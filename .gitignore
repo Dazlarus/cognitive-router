@@ -47,6 +47,9 @@ cognitiverouter.*
 *.err.log
 *.out.log
 
+# OpenClaw plugin manifest (internal — router is standalone)
+openclaw.plugin.json
+
 # Python (for any scripts/tooling)
 __pycache__/
 *.py[cod]

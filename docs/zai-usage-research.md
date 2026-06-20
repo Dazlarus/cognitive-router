@@ -35,10 +35,21 @@ Models consume quota at different rates:
 
 ## Routing Implications
 
+- **Coding Plan covers exactly 3 models**: GLM-5.2, GLM-5-Turbo, GLM-4.7
+- **All other models** visible at the endpoint require credits/balance — will return error 1113
 - **Heavy tasks** (coding, reasoning, analysis): GLM-5.2 despite 2-3× cost
-- **Medium tasks** (business, science): GLM-5.1 or GLM-4.7 at 1×
-- **Light tasks** (chat, retrieval, summary): Flash models (FREE, no quota)
+- **Medium tasks** (business, science): GLM-4.7 at 1×
+- **Light tasks** (chat, retrieval, summary): GLM-4.7 (flash variants not in plan)
 - **When rate-limited**: escalate backoff tier (5min → 30min → 5hr → weekly)
+- **Off-peak** = higher concurrency allowed + 1× promo through Sep 2026
+
+## Plan-Eligible Models (set via `planEligible` flag in model_registry.ts)
+
+| Model | Quota Multiplier | Tier |
+|-------|-----------------|------|
+| GLM-5.2 | 3× peak / 2× off-peak (1× promo) | Opus |
+| GLM-5-Turbo | 3× peak / 2× off-peak (1× promo) | Opus |
+| GLM-4.7 | 1× | Sonnet |
 
 ## TODO
 

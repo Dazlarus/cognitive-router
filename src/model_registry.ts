@@ -31,6 +31,8 @@ export interface ModelCapability {
   vramRequiredGb?: number;
   isLocal: boolean;
   source: "benchmark" | "observed" | "blended"; // how current the data is
+  /** Whether this model is included in the provider's subscription plan (vs pay-per-credit) */
+  planEligible?: boolean;
 }
 
 type Caps = ModelCapability["capabilities"];
@@ -41,7 +43,7 @@ function makeModel(
   id: string,
   ctx: number,
   caps: Caps,
-  opts: { input?: number; output?: number; local?: boolean; vision?: boolean; usageMultiplier?: number; vram?: number } = {},
+  opts: { input?: number; output?: number; local?: boolean; vision?: boolean; usageMultiplier?: number; vram?: number; planEligible?: boolean } = {},
 ): ModelCapability {
   return {
     provider,
@@ -55,6 +57,7 @@ function makeModel(
     vramRequiredGb: opts.vram,
     isLocal: opts.local ?? false,
     source: "benchmark",
+    planEligible: opts.planEligible ?? true,
   };
 }
 
@@ -68,73 +71,70 @@ const SEED_MODELS: ModelCapability[] = [
   // ═══════════════════════════════════════════════════════════════
 
   // GLM-5.x — top tier reasoning
+  // ✅ Coding Plan eligible (Opus-tier, 3× peak / 2× off-peak quota, 1× promo through Sep 2026)
   makeModel("zai", "glm-5.2", 202_800,
     { coding: 0.88, reasoning: 0.92, creative: 0.84, math: 0.90, analysis: 0.91, conversation: 0.87, retrieval: 0.85, science: 0.93, business: 0.88, summary: 0.87 },
-    // Z.AI promo through Sep 2026: all models 1× tokens — no multiplier
-    { input: 0, output: 0, usageMultiplier: 1 },
+    { input: 0, output: 0, usageMultiplier: 1, planEligible: true },
   ),
   makeModel("zai", "glm-5.1", 202_800,
     { coding: 0.85, reasoning: 0.88, creative: 0.80, math: 0.84, analysis: 0.86, conversation: 0.87, retrieval: 0.83, science: 0.86, business: 0.84, summary: 0.86 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: false }, // Not in coding plan — requires credits
   ),
   makeModel("zai", "glm-5", 202_800,
     { coding: 0.82, reasoning: 0.85, creative: 0.78, math: 0.80, analysis: 0.82, conversation: 0.85, retrieval: 0.80, science: 0.82, business: 0.82, summary: 0.83 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: false },
   ),
+  // ✅ Coding Plan eligible (Opus-tier)
   makeModel("zai", "glm-5-turbo", 202_800,
     { coding: 0.80, reasoning: 0.82, creative: 0.76, math: 0.78, analysis: 0.80, conversation: 0.84, retrieval: 0.78, science: 0.78, business: 0.80, summary: 0.82 },
-    // Z.AI promo through Sep 2026: all models 1× tokens
-    { input: 0, output: 0, usageMultiplier: 1 },
+    { input: 0, output: 0, usageMultiplier: 1, planEligible: true },
   ),
   makeModel("zai", "glm-5v-turbo", 202_800,
     { coding: 0.78, reasoning: 0.80, creative: 0.75, math: 0.76, analysis: 0.78, conversation: 0.82, retrieval: 0.76, science: 0.76, business: 0.78, summary: 0.80 },
-    { input: 0, output: 0, vision: true },
+    { input: 0, output: 0, vision: true, planEligible: false },
   ),
 
-  // GLM-4.7 — strong mid-tier
+  // ✅ Coding Plan eligible (Sonnet-tier, standard 1× quota)
   makeModel("zai", "glm-4.7", 204_800,
     { coding: 0.78, reasoning: 0.80, creative: 0.74, math: 0.76, analysis: 0.78, conversation: 0.82, retrieval: 0.78, science: 0.77, business: 0.78, summary: 0.80 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: true },
   ),
-  // Flash models are OPTIMAL for conversation, retrieval, summary — fast inference,
-  // low quota usage, and more than smart enough for interturn chat. They should
-  // beat GLM-5.1 on these intents to conserve heavy-model quota.
+  // Flash models — not in coding plan, require credits
   makeModel("zai", "glm-4.7-flash", 200_000,
     { coding: 0.65, reasoning: 0.66, creative: 0.68, math: 0.60, analysis: 0.64, conversation: 0.90, retrieval: 0.88, science: 0.62, business: 0.72, summary: 0.87 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: false },
   ),
   makeModel("zai", "glm-4.7-flashx", 200_000,
     { coding: 0.58, reasoning: 0.58, creative: 0.65, math: 0.52, analysis: 0.56, conversation: 0.88, retrieval: 0.85, science: 0.54, business: 0.68, summary: 0.84 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: false },
   ),
 
-  // GLM-4.6 — solid workhorse
+  // GLM-4.6 — not in coding plan
   makeModel("zai", "glm-4.6", 204_800,
     { coding: 0.72, reasoning: 0.74, creative: 0.70, math: 0.70, analysis: 0.72, conversation: 0.78, retrieval: 0.74, science: 0.71, business: 0.72, summary: 0.76 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: false },
   ),
   makeModel("zai", "glm-4.6v", 128_000,
     { coding: 0.68, reasoning: 0.70, creative: 0.68, math: 0.66, analysis: 0.68, conversation: 0.75, retrieval: 0.70, science: 0.67, business: 0.68, summary: 0.72 },
-    { input: 0, output: 0, vision: true },
+    { input: 0, output: 0, vision: true, planEligible: false },
   ),
 
-  // GLM-4.5 — budget tier
+  // GLM-4.5 — not in coding plan
   makeModel("zai", "glm-4.5", 131_072,
     { coding: 0.68, reasoning: 0.70, creative: 0.68, math: 0.66, analysis: 0.68, conversation: 0.76, retrieval: 0.70, science: 0.67, business: 0.68, summary: 0.72 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: false },
   ),
   makeModel("zai", "glm-4.5-air", 131_072,
     { coding: 0.55, reasoning: 0.56, creative: 0.60, math: 0.52, analysis: 0.55, conversation: 0.72, retrieval: 0.60, science: 0.52, business: 0.54, summary: 0.66 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: false },
   ),
-  // glm-4.5-flash is FREE on Z.AI — ideal for casual chat and quick lookups
   makeModel("zai", "glm-4.5-flash", 131_072,
     { coding: 0.48, reasoning: 0.48, creative: 0.62, math: 0.42, analysis: 0.48, conversation: 0.85, retrieval: 0.80, science: 0.45, business: 0.60, summary: 0.80 },
-    { input: 0, output: 0 },
+    { input: 0, output: 0, planEligible: false },
   ),
   makeModel("zai", "glm-4.5v", 64_000,
     { coding: 0.58, reasoning: 0.60, creative: 0.58, math: 0.55, analysis: 0.58, conversation: 0.70, retrieval: 0.62, science: 0.56, business: 0.58, summary: 0.66 },
-    { input: 0, output: 0, vision: true },
+    { input: 0, output: 0, vision: true, planEligible: false },
   ),
 
   // ═══════════════════════════════════════════════════════════════

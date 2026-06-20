@@ -70,6 +70,11 @@ export class RoutingEngine {
         logger.debug(`Skipping ${m.provider}/${m.model} — embedding-only model.`);
         return false;
       }
+      // Filter out ZAI models not covered by the coding plan
+      if (m.provider === "zai" && m.planEligible === false) {
+        logger.debug(`Skipping ${m.provider}/${m.model} — not in coding plan (requires credits).`);
+        return false;
+      }
       return true;
     });
 
