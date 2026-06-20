@@ -45,11 +45,13 @@ Models consume quota at different rates:
 
 ## Plan-Eligible Models (set via `planEligible` flag in model_registry.ts)
 
-| Model | Quota Multiplier | Tier |
-|-------|-----------------|------|
-| GLM-5.2 | 3× peak / 2× off-peak (1× promo) | Opus |
-| GLM-5-Turbo | 3× peak / 2× off-peak (1× promo) | Opus |
-| GLM-4.7 | 1× | Sonnet |
+| Model | Normal Multiplier | Promo (through Sep 2026) | Tier |
+|-------|-------------------|--------------------------|------|
+| GLM-5.2 | 3× peak / 2× off-peak | 1× | Opus |
+| GLM-5-Turbo | 3× peak / 2× off-peak | 1× | Opus |
+| GLM-4.7 | 1× | 1× | Sonnet |
+
+> **Note:** GLM-5.1 also has 1× promo pricing but is **not** callable with coding plan keys — it requires credits.
 
 ## TODO
 
