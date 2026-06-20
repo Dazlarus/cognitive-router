@@ -1,0 +1,48 @@
+{
+  "name": "cognitive-router",
+  "version": "0.1.0-alpha",
+  "type": "module",
+  "description": "Self-healing LLM proxy that classifies intent and routes each request to the optimal model across multiple providers.",
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "tsx src/server.ts",
+    "start:prod": "node dist/server.js",
+    "install-service": "tsx scripts/install-service.ts",
+    "uninstall-service": "tsx scripts/install-service.ts --uninstall",
+    "service-status": "tsx scripts/install-service.ts --status"
+  },
+  "keywords": [
+    "llm",
+    "router",
+    "proxy",
+    "openai-compatible",
+    "model-routing",
+    "failover",
+    "circuit-breaker",
+    "multi-provider",
+    "intent-classification"
+  ],
+  "author": "Daz <daz@dazlarus.dev>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dazwritescode/cognitive-router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dazwritescode/cognitive-router/issues"
+  },
+  "homepage": "https://github.com/dazwritescode/cognitive-router#readme",
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "node-windows": "^1.0.0-beta.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "@types/node-windows": "^0.1.6",
+    "tsx": "^4.22.4",
+    "typescript": "^5.5.0"
+  }
+}

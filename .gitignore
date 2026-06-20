@@ -1,0 +1,66 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Runtime data
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Project planning (internal)
+PLANCLAVE.md
+tmp/
+
+# Debug / ad-hoc scripts
+check-outcomes.cjs
+query-*.cjs
+reset-*.cjs
+
+# Windows service runtime files
+cognitiverouter.*
+*.wrapper.log
+*.err.log
+*.out.log
+
+# Python (for any scripts/tooling)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+*.egg
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nyc_output
+.ruff_cache/
+.mypy_cache/
