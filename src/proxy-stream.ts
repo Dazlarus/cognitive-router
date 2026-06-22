@@ -15,6 +15,7 @@ import { loadProjectEnv } from "./env.js";
 import { buildStatsPayload } from "./stats.js";
 import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
 import { JudgeEvaluator } from "./judge.js";
+import { raceHedgedRequests, hedgeRetryDelayMs, type HedgeCandidate } from "./hedged_request.js";
 
 const CHAT_ALIAS_MODEL = "CognitiveRouter:latest";
 const LEGACY_CHAT_ALIAS_MODEL = "CogRouter:latest";
@@ -25,6 +26,7 @@ const DEFAULT_OPENROUTER_TOOL_MODEL = "qwen/qwen3-coder:free";
 const DEFAULT_OPENROUTER_FALLBACK_MODEL = "openrouter/owl-alpha";
 const DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-2.5-flash";
 const DEFAULT_GEMINI_TOOL_MODEL = "gemini-2.5-flash";
+const DEFAULT_OPENROUTER_PAID_FALLBACK_MODEL = "deepseek/deepseek-v4-flash";
 const ALLOWED_OPENROUTER_FALLBACK_MODELS = new Set([
   "cohere/north-mini-code:free",
   "openrouter/free",
@@ -34,6 +36,13 @@ const ALLOWED_OPENROUTER_FALLBACK_MODELS = new Set([
   "poolside/laguna-m.1:free",
   "qwen/qwen3-coder:free",
   "qwen/qwen3.6-plus:free",
+]);
+
+// Paid OpenRouter models allowed as mid-tier fallback (after free, before local)
+const ALLOWED_OPENROUTER_PAID_MODELS = new Set([
+  "deepseek/deepseek-v4-flash",
+  "qwen/qwen3-235b-a22b-2507",
+  "qwen/qwen3-coder-30b-a3b-instruct",
 ]);
 
 // Load .env before standalone proxy code reads provider keys from process.env.
@@ -56,6 +65,75 @@ export interface ChatCompletionRequest {
   reasoning?: any;
   reasoning_effort?: string;
   [key: string]: any;
+}
+
+// ─── Token estimation & provider context limits ───
+
+/**
+ * Rough token estimate: ~4 chars per token for typical mixed text/JSON.
+ * This is intentionally conservative (overestimates slightly) so we err
+ * on the side of skipping providers that would reject the request.
+ */
+function estimateTokenCount(request: ChatCompletionRequest): number {
+  // Serialize messages + tools to approximate the full prompt payload
+  let chars = 0;
+  for (const msg of request.messages ?? []) {
+    chars += (msg.content?.length ?? 0) + (msg.role?.length ?? 0) + 10;
+  }
+  // Tools contribute significantly — include them in the estimate
+  if (Array.isArray(request.tools)) {
+    chars += JSON.stringify(request.tools).length;
+  }
+  // System/tool overhead in OpenAI format
+  if (Array.isArray(request.functions)) {
+    chars += JSON.stringify(request.functions).length;
+  }
+  return Math.ceil(chars / 4);
+}
+
+/**
+ * Effective input token limit per provider. This is the *real* ceiling,
+ * not the advertised model context window — some providers cap lower.
+ *
+ * - OpenRouter free models: 66,327 tokens (hardcoded by OpenRouter)
+ * - OpenRouter paid: use model's context_length (no separate cap)
+ * - Gemini: 1M (very generous)
+ * - ZAI: 200K
+ * - Ollama: model-dependent, but we use 32K as safe default
+ */
+const PROVIDER_EFFECTIVE_INPUT_LIMITS: Record<string, number> = {
+  zai: 200_000,
+  openrouter: 66_327, // OpenRouter free-tier hard cap
+  gemini: 1_000_000,
+  ollama: 32_768,
+};
+
+/**
+ * Minimum input token capacity required for the router to be useful.
+ * Requests below this threshold are likely small enough for any provider.
+ */
+const MIN_USEFUL_CONTEXT_TOKENS = Number.parseInt(
+  process.env.ROUTER_MIN_CONTEXT_TOKENS ?? "86000",
+  10,
+) || 86_000;
+
+/**
+ * Returns the effective input token limit for a specific provider+model.
+ * For OpenRouter, checks if the model is a free variant (capped at 66K)
+ * vs a paid model (uses model context length).
+ */
+function getEffectiveInputLimit(provider: string, model: string): number {
+  if (provider === "openrouter") {
+    // Free models (ending in :free) and owl-alpha are subject to the 66K cap.
+    // Paid models through OpenRouter use the model's real context length.
+    const isFreeModel = model.endsWith(":free") || model === "openrouter/owl-alpha";
+    if (isFreeModel) {
+      return PROVIDER_EFFECTIVE_INPUT_LIMITS.openrouter;
+    }
+    // For paid OpenRouter models, be generous — use 256K as practical limit
+    return 256_000;
+  }
+  return PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
 }
 
 function maxAttemptsPerProvider(): number {
@@ -95,6 +173,19 @@ export function fallbackModelForProvider(provider: string, usesTools: boolean): 
   return null;
 }
 
+/**
+ * Returns the paid OpenRouter fallback model for when free models are exhausted
+ * or when the request is too large for free-tier context limits.
+ * Configurable via ROUTER_OPENROUTER_PAID_MODEL env var.
+ */
+export function paidOpenRouterFallbackModel(): string {
+  const configured = process.env.ROUTER_OPENROUTER_PAID_MODEL?.trim();
+  if (configured && ALLOWED_OPENROUTER_PAID_MODELS.has(configured.toLowerCase())) {
+    return configured;
+  }
+  return DEFAULT_OPENROUTER_PAID_FALLBACK_MODEL;
+}
+
 function cheapOpenRouterModel(value: string | undefined, fallback: string): string {
   const model = value?.trim();
   if (!model) return fallback;
@@ -112,6 +203,36 @@ function sanitizeErrorForClient(message: string): string {
     .replace(/https:\/\/openrouter\.ai\/workspaces\/[^"'\s)\]]+/gi, "[openrouter-key-settings]")
     .replace(/user_[A-Za-z0-9]+/g, "[provider-user]")
     .replace(/[A-Fa-f0-9]{32,}/g, "[redacted]");
+}
+
+/**
+ * Calculate the dollar cost of a request based on token usage and model pricing.
+ * Returns 0 for free models (no cost data).
+ */
+function calculateRequestCost(
+  provider: string,
+  model: string,
+  modelRegistry: ModelRegistry,
+  usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined,
+): number {
+  if (!usage) return 0;
+  const cap = modelRegistry.getCapability(provider, model);
+  if (!cap || (!cap.costPer1kInput && !cap.costPer1kOutput)) return 0;
+
+  const inputTokens = usage.prompt_tokens ?? 0;
+  const outputTokens = usage.completion_tokens ?? 0;
+  const inputCost = (cap.costPer1kInput ?? 0) * (inputTokens / 1000);
+  const outputCost = (cap.costPer1kOutput ?? 0) * (outputTokens / 1000);
+
+  return inputCost + outputCost;
+}
+
+/**
+ * Check if a model is a paid model (has non-zero token costs).
+ */
+function isPaidModel(provider: string, model: string, modelRegistry: ModelRegistry): boolean {
+  const cap = modelRegistry.getCapability(provider, model);
+  return Boolean(cap && ((cap.costPer1kInput ?? 0) > 0 || (cap.costPer1kOutput ?? 0) > 0));
 }
 
 export class ProxyServerStreaming {
@@ -304,8 +425,11 @@ export class ProxyServerStreaming {
       classification = { intent: "conversation", confidence: 0.5 };
     }
 
-    // Build candidate list
-    const decision = await this.router.decide(classification, sessionKey, {});
+    // Estimate prompt token count for routing + context window guard
+    const estimatedTokens = estimateTokenCount(request);
+
+    // Build candidate list — pass estimated tokens for size-aware routing
+    const decision = await this.router.decide(classification, sessionKey, { estimatedTokens });
     const candidates = this.buildCandidateList(decision, request);
     const requestId = this.extractRequestId(request);
 
@@ -339,13 +463,19 @@ export class ProxyServerStreaming {
       return maxProviderAttempts;
     };
 
+    if (estimatedTokens > MIN_USEFUL_CONTEXT_TOKENS) {
+      logger.info(`Large request: ~${estimatedTokens} input tokens — context guard active`);
+    }
+
     // Retry loop. Keep the default conservative so CogRouter can fail over
     // before OpenClaw's outer LLM timeout fires.
     let lastError: Error | null = null;
     const providerStrikes = new Map<string, number>();
     const requestDeadlineMs = Date.now() + routerRequestTimeoutMs();
+    let hedgeAttempted = false;
 
-    for (const candidate of candidates) {
+    for (let ci = 0; ci < candidates.length; ci++) {
+      const candidate = candidates[ci];
       if (Date.now() >= requestDeadlineMs) {
         lastError = new Error(`router_request_timeout: exceeded ${routerRequestTimeoutMs()}ms before trying ${candidate.provider}/${candidate.model}`);
         logger.warn(lastError.message);
@@ -375,13 +505,132 @@ export class ProxyServerStreaming {
         continue;
       }
 
+      // Context window guard: skip providers whose effective input limit
+      // is too small for this request. This saves a wasted API call + timeout.
+      const effectiveLimit = getEffectiveInputLimit(candidate.provider, candidate.model);
+      if (estimatedTokens > effectiveLimit) {
+        logger.info(
+          `Skipping ${candidate.provider}/${candidate.model} — request ~${estimatedTokens} tokens exceeds limit ${effectiveLimit}`,
+        );
+        providerStrikes.set(candidate.provider, strikes + 1);
+        continue;
+      }
+
       const apiKey = process.env[candidate.provider.toUpperCase() + "_API_KEY"] ?? "";
       const startTime = Date.now();
 
       try {
         logger.info(`Trying ${candidate.provider}/${candidate.model}...`);
 
-        // Always use non-streaming from provider (we handle SSE to client)
+        if (isStreaming) {
+          // ── Streaming pass-through ──
+          // Request stream:true from provider and pipe SSE chunks directly to client.
+          // This eliminates double-buffering: tokens appear immediately.
+          const providerRequest = { ...request, model: candidate.model, stream: true };
+          let hasForwarded = false;
+          let accumulatedContent = "";
+          let hasPayload = false;
+
+          try {
+            for await (const chunk of adapter.chatCompletionStream(candidate.model, providerRequest, apiKey)) {
+              // Scrub provider model name — never leak to client
+              chunk.model = CHAT_RESPONSE_MODEL;
+
+              // Track content for judge evaluation + empty-response detection
+              const delta = chunk.choices?.[0]?.delta;
+              if (delta?.content) {
+                accumulatedContent += delta.content;
+                hasPayload = true;
+              }
+              if (delta?.tool_calls?.length) {
+                hasPayload = true;
+              }
+
+              // Forward chunk to client immediately — no buffering
+              this.writeSSE(res, chunk);
+              hasForwarded = true;
+            }
+          } catch (streamErr) {
+            if (!hasForwarded) throw streamErr; // Pre-data error → retry via outer catch
+
+            // Mid-stream error → forward error chunk, then [DONE]
+            const error = streamErr as Error;
+            const errDurationMs = Date.now() - startTime;
+            this.writeSSE(res, {
+              error: {
+                message: sanitizeErrorForClient(error.message),
+                type: "stream_error",
+              },
+            });
+            res.write("data: [DONE]\n\n");
+            res.end();
+
+            await this.costTracker.recordCall(candidate.provider, { durationMs: errDurationMs, outcome: "error" }, candidate.model);
+            this.db.recordCallOutcome({
+              provider: candidate.provider, model: candidate.model,
+              durationMs: errDurationMs, outcome: "error", timestamp: new Date().toISOString(),
+            });
+            logger.warn(`❌ ${candidate.provider}/${candidate.model} stream error after data sent in ${errDurationMs}ms: ${sanitizeErrorForClient(error.message).substring(0, 100)}`);
+            return; // Cannot retry — data already sent to client
+          }
+
+          // Stream completed — check for empty response before committing
+          if (!hasPayload && !hasForwarded) {
+            // Stream yielded zero forwardable chunks — treat as empty response and retry
+            const err = new Error(`empty_provider_response: stream from ${candidate.provider}/${candidate.model} produced no content`);
+            (err as any).code = "empty_response";
+            throw err; // Re-thrown to outer catch → retry next candidate
+          }
+
+          const durationMs = Date.now() - startTime;
+          res.write("data: [DONE]\n\n");
+          res.end();
+
+          if (!hasPayload) {
+            logger.warn(`Empty stream from ${candidate.provider}/${candidate.model} — forwarded non-content chunks but no payload`);
+          }
+
+          await this.costTracker.recordCall(candidate.provider, { durationMs, outcome: "success" }, candidate.model);
+          this.costTracker.recordSizeLatency(candidate.provider, estimatedTokens, durationMs);
+          this.db.recordCallOutcome({
+            provider: candidate.provider, model: candidate.model,
+            durationMs, outcome: "success", timestamp: new Date().toISOString(),
+          });
+
+          logger.info(`✅ ${candidate.provider}/${candidate.model} streamed in ${durationMs}ms`);
+
+          // ─── Async LLM-as-judge feedback ───
+          if (
+            this.judge.shouldJudge() &&
+            !this.judge.isSameModel(candidate.provider, candidate.model) &&
+            accumulatedContent // Skip empty/tool-only responses
+          ) {
+            const evalProvider = candidate.provider;
+            const evalModel = candidate.model;
+            const evalIntent = classification.intent;
+            const evalPrompt = prompt;
+
+            // Fire and forget — don't await, don't block
+            this.judge.evaluate(evalPrompt, accumulatedContent, evalIntent)
+              .then((result) => {
+                if (result) {
+                  this.modelRegistry.updateCapability(evalProvider, evalModel, evalIntent, result.score);
+                  this.db.recordJudgeEvaluation(
+                    evalProvider, evalModel, evalIntent,
+                    result.rawScore, result.note,
+                    `${this.judge.judgeModelId}`,
+                  );
+                }
+              })
+              .catch((err) => {
+                logger.debug(`Judge async error (non-fatal): ${err instanceof Error ? err.message : err}`);
+              });
+          }
+
+          return;
+        }
+
+        // ── Non-streaming path ──
         const providerRequest = { ...request, model: candidate.model, stream: false };
         const response = await this.withRequestDeadline(
           adapter.chatCompletion(candidate.model, providerRequest, apiKey),
@@ -403,45 +652,24 @@ export class ProxyServerStreaming {
         }
 
         await this.costTracker.recordCall(candidate.provider, { durationMs, outcome: "success" }, candidate.model);
+        this.costTracker.recordSizeLatency(candidate.provider, estimatedTokens, durationMs);
         this.db.recordCallOutcome({
           provider: candidate.provider, model: candidate.model,
           durationMs, outcome: "success", timestamp: new Date().toISOString(),
         });
 
+        // Track dollar spend for paid models
+        const requestCost = calculateRequestCost(candidate.provider, candidate.model, this.modelRegistry, response.usage);
+        if (requestCost > 0) {
+          this.costTracker.recordSpend(candidate.provider, requestCost);
+          logger.debug(`Spend: ${candidate.provider} +$${requestCost.toFixed(4)} (daily=$${this.costTracker.getDailySpend(candidate.provider).toFixed(2)}, monthly=$${this.costTracker.getMonthlySpend(candidate.provider).toFixed(2)})`);
+        }
+
         logger.info(`✅ ${candidate.provider}/${candidate.model} succeeded in ${durationMs}ms`);
 
-        if (isStreaming) {
-          const delta: Record<string, any> = { role: "assistant" };
-          if (content) {
-            delta.content = content;
-          }
-          if (toolCalls) {
-            delta.tool_calls = toolCalls;
-          }
-
-          // Send the provider's assistant payload as SSE. This may be text
-          // content or tool_calls; both are valid OpenAI assistant payloads.
-          this.writeSSE(res, {
-            id: response.id ?? `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: CHAT_RESPONSE_MODEL,
-            choices: [{ index: 0, delta, finish_reason: null }],
-          });
-          this.writeSSE(res, {
-            id: response.id ?? `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: CHAT_RESPONSE_MODEL,
-            choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-          });
-          res.write("data: [DONE]\n\n");
-          res.end();
-        } else {
-          response.model = CHAT_RESPONSE_MODEL;
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(response));
-        }
+        response.model = CHAT_RESPONSE_MODEL;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(response));
 
         // ─── Async LLM-as-judge feedback ───
         // After the response is sent, maybe evaluate quality and evolve capability scores.
@@ -501,6 +729,114 @@ export class ProxyServerStreaming {
 
         if (newStrikes >= providerAttemptLimit) {
           logger.info(`⏭️ ${candidate.provider} exhausted (${newStrikes} strikes) — moving to next provider`);
+        }
+
+        // ─── Hedged request: race fallback vs delayed primary retry ───
+        // When the primary returns 429/503, immediately try the fallback AND
+        // queue a delayed retry of the primary. First response wins.
+        const isServerErr = (error as any).code === "server_error" || /server_error|503|internal server error/i.test(error.message);
+        const shouldHedge =
+          !hedgeAttempted &&
+          (isRateLimit || isServerErr) &&
+          !isStreaming &&
+          !res.headersSent &&
+          // Need at least one candidate from a DIFFERENT provider after this one
+          candidates.some((c, idx) => idx > ci && c.provider !== candidate.provider) &&
+          Date.now() < requestDeadlineMs;
+
+        if (shouldHedge) {
+          hedgeAttempted = true;
+          // Find the next candidate from a DIFFERENT provider (not another model from same provider)
+          let fallbackCand = candidates[ci + 1];
+          for (let fi = ci + 1; fi < candidates.length; fi++) {
+            if (candidates[fi].provider !== candidate.provider) {
+              fallbackCand = candidates[fi];
+              break;
+            }
+          }
+          const fallbackAdapter = getProvider(fallbackCand.provider);
+          const fallbackApiKey = process.env[fallbackCand.provider.toUpperCase() + "_API_KEY"] ?? "";
+
+          if (fallbackAdapter && this.costTracker.isAvailable(fallbackCand.provider)) {
+            const retryDelay = hedgeRetryDelayMs();
+            logger.info(
+              `🂺 Hedging: racing ${fallbackCand.provider}/${fallbackCand.model} (immediate) vs ` +
+              `${candidate.provider}/${candidate.model} (retry in ${retryDelay}ms)`,
+            );
+
+            try {
+              const hedgeResult = await raceHedgedRequests(
+                {
+                  provider: candidate.provider,
+                  model: candidate.model,
+                  adapter: adapter,
+                  apiKey: apiKey,
+                },
+                {
+                  provider: fallbackCand.provider,
+                  model: fallbackCand.model,
+                  adapter: fallbackAdapter,
+                  apiKey: fallbackApiKey,
+                },
+                request,
+                retryDelay,
+              );
+
+              // Winner determined — record stats and send response
+              const { response: winResponse, outcome: hedgeOutcome } = hedgeResult;
+              const winDurationMs = hedgeOutcome.winnerDurationMs;
+
+              // Record success for winner
+              await this.costTracker.recordCall(
+                hedgeOutcome.winnerProvider,
+                { durationMs: winDurationMs, outcome: "success" },
+                hedgeOutcome.winnerModel,
+              );
+              this.costTracker.recordSizeLatency(hedgeOutcome.winnerProvider, estimatedTokens, winDurationMs);
+              this.db.recordCallOutcome({
+                provider: hedgeOutcome.winnerProvider, model: hedgeOutcome.winnerModel,
+                durationMs: winDurationMs, outcome: "success", timestamp: new Date().toISOString(),
+              });
+
+              // Track dollar spend for paid models
+              const hedgeCost = calculateRequestCost(
+                hedgeOutcome.winnerProvider, hedgeOutcome.winnerModel,
+                this.modelRegistry, winResponse.usage,
+              );
+              if (hedgeCost > 0) {
+                this.costTracker.recordSpend(hedgeOutcome.winnerProvider, hedgeCost);
+              }
+
+              // Record hedge outcome for analytics
+              this.costTracker.recordHedgeOutcome({
+                result: hedgeOutcome.result,
+                winnerProvider: hedgeOutcome.winnerProvider,
+                winnerModel: hedgeOutcome.winnerModel,
+                loserCancelled: hedgeOutcome.loserCancelled,
+              });
+
+              logger.info(`✅ Hedge winner: ${hedgeOutcome.winnerProvider}/${hedgeOutcome.winnerModel} in ${winDurationMs}ms`);
+
+              // Send the winning response to client
+              winResponse.model = CHAT_RESPONSE_MODEL;
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(winResponse));
+              return;
+            } catch (hedgeErr) {
+              logger.warn(
+                `Hedge failed: ${hedgeErr instanceof Error ? hedgeErr.message : hedgeErr} — continuing fallback loop`,
+              );
+              this.costTracker.recordHedgeOutcome({
+                result: "both_fail",
+                winnerProvider: "none",
+                winnerModel: "none",
+                loserCancelled: false,
+              });
+              // Skip the fallback candidate since hedge already tried it
+              ci++;
+              lastError = hedgeErr instanceof Error ? hedgeErr : new Error(String(hedgeErr));
+            }
+          }
         }
       }
     }
@@ -593,10 +929,13 @@ export class ProxyServerStreaming {
   ): Array<{ provider: string; model: string }> {
     const candidates: Array<{ provider: string; model: string }> = [];
     const usesTools = requestUsesTools(request);
+    const estimatedTokens = estimateTokenCount(request);
 
     // Router's top pick first for plain chat. For tool turns, keep provider
     // priority strict so remote tool-capable providers stay ahead of local ones.
-    if (!usesTools && decision) {
+    // Only include the decision winner if its provider is in the active priority list.
+    const prioritySet = new Set(this.config.providerPriority);
+    if (!usesTools && decision && prioritySet.has(decision.provider)) {
       candidates.push({ provider: decision.provider, model: decision.model });
     } else if (decision && usesTools) {
       logger.debug(`Deferring ${decision.provider}/${decision.model} — tool request uses provider priority`);
@@ -616,7 +955,17 @@ export class ProxyServerStreaming {
         continue;
       }
 
+      // Context guard: skip entire provider if its effective limit is too small
+      const providerLimit = PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
+      if (estimatedTokens > providerLimit) {
+        logger.info(
+          `Skipping ${provider} — request ~${estimatedTokens} tokens exceeds provider limit ${providerLimit}`,
+        );
+        continue;
+      }
+
       const fallbackModel = usesTools ? fallbackModelForProvider(provider, true) : null;
+      const budgetExceeded = this.costTracker.isBudgetExceeded(provider);
       let models = this.modelRegistry
         .getAvailableModels([provider])
         .filter((m) => {
@@ -630,6 +979,15 @@ export class ProxyServerStreaming {
             return false;
           }
           if (usesTools && !modelSupportsTools(m.provider, m.model)) {
+            return false;
+          }
+          // Skip paid models when budget is exceeded
+          if (budgetExceeded && ((m.costPer1kInput ?? 0) > 0 || (m.costPer1kOutput ?? 0) > 0)) {
+            logger.info(
+              `Skipping ${m.provider}/${m.model} — budget exceeded ` +
+              `(daily=$${this.costTracker.getDailySpend(provider).toFixed(2)}/${this.costTracker.dailyBudget.toFixed(2)}, ` +
+              `monthly=$${this.costTracker.getMonthlySpend(provider).toFixed(2)}/${this.costTracker.monthlyBudget.toFixed(2)})`,
+            );
             return false;
           }
           return true;
@@ -695,6 +1053,25 @@ export class ProxyServerStreaming {
         if (!candidates.some((c) => c.provider === entry.provider && c.model === entry.model)) {
           candidates.push(entry);
         }
+      }
+    }
+
+    // Add paid OpenRouter fallback (DeepSeek V4 Flash) after free providers are exhausted.
+    // This costs real money (~$0.01/request) but only fires when ZAI + Gemini are both down
+    // and the request is too large for free OpenRouter models.
+    // Skip if daily/monthly budget is exceeded.
+    if (this.config.providerPriority.includes("openrouter")) {
+      const paidModel = paidOpenRouterFallbackModel();
+      const paidLimit = getEffectiveInputLimit("openrouter", paidModel);
+      const alreadyHaveIt = candidates.some((c) => c.provider === "openrouter" && c.model === paidModel);
+      const orStillAvailable = this.costTracker.isAvailable("openrouter");
+      const orBudgetExceeded = this.costTracker.isBudgetExceeded("openrouter");
+      if (!alreadyHaveIt && orStillAvailable && estimatedTokens <= paidLimit && !orBudgetExceeded) {
+        candidates.push({ provider: "openrouter", model: paidModel });
+      } else if (alreadyHaveIt && orBudgetExceeded) {
+        // Remove the paid model if budget was exceeded after it was added
+        const idx = candidates.findIndex((c) => c.provider === "openrouter" && c.model === paidModel);
+        if (idx !== -1) candidates.splice(idx, 1);
       }
     }
 
