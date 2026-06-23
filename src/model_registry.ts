@@ -1,6 +1,7 @@
 // src/model_registry.ts — Model discovery + capability profiles
 
 import { logger } from "./logger.js";
+import { registryReadiness } from "./readiness.js";
 import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig } from "./config.js";
 
@@ -173,6 +174,15 @@ const SEED_MODELS: ModelCapability[] = [
   ),
 
   // ═══════════════════════════════════════════════════════════════
+  // OpenRouter Paid Fallback (used when free tier can't handle the request)
+  // ═══════════════════════════════════════════════════════════════
+
+  makeModel("openrouter", "deepseek/deepseek-v4-flash", 1_000_000,
+    { coding: 0.84, reasoning: 0.82, creative: 0.72, math: 0.80, analysis: 0.82, conversation: 0.76, retrieval: 0.74, science: 0.80, business: 0.74, summary: 0.76 },
+    { input: 0.09, output: 0.18 }, // per 1K tokens (paid)
+  ),
+
+  // ═══════════════════════════════════════════════════════════════
   // Ollama Local Models
   // ═══════════════════════════════════════════════════════════════
 
@@ -293,6 +303,8 @@ export class ModelRegistry {
     // Apply any saved capability overrides from the judge feedback loop
     this.applySavedOverrides();
 
+    registryReadiness.setSynced();
+
     logger.info(`Model registry loaded — ${this.models.size} models tracked.`);
   }
 
@@ -323,10 +335,18 @@ export class ModelRegistry {
               ));
             }
           }
+
+          // Auto-disable deprecated models (those in local registry but not in API response)
+          let deprecatedCount = 0;
           for (const [key, m] of this.models) {
             if (m.provider === "zai" && !remoteIds.has(m.model)) {
-              logger.warn(`Z.AI model ${key} not in API response — may be deprecated`);
+              logger.warn(`Z.AI model ${key} not in API response — disabling as deprecated`);
+              this.models.delete(key);
+              deprecatedCount++;
             }
+          }
+          if (deprecatedCount > 0) {
+            logger.info(`Auto-disabled ${deprecatedCount} deprecated Z.AI models`);
           }
         }
       }

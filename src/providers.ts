@@ -3,6 +3,7 @@
 // and returns an OpenAI-compatible response. Supports both non-streaming and streaming.
 
 import { logger } from "./logger.js";
+import { maybeGeminiCache, observeZaIPrefix, PrefixCache } from "./prefix_cache.js";
 
 // ─── Types ───
 
@@ -83,6 +84,16 @@ function localTimeoutMs(): number {
 
 function localStreamTimeoutMs(): number {
   return envTimeoutMs("ROUTER_LOCAL_STREAM_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_STREAM_TIMEOUT_MS", 120_000));
+}
+
+/**
+ * Combine an external AbortSignal with a timeout signal.
+ * If no external signal is provided, returns just the timeout signal.
+ */
+function withExternalSignal(timeoutMs: number, external?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  if (!external) return timeout;
+  return AbortSignal.any([timeout, external]);
 }
 
 // ─── Provider Base URLs (env-configurable) ───
@@ -172,6 +183,7 @@ export interface ProviderAdapter {
     model: string,
     request: ChatCompletionRequest,
     apiKey: string,
+    signal?: AbortSignal,
   ): Promise<ChatCompletionResponse>;
 
   /** Send a streaming chat completion request. Yields chunks. Throws on failure. */
@@ -179,6 +191,7 @@ export interface ProviderAdapter {
     model: string,
     request: ChatCompletionRequest,
     apiKey: string,
+    signal?: AbortSignal,
   ): AsyncIterable<ChatCompletionChunk>;
 }
 
@@ -273,10 +286,16 @@ export const ZAIAdapter: ProviderAdapter = {
     model: string,
     request: ChatCompletionRequest,
     apiKey: string,
+    externalSignal?: AbortSignal,
   ): Promise<ChatCompletionResponse> {
     const level = extractThinkingLevel(request);
     const cleaned = stripThinking(request);
     const thinking = buildZaiThinking(level);
+
+    // Observe system prompt prefix for ZAI automatic prefix caching
+    // (GLM-4+ caches identical prefixes ≥1024 tokens transparently)
+    observeZaIPrefix(request.messages);
+
     const body = { ...cleaned, model, stream: false, ...(thinking ? { thinking } : {}) };
     const resp = await fetch(`${ZAI_BASE}/chat/completions`, {
       method: "POST",
@@ -285,7 +304,7 @@ export const ZAIAdapter: ProviderAdapter = {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(remoteTimeoutMs()),
+      signal: withExternalSignal(remoteTimeoutMs(), externalSignal),
     });
 
     if (!resp.ok) {
@@ -300,10 +319,15 @@ export const ZAIAdapter: ProviderAdapter = {
     model: string,
     request: ChatCompletionRequest,
     apiKey: string,
+    externalSignal?: AbortSignal,
   ): AsyncIterable<ChatCompletionChunk> {
     const level = extractThinkingLevel(request);
     const cleaned = stripThinking(request);
     const thinking = buildZaiThinking(level);
+
+    // Observe system prompt prefix for ZAI automatic prefix caching
+    observeZaIPrefix(request.messages);
+
     const body = { ...cleaned, model, stream: true, ...(thinking ? { thinking } : {}) };
     const resp = await fetch(`${ZAI_BASE}/chat/completions`, {
       method: "POST",
@@ -312,7 +336,7 @@ export const ZAIAdapter: ProviderAdapter = {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(remoteStreamTimeoutMs()),
+      signal: withExternalSignal(remoteStreamTimeoutMs(), externalSignal),
     });
 
     if (!resp.ok || !resp.body) {
@@ -333,6 +357,7 @@ export const OpenRouterAdapter: ProviderAdapter = {
     model: string,
     request: ChatCompletionRequest,
     apiKey: string,
+    externalSignal?: AbortSignal,
   ): Promise<ChatCompletionResponse> {
     const level = extractThinkingLevel(request);
     const cleaned = stripThinking(request);
@@ -347,7 +372,7 @@ export const OpenRouterAdapter: ProviderAdapter = {
         "X-Title": "Cognitive Router",
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(remoteTimeoutMs()),
+      signal: withExternalSignal(remoteTimeoutMs(), externalSignal),
     });
 
     if (!resp.ok) {
@@ -362,6 +387,7 @@ export const OpenRouterAdapter: ProviderAdapter = {
     model: string,
     request: ChatCompletionRequest,
     apiKey: string,
+    externalSignal?: AbortSignal,
   ): AsyncIterable<ChatCompletionChunk> {
     const level = extractThinkingLevel(request);
     const cleaned = stripThinking(request);
@@ -376,7 +402,7 @@ export const OpenRouterAdapter: ProviderAdapter = {
         "X-Title": "Cognitive Router",
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(remoteStreamTimeoutMs()),
+      signal: withExternalSignal(remoteStreamTimeoutMs(), externalSignal),
     });
 
     if (!resp.ok || !resp.body) {
@@ -397,14 +423,17 @@ export const GeminiAdapter: ProviderAdapter = {
     model: string,
     request: ChatCompletionRequest,
     apiKey: string,
+    externalSignal?: AbortSignal,
   ): Promise<ChatCompletionResponse> {
+    // Check/create prefix cache for the system prompt
+    await maybeGeminiCache(model, request.messages, apiKey);
     const { geminiBody, url } = buildGeminiRequest(model, request, apiKey, false);
 
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(geminiBody),
-      signal: AbortSignal.timeout(remoteTimeoutMs()),
+      signal: withExternalSignal(remoteTimeoutMs(), externalSignal),
     });
 
     if (!resp.ok) {
@@ -420,14 +449,17 @@ export const GeminiAdapter: ProviderAdapter = {
     model: string,
     request: ChatCompletionRequest,
     apiKey: string,
+    externalSignal?: AbortSignal,
   ): AsyncIterable<ChatCompletionChunk> {
+    // Check/create prefix cache for the system prompt
+    await maybeGeminiCache(model, request.messages, apiKey);
     const { geminiBody, url } = buildGeminiRequest(model, request, apiKey, true);
 
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(geminiBody),
-      signal: AbortSignal.timeout(remoteStreamTimeoutMs()),
+      signal: withExternalSignal(remoteStreamTimeoutMs(), externalSignal),
     });
 
     if (!resp.ok || !resp.body) {
@@ -514,6 +546,7 @@ export const OllamaAdapter: ProviderAdapter = {
     model: string,
     request: ChatCompletionRequest,
     _apiKey: string,
+    externalSignal?: AbortSignal,
   ): Promise<ChatCompletionResponse> {
     const level = extractThinkingLevel(request);
     const cleaned = stripThinking(request);
@@ -521,7 +554,7 @@ export const OllamaAdapter: ProviderAdapter = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...cleaned, model, stream: false, think: level !== "none" }),
-      signal: AbortSignal.timeout(localTimeoutMs()),
+      signal: withExternalSignal(localTimeoutMs(), externalSignal),
     });
 
     if (!resp.ok) {
@@ -536,6 +569,7 @@ export const OllamaAdapter: ProviderAdapter = {
     model: string,
     request: ChatCompletionRequest,
     _apiKey: string,
+    externalSignal?: AbortSignal,
   ): AsyncIterable<ChatCompletionChunk> {
     const level = extractThinkingLevel(request);
     const cleaned = stripThinking(request);
@@ -543,7 +577,7 @@ export const OllamaAdapter: ProviderAdapter = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...cleaned, model, stream: true, think: level !== "none" }),
-      signal: AbortSignal.timeout(localStreamTimeoutMs()),
+      signal: withExternalSignal(localStreamTimeoutMs(), externalSignal),
     });
 
     if (!resp.ok || !resp.body) {
@@ -584,7 +618,16 @@ function buildGeminiRequest(
     },
   };
 
-  if (systemPrompt) {
+  // Check for an existing Gemini cachedContent for this system prompt.
+  // If one exists, reference it via cachedContent field and skip systemInstruction
+  // (the cached content already includes it).
+  const existingCacheName = PrefixCache.instance.getGeminiCacheName(systemPrompt);
+  if (existingCacheName) {
+    geminiBody.cachedContent = existingCacheName;
+    PrefixCache.instance.recordGeminiCacheHit();
+    logger.debug(`Gemini: using cachedContent ${existingCacheName} for system prompt`);
+    // Don't include systemInstruction — it's in the cached content
+  } else if (systemPrompt) {
     geminiBody.systemInstruction = { parts: [{ text: systemPrompt }] };
   }
 
@@ -618,8 +661,23 @@ function openAIMessageToGeminiContent(message: ChatMessage): any {
   }
 
   const parts: any[] = [];
-  if (message.content) {
-    parts.push({ text: message.content });
+  const content = message.content as any;
+  if (content) {
+    // Handle both string content and array content (OpenAI vision format)
+    if (typeof content === "string") {
+      parts.push({ text: content });
+    } else if (Array.isArray(content)) {
+      // Extract text from content blocks
+      const textParts = content
+        .filter((block: any) => typeof block === "string" || block?.type === "text")
+        .map((block: any) => typeof block === "string" ? block : block.text ?? "");
+      if (textParts.length > 0) {
+        parts.push({ text: textParts.join("\n") });
+      }
+      // Note: image content blocks are not handled here yet
+    } else if (typeof content === "object") {
+      parts.push({ text: String(content) });
+    }
   }
 
   if (Array.isArray(message.tool_calls)) {
@@ -645,6 +703,107 @@ function openAIMessageToGeminiContent(message: ChatMessage): any {
   };
 }
 
+/**
+ * Recursively sanitize a JSON Schema object for Gemini's function declaration API.
+ *
+ * Gemini's GenerateContent API accepts a subset of OpenAPI 3.0 schema fields.
+ * It rejects standard JSON Schema draft-07 fields like `$schema`, `$ref`, `$defs`,
+ * and `additionalProperties`, returning a 400 "Invalid JSON payload" error.
+ *
+ * Supported fields (per Google's documentation + empirical testing):
+ *   - type, description, properties, required, enum, items, format
+ *
+ * Stripped fields:
+ *   - $schema, $ref, $defs, $id, $comment, additionalProperties,
+ *     default, examples, readOnly, writeOnly, deprecated, contentEncoding,
+ *     contentMediaType, pattern (Gemini ignores regex constraints)
+ */
+const GEMINI_UNSUPPORTED_KEYS = new Set([
+  "$schema", "$ref", "$defs", "$id", "$comment", "additionalProperties",
+  "default", "examples", "readOnly", "writeOnly", "deprecated",
+  "contentEncoding", "contentMediaType", "pattern",
+  // JSON Schema composition keywords — Gemini doesn't support these
+  "anyOf", "oneOf", "allOf", "not", "const",
+  "if", "then", "else",
+  // Other unsupported validation keywords
+  "minProperties", "maxProperties", "minItems", "maxItems",
+  "uniqueItems", "multipleOf", "exclusiveMinimum", "exclusiveMaximum",
+]);
+
+/**
+ * Convert anyOf/oneOf/allOf schemas to a flattened form Gemini can understand.
+ * Gemini only supports: type, description, properties, required, enum, items, format.
+ * When we encounter anyOf/oneOf, we flatten to the first type option (best effort).
+ */
+function flattenForGemini(schema: any): any {
+  if (!schema || typeof schema !== "object") return schema;
+
+  // Handle anyOf/oneOf: pick the first non-null option as the type
+  const union = schema.anyOf ?? schema.oneOf;
+  if (Array.isArray(union)) {
+    const nonNull = union.filter((o: any) => o && o.type !== "null");
+    const picked = nonNull[0] ?? union[0];
+    if (picked) {
+      // Merge description from parent
+      const merged = { ...picked };
+      if (schema.description && !merged.description) {
+        merged.description = schema.description;
+      }
+      return flattenForGemini(merged);
+    }
+    return { type: "string" }; // safe fallback
+  }
+
+  // Handle allOf: merge all schemas together
+  if (Array.isArray(schema.allOf)) {
+    const merged: any = { type: "object", properties: {} };
+    for (const sub of schema.allOf) {
+      const flat = flattenForGemini(sub);
+      if (flat.properties) Object.assign(merged.properties, flat.properties);
+      if (flat.required) {
+        merged.required = [...(merged.required ?? []), ...flat.required];
+      }
+      if (flat.type && merged.type === "object" && flat.type !== "object") {
+        merged.type = flat.type;
+      }
+    }
+    if (schema.description) merged.description = schema.description;
+    return merged;
+  }
+
+  return schema;
+}
+
+function sanitizeSchemaForGemini(schema: any): any {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) return schema.map(sanitizeSchemaForGemini);
+
+  // First, flatten any anyOf/oneOf/allOf into Gemini-compatible types
+  const flattened = flattenForGemini(schema);
+  if (flattened !== schema) {
+    return sanitizeSchemaForGemini(flattened);
+  }
+
+  const cleaned: Record<string, any> = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
+    if (key === "properties" && value && typeof value === "object") {
+      const cleanedProps: Record<string, any> = {};
+      for (const [propName, propSchema] of Object.entries(value)) {
+        cleanedProps[propName] = sanitizeSchemaForGemini(propSchema);
+      }
+      cleaned[key] = cleanedProps;
+    } else if (key === "items") {
+      cleaned[key] = sanitizeSchemaForGemini(value);
+    } else if (value && typeof value === "object") {
+      cleaned[key] = sanitizeSchemaForGemini(value);
+    } else {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
+}
+
 function openAIToolsToGeminiFunctionDeclarations(request: ChatCompletionRequest): any[] {
   const declarations: any[] = [];
 
@@ -654,7 +813,7 @@ function openAIToolsToGeminiFunctionDeclarations(request: ChatCompletionRequest)
     declarations.push({
       name: fn.name,
       description: fn.description ?? "",
-      parameters: fn.parameters ?? { type: "object", properties: {} },
+      parameters: sanitizeSchemaForGemini(fn.parameters ?? { type: "object", properties: {} }),
     });
   }
 
@@ -663,7 +822,7 @@ function openAIToolsToGeminiFunctionDeclarations(request: ChatCompletionRequest)
     declarations.push({
       name: fn.name,
       description: fn.description ?? "",
-      parameters: fn.parameters ?? { type: "object", properties: {} },
+      parameters: sanitizeSchemaForGemini(fn.parameters ?? { type: "object", properties: {} }),
     });
   }
 

@@ -44,6 +44,11 @@ export class DBService {
     logger.info(`Database opened: ${dbPath}`);
   }
 
+  /** Get raw database instance for use in migrations or benchmarks */
+  getDb(): Database.Database {
+    return this.db;
+  }
+
   async initializeSchema(): Promise<void> {
     try {
       this.db.exec(TABLE_SCHEMA_SQL);
@@ -290,6 +295,53 @@ export class DBService {
     return row;
   }
 
+  // ─── Provider Spend Tracking ───
+
+  /**
+   * Add spend for a provider within a specific period.
+   * Uses UPSERT to accumulate spend within the same period.
+   */
+  recordSpend(provider: string, amountUsd: number, period: "daily" | "monthly"): void {
+    const dateKey = period === "daily"
+      ? new Date().toISOString().slice(0, 10) // YYYY-MM-DD
+      : new Date().toISOString().slice(0, 7);  // YYYY-MM
+
+    this.db.prepare(`
+      INSERT INTO provider_spend (date_key, period, provider, spend_usd)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(date_key, period, provider) DO UPDATE SET
+        spend_usd = spend_usd + ?
+    `).run(dateKey, period, provider, amountUsd, amountUsd);
+  }
+
+  /** Get spend for a specific provider + period (default: current period). */
+  getSpend(provider: string, period: "daily" | "monthly", dateKey?: string): number {
+    const key = dateKey ?? (period === "daily"
+      ? new Date().toISOString().slice(0, 10)
+      : new Date().toISOString().slice(0, 7));
+
+    const row = this.db.prepare(`
+      SELECT spend_usd FROM provider_spend
+      WHERE date_key = ? AND period = ? AND provider = ?
+    `).get(key, period, provider) as { spend_usd: number } | undefined;
+
+    return row?.spend_usd ?? 0;
+  }
+
+  /** Get all provider spend for a specific period. */
+  getAllSpend(period: "daily" | "monthly", dateKey?: string): Array<{ provider: string; spendUsd: number }> {
+    const key = dateKey ?? (period === "daily"
+      ? new Date().toISOString().slice(0, 10)
+      : new Date().toISOString().slice(0, 7));
+
+    return this.db.prepare(`
+      SELECT provider, spend_usd AS spendUsd
+      FROM provider_spend
+      WHERE date_key = ? AND period = ?
+      ORDER BY spend_usd DESC
+    `).all(key, period) as Array<{ provider: string; spendUsd: number }>;
+  }
+
   close(): void {
     this.db.close();
     logger.info("Database connection closed.");
@@ -382,6 +434,15 @@ CREATE TABLE IF NOT EXISTS judge_history (
   judge_note   TEXT,
   judge_model  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS provider_spend (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  date_key    TEXT NOT NULL,
+  period      TEXT NOT NULL,
+  provider    TEXT NOT NULL,
+  spend_usd   REAL NOT NULL DEFAULT 0,
+  UNIQUE(date_key, period, provider)
+);
 `;
 
 const INDEX_SCHEMA_SQL = `
@@ -394,4 +455,5 @@ CREATE INDEX IF NOT EXISTS idx_retry_request_id ON retry_attempts(request_id);
 CREATE INDEX IF NOT EXISTS idx_retry_timestamp ON retry_attempts(timestamp);
 CREATE INDEX IF NOT EXISTS idx_outcomes_provider ON call_outcomes(provider);
 CREATE INDEX IF NOT EXISTS idx_outcomes_timestamp ON call_outcomes(timestamp);
+CREATE INDEX IF NOT EXISTS idx_spend_lookup ON provider_spend(period, provider, date_key);
 `;

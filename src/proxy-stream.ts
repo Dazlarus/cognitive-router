@@ -1,9 +1,13 @@
-// src/proxy-stream.ts — Streaming + self-healing proxy for Cognitive Router
+// src/proxy-stream.ts - Streaming + self-healing proxy for Cognitive Router
 
 import http from "node:http";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { logger } from "./logger.js";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+
+const execAsync = promisify(exec);
 import { IntentClassifier } from "./classifier.js";
 import { RoutingEngine } from "./router.js";
 import { DBService } from "./db_service.js";
@@ -15,7 +19,9 @@ import { loadProjectEnv } from "./env.js";
 import { buildStatsPayload } from "./stats.js";
 import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
 import { JudgeEvaluator } from "./judge.js";
+import { EmbeddingBenchmark, initializeBenchmarkTables } from "./benchmark_embeddings.js";
 import { raceHedgedRequests, hedgeRetryDelayMs, type HedgeCandidate } from "./hedged_request.js";
+import { registryReadiness } from "./readiness.js";
 
 const CHAT_ALIAS_MODEL = "CognitiveRouter:latest";
 const LEGACY_CHAT_ALIAS_MODEL = "CogRouter:latest";
@@ -80,7 +86,7 @@ function estimateTokenCount(request: ChatCompletionRequest): number {
   for (const msg of request.messages ?? []) {
     chars += (msg.content?.length ?? 0) + (msg.role?.length ?? 0) + 10;
   }
-  // Tools contribute significantly — include them in the estimate
+  // Tools contribute significantly - include them in the estimate
   if (Array.isArray(request.tools)) {
     chars += JSON.stringify(request.tools).length;
   }
@@ -93,7 +99,7 @@ function estimateTokenCount(request: ChatCompletionRequest): number {
 
 /**
  * Effective input token limit per provider. This is the *real* ceiling,
- * not the advertised model context window — some providers cap lower.
+ * not the advertised model context window - some providers cap lower.
  *
  * - OpenRouter free models: 66,327 tokens (hardcoded by OpenRouter)
  * - OpenRouter paid: use model's context_length (no separate cap)
@@ -130,7 +136,7 @@ function getEffectiveInputLimit(provider: string, model: string): number {
     if (isFreeModel) {
       return PROVIDER_EFFECTIVE_INPUT_LIMITS.openrouter;
     }
-    // For paid OpenRouter models, be generous — use 256K as practical limit
+    // For paid OpenRouter models, be generous - use 256K as practical limit
     return 256_000;
   }
   return PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
@@ -256,6 +262,9 @@ export class ProxyServerStreaming {
     this.db = new DBService(dbPath);
     this.db.initializeSchema();
 
+    // Initialize benchmark tables
+    initializeBenchmarkTables(this.db);
+
     this.modelRegistry = new ModelRegistry(this.db, config);
     this.costTracker = new CostTracker(this.db, config);
     this.classifier = new IntentClassifier({ tiebreakerThreshold: config.tiebreakerThreshold });
@@ -275,18 +284,29 @@ export class ProxyServerStreaming {
   }
 
   async start(): Promise<void> {
+    // Kill any lingering process on the proxy port to avoid EADDRINUSE
+    const port = this.config.proxyPort ?? 3456;
+    await this.cleanupPort(port);
+
     // Load model registry
     await this.modelRegistry.loadCachedState();
     await this.costTracker.refreshProviderStatus();
 
     this.server.listen(this.config.proxyPort, "127.0.0.1", () => {
       logger.info(`Cognitive Router proxy listening on http://127.0.0.1:${this.config.proxyPort}`);
-      logger.info(`   POST /v1/chat/completions    — Chat (streaming + non-streaming)`);
-      logger.info(`   POST /v1/embeddings           — Embeddings (Ollama + Gemini fallback)`);
-      logger.info(`   GET  /v1/models               — List available models`);
-      logger.info(`   GET  /health                  — Health check`);
-      logger.info(`   GET  /stats                   — Provider health + stats`);
+      logger.info(`   POST /v1/chat/completions    - Chat (streaming + non-streaming)`);
+      logger.info(`   POST /v1/embeddings           - Embeddings (Ollama + Gemini fallback)`);
+      logger.info(`   GET  /v1/models               - List available models`);
+      logger.info(`   GET  /health                  - Health check`);
+      logger.info(`   GET  /stats                   - Provider health + stats`);
+      logger.info(`   POST /v1/benchmark/embeddings  - Run embedding model benchmark`);
     });
+
+    // Check Ollama health before starting classifier embeddings
+    const ollamaHealthy = await this.checkOllamaHealth();
+    if (!ollamaHealthy) {
+      logger.warn("Ollama not reachable - embedding classifier will use keyword fallback");
+    }
 
     // Initialize classifier embeddings in the background. Chat can use keyword
     // fallback until prototypes are ready.
@@ -307,6 +327,7 @@ export class ProxyServerStreaming {
   // ─── Request Handler ───
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    await registryReadiness.wait();
     // CORS
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "*");
@@ -355,6 +376,20 @@ export class ProxyServerStreaming {
       if (url === "/stats" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(buildStatsPayload(this.modelRegistry, this.costTracker, this.config), null, 2));
+        return;
+      }
+
+      if (url === "/v1/benchmark/embeddings" && req.method === "POST") {
+        const benchmark = new EmbeddingBenchmark(this.db);
+        try {
+          const summary = await benchmark.runFullBenchmark();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(summary, null, 2));
+        } catch (err) {
+          logger.error(`Benchmark failed: ${err}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Benchmark failed", message: err instanceof Error ? err.message : String(err) }));
+        }
         return;
       }
 
@@ -425,10 +460,15 @@ export class ProxyServerStreaming {
       classification = { intent: "conversation", confidence: 0.5 };
     }
 
+    // Ensure confidence is always a valid number (fallback for DB constraint)
+    if (typeof classification.confidence !== 'number' || isNaN(classification.confidence)) {
+      classification.confidence = 0.5;
+    }
+
     // Estimate prompt token count for routing + context window guard
     const estimatedTokens = estimateTokenCount(request);
 
-    // Build candidate list — pass estimated tokens for size-aware routing
+    // Build candidate list - pass estimated tokens for size-aware routing
     const decision = await this.router.decide(classification, sessionKey, { estimatedTokens });
     const candidates = this.buildCandidateList(decision, request);
     const requestId = this.extractRequestId(request);
@@ -439,7 +479,7 @@ export class ProxyServerStreaming {
         sessionKey,
         messageHash: this.hashPrompt(prompt),
         intent: classification.intent,
-        confidence: classification.confidence,
+        confidence: classification.confidence ?? 0.5, // Default if missing
         provider: decision.provider,
         model: decision.model,
         scores: decision.scores,
@@ -450,7 +490,7 @@ export class ProxyServerStreaming {
     }
 
     logger.info(
-      `Chat request — session=${sessionKey} intent=${classification.intent} stream=${isStreaming} — ` +
+      `Chat request - session=${sessionKey} intent=${classification.intent} stream=${isStreaming} - ` +
       `${candidates.length} candidates across ${new Set(candidates.map(c => c.provider)).size} providers` +
       `${requestUsesTools(request) ? " tools=yes" : ""}`,
     );
@@ -464,7 +504,7 @@ export class ProxyServerStreaming {
     };
 
     if (estimatedTokens > MIN_USEFUL_CONTEXT_TOKENS) {
-      logger.info(`Large request: ~${estimatedTokens} input tokens — context guard active`);
+      logger.info(`Large request: ~${estimatedTokens} input tokens - context guard active`);
     }
 
     // Retry loop. Keep the default conservative so CogRouter can fail over
@@ -485,7 +525,7 @@ export class ProxyServerStreaming {
       const providerAttemptLimit = maxAttemptsForProvider(candidate.provider);
       const strikes = providerStrikes.get(candidate.provider) ?? 0;
       if (strikes >= providerAttemptLimit) {
-        logger.debug(`Skipping ${candidate.provider}/${candidate.model} — ${strikes} strikes`);
+        logger.debug(`Skipping ${candidate.provider}/${candidate.model} - ${strikes} strikes`);
         continue;
       }
 
@@ -494,13 +534,13 @@ export class ProxyServerStreaming {
 
       // Check circuit breaker
       if (!this.costTracker.isAvailable(candidate.provider)) {
-        logger.debug(`Skipping ${candidate.provider} — circuit open`);
+        logger.debug(`Skipping ${candidate.provider} - circuit open`);
         providerStrikes.set(candidate.provider, providerAttemptLimit);
         continue;
       }
 
       if (!this.costTracker.isAvailable(candidate.provider, candidate.model)) {
-        logger.debug(`Skipping ${candidate.provider}/${candidate.model} — model circuit open`);
+        logger.debug(`Skipping ${candidate.provider}/${candidate.model} - model circuit open`);
         providerStrikes.set(candidate.provider, strikes + 1);
         continue;
       }
@@ -510,7 +550,7 @@ export class ProxyServerStreaming {
       const effectiveLimit = getEffectiveInputLimit(candidate.provider, candidate.model);
       if (estimatedTokens > effectiveLimit) {
         logger.info(
-          `Skipping ${candidate.provider}/${candidate.model} — request ~${estimatedTokens} tokens exceeds limit ${effectiveLimit}`,
+          `Skipping ${candidate.provider}/${candidate.model} - request ~${estimatedTokens} tokens exceeds limit ${effectiveLimit}`,
         );
         providerStrikes.set(candidate.provider, strikes + 1);
         continue;
@@ -533,7 +573,7 @@ export class ProxyServerStreaming {
 
           try {
             for await (const chunk of adapter.chatCompletionStream(candidate.model, providerRequest, apiKey)) {
-              // Scrub provider model name — never leak to client
+              // Scrub provider model name - never leak to client
               chunk.model = CHAT_RESPONSE_MODEL;
 
               // Track content for judge evaluation + empty-response detection
@@ -546,7 +586,7 @@ export class ProxyServerStreaming {
                 hasPayload = true;
               }
 
-              // Forward chunk to client immediately — no buffering
+              // Forward chunk to client immediately - no buffering
               this.writeSSE(res, chunk);
               hasForwarded = true;
             }
@@ -571,12 +611,12 @@ export class ProxyServerStreaming {
               durationMs: errDurationMs, outcome: "error", timestamp: new Date().toISOString(),
             });
             logger.warn(`❌ ${candidate.provider}/${candidate.model} stream error after data sent in ${errDurationMs}ms: ${sanitizeErrorForClient(error.message).substring(0, 100)}`);
-            return; // Cannot retry — data already sent to client
+            return; // Cannot retry - data already sent to client
           }
 
-          // Stream completed — check for empty response before committing
+          // Stream completed - check for empty response before committing
           if (!hasPayload && !hasForwarded) {
-            // Stream yielded zero forwardable chunks — treat as empty response and retry
+            // Stream yielded zero forwardable chunks - treat as empty response and retry
             const err = new Error(`empty_provider_response: stream from ${candidate.provider}/${candidate.model} produced no content`);
             (err as any).code = "empty_response";
             throw err; // Re-thrown to outer catch → retry next candidate
@@ -587,7 +627,7 @@ export class ProxyServerStreaming {
           res.end();
 
           if (!hasPayload) {
-            logger.warn(`Empty stream from ${candidate.provider}/${candidate.model} — forwarded non-content chunks but no payload`);
+            logger.warn(`Empty stream from ${candidate.provider}/${candidate.model} - forwarded non-content chunks but no payload`);
           }
 
           await this.costTracker.recordCall(candidate.provider, { durationMs, outcome: "success" }, candidate.model);
@@ -610,7 +650,7 @@ export class ProxyServerStreaming {
             const evalIntent = classification.intent;
             const evalPrompt = prompt;
 
-            // Fire and forget — don't await, don't block
+            // Fire and forget - don't await, don't block
             this.judge.evaluate(evalPrompt, accumulatedContent, evalIntent)
               .then((result) => {
                 if (result) {
@@ -658,6 +698,15 @@ export class ProxyServerStreaming {
           durationMs, outcome: "success", timestamp: new Date().toISOString(),
         });
 
+        // Track token usage for subscription providers (e.g., Z.AI quota)
+        if (response.usage && candidate.provider === "zai") {
+          this.costTracker.recordTokenUsage(
+            candidate.provider,
+            response.usage.prompt_tokens || 0,
+            response.usage.completion_tokens || 0,
+          );
+        }
+
         // Track dollar spend for paid models
         const requestCost = calculateRequestCost(candidate.provider, candidate.model, this.modelRegistry, response.usage);
         if (requestCost > 0) {
@@ -677,7 +726,7 @@ export class ProxyServerStreaming {
         if (
           this.judge.shouldJudge() &&
           !this.judge.isSameModel(candidate.provider, candidate.model) &&
-          !toolCalls // Skip tool-call responses — judge evaluates text quality only
+          !toolCalls // Skip tool-call responses - judge evaluates text quality only
         ) {
           const evalProvider = candidate.provider;
           const evalModel = candidate.model;
@@ -685,7 +734,7 @@ export class ProxyServerStreaming {
           const evalPrompt = prompt;
           const evalResponse = content;
 
-          // Fire and forget — don't await, don't block
+          // Fire and forget - don't await, don't block
           this.judge.evaluate(evalPrompt, evalResponse, evalIntent)
             .then((result) => {
               if (result) {
@@ -728,7 +777,7 @@ export class ProxyServerStreaming {
         });
 
         if (newStrikes >= providerAttemptLimit) {
-          logger.info(`⏭️ ${candidate.provider} exhausted (${newStrikes} strikes) — moving to next provider`);
+          logger.info(`⏭️ ${candidate.provider} exhausted (${newStrikes} strikes) - moving to next provider`);
         }
 
         // ─── Hedged request: race fallback vs delayed primary retry ───
@@ -782,7 +831,7 @@ export class ProxyServerStreaming {
                 retryDelay,
               );
 
-              // Winner determined — record stats and send response
+              // Winner determined - record stats and send response
               const { response: winResponse, outcome: hedgeOutcome } = hedgeResult;
               const winDurationMs = hedgeOutcome.winnerDurationMs;
 
@@ -797,6 +846,15 @@ export class ProxyServerStreaming {
                 provider: hedgeOutcome.winnerProvider, model: hedgeOutcome.winnerModel,
                 durationMs: winDurationMs, outcome: "success", timestamp: new Date().toISOString(),
               });
+
+              // Track token usage for subscription providers (e.g., Z.AI quota)
+              if (winResponse.usage && hedgeOutcome.winnerProvider === "zai") {
+                this.costTracker.recordTokenUsage(
+                  hedgeOutcome.winnerProvider,
+                  winResponse.usage.prompt_tokens || 0,
+                  winResponse.usage.completion_tokens || 0,
+                );
+              }
 
               // Track dollar spend for paid models
               const hedgeCost = calculateRequestCost(
@@ -824,7 +882,7 @@ export class ProxyServerStreaming {
               return;
             } catch (hedgeErr) {
               logger.warn(
-                `Hedge failed: ${hedgeErr instanceof Error ? hedgeErr.message : hedgeErr} — continuing fallback loop`,
+                `Hedge failed: ${hedgeErr instanceof Error ? hedgeErr.message : hedgeErr} - continuing fallback loop`,
               );
               this.costTracker.recordHedgeOutcome({
                 result: "both_fail",
@@ -889,6 +947,50 @@ export class ProxyServerStreaming {
     }));
   }
 
+  // ─── Port Cleanup ───
+
+  private async cleanupPort(port: number): Promise<void> {
+    try {
+      const { stdout } = await execAsync(`netstat -ano | findstr :${port}`);
+      if (stdout.trim()) {
+        const lines = stdout.trim().split('\n');
+        for (const line of lines) {
+          const parts = line.trim().split(/\s+/);
+          const pid = parts[parts.length - 1];
+          const localAddress = parts[1];
+          // Only kill processes in LISTENING state on 127.0.0.1
+          if (localAddress.includes(`127.0.0.1:${port}`) || localAddress.includes(`0.0.0.0:${port}`)) {
+            try {
+              await execAsync(`taskkill /F /PID ${pid}`);
+              logger.info(`Killed lingering process ${pid} on port ${port}`);
+            } catch (err) {
+              // Process might have already exited
+              logger.debug(`Process ${pid} already exited: ${err}`);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // netstat might not find anything, or there's a permission issue - not fatal
+      logger.debug(`Port cleanup check for ${port}: ${err}`);
+    }
+  }
+
+  // ─── Ollama Health Check ───
+
+  private async checkOllamaHealth(): Promise<boolean> {
+    try {
+      const response = await fetch('http://localhost:11434/api/tags', {
+        method: 'GET',
+        signal: AbortSignal.timeout(5000),
+      });
+      return response.ok;
+    } catch (err) {
+      logger.debug(`Ollama health check failed: ${err}`);
+      return false;
+    }
+  }
+
   // ─── Helpers ───
 
   private writeSSE(res: http.ServerResponse, data: any): void {
@@ -938,7 +1040,7 @@ export class ProxyServerStreaming {
     if (!usesTools && decision && prioritySet.has(decision.provider)) {
       candidates.push({ provider: decision.provider, model: decision.model });
     } else if (decision && usesTools) {
-      logger.debug(`Deferring ${decision.provider}/${decision.model} — tool request uses provider priority`);
+      logger.debug(`Deferring ${decision.provider}/${decision.model} - tool request uses provider priority`);
     }
 
     const maxProviderAttempts = maxAttemptsPerProvider();
@@ -946,12 +1048,12 @@ export class ProxyServerStreaming {
     // Then top models per provider in priority order
     for (const provider of this.config.providerPriority) {
       if (usesTools && !providerSupportsTools(provider)) {
-        logger.debug(`Skipping ${provider} — request uses tools`);
+        logger.debug(`Skipping ${provider} - request uses tools`);
         continue;
       }
 
       if (!this.costTracker.isAvailable(provider)) {
-        logger.debug(`Skipping ${provider} — circuit open`);
+        logger.debug(`Skipping ${provider} - circuit open`);
         continue;
       }
 
@@ -959,7 +1061,7 @@ export class ProxyServerStreaming {
       const providerLimit = PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
       if (estimatedTokens > providerLimit) {
         logger.info(
-          `Skipping ${provider} — request ~${estimatedTokens} tokens exceeds provider limit ${providerLimit}`,
+          `Skipping ${provider} - request ~${estimatedTokens} tokens exceeds provider limit ${providerLimit}`,
         );
         continue;
       }
@@ -984,7 +1086,7 @@ export class ProxyServerStreaming {
           // Skip paid models when budget is exceeded
           if (budgetExceeded && ((m.costPer1kInput ?? 0) > 0 || (m.costPer1kOutput ?? 0) > 0)) {
             logger.info(
-              `Skipping ${m.provider}/${m.model} — budget exceeded ` +
+              `Skipping ${m.provider}/${m.model} - budget exceeded ` +
               `(daily=$${this.costTracker.getDailySpend(provider).toFixed(2)}/${this.costTracker.dailyBudget.toFixed(2)}, ` +
               `monthly=$${this.costTracker.getMonthlySpend(provider).toFixed(2)}/${this.costTracker.monthlyBudget.toFixed(2)})`,
             );
@@ -1203,7 +1305,7 @@ export async function startProxyStreaming(): Promise<void> {
   await proxy.start();
 
   const shutdown = async (signal: string) => {
-    logger.info(`${signal} received — shutting down...`);
+    logger.info(`${signal} received - shutting down...`);
     await proxy.stop();
     process.exit(0);
   };

@@ -9,6 +9,7 @@ import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig } from "./config.js";
 import type { Classification } from "./classifier.js";
 import { isGenerationModel } from "./model_policy.js";
+import { bucketForTokenCount, type SizeBucket } from "./cost_tracker.js";
 
 export interface RoutingDecision {
   provider: string;
@@ -18,9 +19,55 @@ export interface RoutingDecision {
     reliability: number;
     cost: number;
     latency: number;
+    sizeAdjust?: number;
   };
   overallScore: number;
   rationale: string;
+}
+
+/** Size-aware scoring configuration.
+ *
+ *  SMALL requests (<5K tokens) get a boost toward low-latency providers.
+ *  LARGE requests (>50K tokens) get a boost toward high-throughput providers.
+ *  MEDIUM requests get no adjustment (neutral).
+ *
+ *  The adjustment magnitude is intentionally small (±5–10%) — this nudges
+ *  the ranking without overriding strong capability/reliability signals. */
+const SIZE_SCORE_BOOST = 0.08;   // max boost for best size-fit provider
+const SIZE_SCORE_PENALTY = 0.05; // max penalty for worst size-fit provider
+
+/** Providers that are known to be fast for small requests (<5K tokens).
+ *  These get boosted on small requests. */
+const LOW_LATENCY_PROVIDERS = new Set(["zai", "gemini"]);
+/** Providers with large context windows / high throughput for big requests. */
+const HIGH_THROUGHPUT_PROVIDERS = new Set(["gemini", "zai"]);
+
+/** Compute a size-aware score adjustment in range [-SIZE_SCORE_PENALTY, +SIZE_SCORE_BOOST].
+ *  Returns 0 for medium-sized requests (no adjustment). */
+function sizeScoreAdjust(
+  provider: string,
+  estimatedTokens: number,
+): number {
+  const bucket = bucketForTokenCount(estimatedTokens);
+
+  if (bucket === "small") {
+    // Boost low-latency providers, penalize those known to be slow on small inputs
+    if (LOW_LATENCY_PROVIDERS.has(provider)) return SIZE_SCORE_BOOST;
+    // Local models are slower for quick requests due to GPU scheduling overhead
+    if (provider === "ollama") return -SIZE_SCORE_PENALTY;
+    return 0;
+  }
+
+  if (bucket === "large") {
+    // Boost providers with large context windows and high throughput
+    if (HIGH_THROUGHPUT_PROVIDERS.has(provider)) return SIZE_SCORE_BOOST;
+    // Providers with small effective limits are penalized for large requests
+    if (provider === "ollama") return -SIZE_SCORE_PENALTY;
+    if (provider === "openrouter") return -SIZE_SCORE_PENALTY * 0.5; // free-tier 66K cap
+    return 0;
+  }
+
+  return 0; // medium — no adjustment
 }
 
 export class RoutingEngine {
@@ -34,9 +81,15 @@ export class RoutingEngine {
   async decide(
     classification: Classification,
     sessionKey: string,
-    _context: any,
+    context: any = {},
   ): Promise<RoutingDecision | null> {
     const { intent, confidence } = classification;
+
+    // Extract estimated token count from context (passed by proxy-stream)
+    const estimatedTokens: number = context?.estimatedTokens ?? 0;
+    const sizeBucket: SizeBucket | null = estimatedTokens > 0
+      ? bucketForTokenCount(estimatedTokens)
+      : null;
 
     // Check for manual overrides first
     const override = this.config.overrides.find((o) => o.intent === intent);
@@ -90,6 +143,15 @@ export class RoutingEngine {
       };
     }
 
+    if (sizeBucket) {
+      logger.debug(
+        `Size-aware routing: ~${estimatedTokens} tokens (${sizeBucket} bucket) — ` +
+        `adjustments: ${this.config.providerPriority
+          .map((p) => `${p}=${sizeScoreAdjust(p, estimatedTokens) >= 0 ? "+" : ""}${sizeScoreAdjust(p, estimatedTokens).toFixed(3)}`)
+          .join(", ")}`,
+      );
+    }
+
     // Score every candidate
     const scored = candidates.map((modelEntry) => {
       const capabilityScore =
@@ -112,12 +174,51 @@ export class RoutingEngine {
         costScore *= 0.85;
       }
 
+      // ─── Size-aware scoring adjustment ───
+      // For small requests, boost low-latency providers.
+      // For large requests, boost high-throughput providers.
+      // This is a gentle nudge, not a hard filter.
+      let sizeAdjust = 0;
+      if (sizeBucket) {
+        sizeAdjust = sizeScoreAdjust(modelEntry.provider, estimatedTokens);
+
+        // If we have observed latency data for this provider+bucket, refine the
+        // adjustment based on actual performance rather than static defaults.
+        if (sizeAdjust !== 0) {
+          const observedLatency = this.costTracker.getSizeLatencyMs(modelEntry.provider, sizeBucket);
+          if (observedLatency !== undefined) {
+            // Provider is faster than average for this bucket → extra boost
+            // Provider is slower than average → reduce boost / increase penalty
+            const bucketAvg = this.computeBucketAverageLatency(sizeBucket);
+            if (bucketAvg !== undefined && bucketAvg > 0) {
+              const ratio = observedLatency / bucketAvg;
+              // ratio < 1 means faster than average → scale boost up
+              // ratio > 1 means slower than average → scale boost down
+              sizeAdjust = sizeAdjust * (2 - Math.min(ratio, 2));
+              sizeAdjust = Math.max(-SIZE_SCORE_PENALTY, Math.min(SIZE_SCORE_BOOST, sizeAdjust));
+            }
+          }
+        }
+      }
+
       const w = this.config.weights;
       const overall =
         w.capability * capabilityScore +
         w.reliability * reliabilityScore +
         w.cost * costScore +
-        w.latency * latencyScore;
+        w.latency * latencyScore +
+        sizeAdjust; // additive adjustment (not weighted)
+
+      const rationaleParts = [
+        `cap=${capabilityScore.toFixed(2)}`,
+        `rel=${reliabilityScore.toFixed(2)}`,
+        `cost=${costScore.toFixed(2)}`,
+        `lat=${latencyScore.toFixed(2)}`,
+        `mult=${usageMultiplier}`,
+      ];
+      if (sizeAdjust !== 0) {
+        rationaleParts.push(`size=${sizeAdjust >= 0 ? "+" : ""}${sizeAdjust.toFixed(3)}`);
+      }
 
       return {
         provider: modelEntry.provider,
@@ -127,9 +228,10 @@ export class RoutingEngine {
           reliability: reliabilityScore,
           cost: costScore,
           latency: latencyScore,
+          ...(sizeAdjust !== 0 ? { sizeAdjust } : {}),
         },
         overallScore: overall,
-        rationale: `cap=${capabilityScore.toFixed(2)} rel=${reliabilityScore.toFixed(2)} cost=${costScore.toFixed(2)} lat=${latencyScore.toFixed(2)} mult=${usageMultiplier}`,
+        rationale: rationaleParts.join(" "),
       };
     });
 
@@ -169,5 +271,17 @@ export class RoutingEngine {
       `Winner: ${best.provider}/${best.model} (${best.overallScore.toFixed(3)}) — ${best.rationale}`,
     );
     return best;
+  }
+
+  /** Compute the average observed latency across all providers for a size bucket.
+   *  Used as a baseline for relative size-score refinement. */
+  private computeBucketAverageLatency(bucket: SizeBucket): number | undefined {
+    const latencies: number[] = [];
+    for (const provider of this.config.providerPriority) {
+      const ms = this.costTracker.getSizeLatencyMs(provider, bucket);
+      if (ms !== undefined) latencies.push(ms);
+    }
+    if (latencies.length === 0) return undefined;
+    return latencies.reduce((a, b) => a + b, 0) / latencies.length;
   }
 }

@@ -13,6 +13,10 @@ export interface ProviderBudget {
   budgetType: "free" | "subscription" | "pay_per_token" | "credits";
   priority: "high" | "medium" | "low";
   monthlyBudgetUsd?: number;
+  /** For subscription providers: track quota consumption. Values: 0-1 (1=exhausted) */
+  quotaConsumed?: number;
+  /** For subscription providers: display quota consumption % */
+  quotaPercent?: number;
 }
 
 export interface EmbeddingConfig {
@@ -59,7 +63,7 @@ const DEFAULT_WEIGHTS: Weights = {
 
 const DEFAULT_PROVIDERS: Record<string, ProviderBudget> = {
   openrouter: { budgetType: "free", priority: "high" },
-  zai: { budgetType: "subscription", priority: "high" },
+  zai: { budgetType: "subscription", priority: "high", quotaConsumed: 0, quotaPercent: 0 },
   gemini: { budgetType: "credits", priority: "medium" },
   requesty: { budgetType: "pay_per_token", priority: "medium", monthlyBudgetUsd: 20 },
   ollama: { budgetType: "free", priority: "low" },
@@ -67,7 +71,7 @@ const DEFAULT_PROVIDERS: Record<string, ProviderBudget> = {
 
 const DEFAULT_EMBEDDING: EmbeddingConfig = {
   provider: "ollama",
-  model: "nomic-embed-text",
+  model: "qwen3-embedding:latest", // Updated 2026-06-23: 2x faster (214ms vs 389ms) per embedding benchmark
   fallback: "gemini",
   fallbackModel: "gemini-embedding-001",
   timeoutMs: 2000,

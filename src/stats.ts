@@ -1,6 +1,7 @@
 import type { CognitiveRouterConfig } from "./config.js";
 import type { CostTracker } from "./cost_tracker.js";
 import type { ModelRegistry, ModelCapability } from "./model_registry.js";
+import { PrefixCache } from "./prefix_cache.js";
 import {
   generationRoutingExclusionReason,
   isGenerationModel,
@@ -57,6 +58,7 @@ export function buildStatsPayload(
     consecutiveFailures: s.consecutiveFailures,
     backoffTier: s.backoffTier,
     monthlySpendUsd: s.monthlySpendUsd,
+    dailySpendUsd: s.dailySpendUsd,
     recentCalls: s.recentCalls,
     avgLatencyMs: averageLatency(s.recentLatencies),
     scores: {
@@ -65,6 +67,11 @@ export function buildStatsPayload(
       latency: costTracker.getLatencyScore(s.name),
     },
     available: costTracker.isAvailable(s.name),
+    budgetExceeded: costTracker.isBudgetExceeded(s.name),
+    // Quota tracking for subscription providers (e.g., Z.AI)
+    quotaPercent: s.budget.budgetType === "subscription" ? costTracker.getQuotaPercent(s.name) : null,
+    totalTokensUsed: s.budget.budgetType === "subscription" ? costTracker.getTotalTokensUsed(s.name) : null,
+    currentQuotaMultiplier: s.budget.budgetType === "subscription" ? costTracker.getCurrentQuotaMultiplier() : null,
   }));
 
   const modelHealthStates = costTracker.getAllModelStates().map((s) => ({
@@ -168,6 +175,17 @@ export function buildStatsPayload(
     modelHealth: modelHealthStates,
     modelCount: models.length,
     models,
+    prefixCache: PrefixCache.instance.getStats(),
+    budget: {
+      dailyBudgetUsd: costTracker.dailyBudget,
+      monthlyBudgetUsd: costTracker.monthlyBudget,
+      spendByProvider: providerStates.map((s) => ({
+        provider: s.name,
+        dailySpendUsd: s.dailySpendUsd,
+        monthlySpendUsd: s.monthlySpendUsd,
+        budgetExceeded: s.budgetExceeded,
+      })),
+    },
     routing: {
       providerPriority,
       weights,
