@@ -197,7 +197,8 @@ export class EmbeddingBenchmark {
     }
 
     const data = await response.json() as any;
-    return data.embedding;
+    // Ollama returns { embeddings: [...] } where embeddings is an array
+    return data.embeddings[0];
   }
 
   /** Calculate quality score based on semantic similarity between intents */
@@ -222,11 +223,14 @@ export class EmbeddingBenchmark {
     // Lower average similarity = better separation = higher quality
     const avgSimilarity = similarities.reduce((a, b) => a + b, 0) / similarities.length;
 
+    // Log the raw similarity for debugging
+    logger.info(`  → Raw avgSimilarity: ${avgSimilarity.toFixed(3)} (min: ${Math.min(...similarities).toFixed(3)}, max: ${Math.max(...similarities).toFixed(3)})`);
+
     // Convert to score: lower similarity = higher quality (inverted relationship)
-    // Avg similarity typically ranges from 0.1 (excellent) to 0.8 (poor)
-    // If avg similarity is 0.1, quality should be ~1.0
-    // If avg similarity is 0.8, quality should be ~0.0
-    const qualityScore = Math.max(0, Math.min(1, 1 - (avgSimilarity - 0.1) / 0.7));
+    // Realistic range for well-separated embeddings: 0.2 (excellent) to 0.6 (poor)
+    // If avg similarity is 0.2, quality should be ~1.0
+    // If avg similarity is 0.6, quality should be ~0.0
+    const qualityScore = Math.max(0, Math.min(1, 1 - (avgSimilarity - 0.2) / 0.4));
 
     return qualityScore;
   }

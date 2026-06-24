@@ -77,6 +77,8 @@
 | nomic-embed-text-v2-moe:latest | 1.000 | 770ms | 0.600 | SKIP |
 | embeddinggemma:latest | 1.000 | 3141ms | 0.600 | SKIP |
 
+**Note:** All models reported quality=1.000 due to quality calculation thresholds. Updated thresholds from 0.1/0.8 to 0.2/0.6 and added debug logging to show raw similarity values.
+
 **Decision:** Updated default embedding model to `qwen3-embedding:latest` (2x faster than previous default).
 
 **Location:**
