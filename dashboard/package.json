@@ -1,0 +1,14 @@
+{
+  "name": "cognitive-router-dashboard",
+  "version": "1.0.0",
+  "description": "Dashboard for Cognitive Router analytics",
+  "main": "api.js",
+  "scripts": {
+    "start": "node api.js",
+    "dev": "node api.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  }
+}

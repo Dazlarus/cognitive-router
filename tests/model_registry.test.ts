@@ -86,11 +86,11 @@ describe("ModelRegistry — Seed Data", () => {
 
   it("should load all seeded Z.AI models", () => {
     const zaiModels = registry.getAllModels().filter((m) => m.provider === "zai");
-    // 13 seeded Z.AI models
-    assert.ok(zaiModels.length >= 13, `Expected >= 13 Z.AI models, got ${zaiModels.length}`);
+    // 9 seeded Z.AI models (after removing non-plan-eligible: glm-5, glm-5v-turbo, glm-4.7-flash, glm-4.7-flashx, glm-4.6)
+    assert.ok(zaiModels.length >= 9, `Expected >= 9 Z.AI models, got ${zaiModels.length}`);
 
     // Verify key models exist
-    for (const model of ["glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-4.7", "glm-4.7-flash"]) {
+    for (const model of ["glm-5.2", "glm-5.1", "glm-5-turbo", "glm-4.7", "glm-4.6v"]) {
       assert.ok(registry.getCapability("zai", model), `Should have zai/${model}`);
     }
   });
@@ -127,9 +127,9 @@ describe("ModelRegistry — Seed Data", () => {
   });
 
   it("should mark vision models correctly", () => {
-    const visionModel = registry.getCapability("zai", "glm-5v-turbo");
+    const visionModel = registry.getCapability("zai", "glm-4.6v");
     assert.ok(visionModel);
-    assert.ok(visionModel!.modalities.includes("vision"), "glm-5v-turbo should have vision modality");
+    assert.ok(visionModel!.modalities.includes("vision"), "glm-4.6v should have vision modality");
 
     const textModel = registry.getCapability("zai", "glm-5.2");
     assert.ok(textModel);
@@ -142,9 +142,9 @@ describe("ModelRegistry — Seed Data", () => {
     assert.equal(registry.getCapability("zai", "glm-5-turbo")!.planEligible, true);
     assert.equal(registry.getCapability("zai", "glm-4.7")!.planEligible, true);
 
-    // NOT eligible
-    assert.equal(registry.getCapability("zai", "glm-5.1")!.planEligible, false);
-    assert.equal(registry.getCapability("zai", "glm-4.7-flash")!.planEligible, false);
+    // NOT eligible (vision models)
+    assert.equal(registry.getCapability("zai", "glm-4.6v")!.planEligible, false);
+    assert.equal(registry.getCapability("zai", "glm-4.5v")!.planEligible, false);
   });
 });
 
@@ -198,10 +198,10 @@ describe("ModelRegistry — Capability Scoring", () => {
     assert.ok(topScore > lowScore, "GLM-5.2 should be better at coding than GLM-4.5-air");
   });
 
-  it("should have higher conversation score for flash models than flagship", () => {
-    const flashScore = registry.getCapabilityScore("zai", "glm-4.7-flash", "conversation");
-    const flagshipScore = registry.getCapabilityScore("zai", "glm-5.2", "conversation");
-    assert.ok(flashScore > flagshipScore, "Flash model should be better at conversation (optimized for chat)");
+  it("should have higher coding score for flagship than budget models", () => {
+    const flagshipScore = registry.getCapabilityScore("zai", "glm-5.2", "coding");
+    const budgetScore = registry.getCapabilityScore("zai", "glm-4.5-air", "coding");
+    assert.ok(flagshipScore > budgetScore, "Flagship model should be better at coding than budget model");
   });
 });
 

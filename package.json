@@ -11,6 +11,7 @@
     "start:prod": "node dist/server.js",
     "install-service": "tsx scripts/install-service.ts",
     "uninstall-service": "tsx scripts/install-service.ts --uninstall",
+    "test": "tsx --test tests/*.test.ts",
     "service-status": "tsx scripts/install-service.ts --status"
   },
   "keywords": [

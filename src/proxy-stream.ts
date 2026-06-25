@@ -510,7 +510,7 @@ export class ProxyServerStreaming {
     // Retry loop. Keep the default conservative so CogRouter can fail over
     // before OpenClaw's outer LLM timeout fires.
     let lastError: Error | null = null;
-    const providerStrikes = new Map<string, number>();
+    const modelStrikes = new Map<string, number>();
     const requestDeadlineMs = Date.now() + routerRequestTimeoutMs();
     let hedgeAttempted = false;
 
@@ -523,9 +523,10 @@ export class ProxyServerStreaming {
       }
 
       const providerAttemptLimit = maxAttemptsForProvider(candidate.provider);
-      const strikes = providerStrikes.get(candidate.provider) ?? 0;
+      const candidateKey = `${candidate.provider}/${candidate.model}`;
+      const strikes = modelStrikes.get(candidateKey) ?? 0;
       if (strikes >= providerAttemptLimit) {
-        logger.debug(`Skipping ${candidate.provider}/${candidate.model} - ${strikes} strikes`);
+        logger.debug(`Skipping ${candidateKey} - ${strikes} strikes`);
         continue;
       }
 
@@ -535,13 +536,13 @@ export class ProxyServerStreaming {
       // Check circuit breaker
       if (!this.costTracker.isAvailable(candidate.provider)) {
         logger.debug(`Skipping ${candidate.provider} - circuit open`);
-        providerStrikes.set(candidate.provider, providerAttemptLimit);
+        modelStrikes.set(candidateKey, providerAttemptLimit);
         continue;
       }
 
       if (!this.costTracker.isAvailable(candidate.provider, candidate.model)) {
-        logger.debug(`Skipping ${candidate.provider}/${candidate.model} - model circuit open`);
-        providerStrikes.set(candidate.provider, strikes + 1);
+        logger.debug(`Skipping ${candidateKey} - model circuit open`);
+        modelStrikes.set(candidateKey, strikes + 1);
         continue;
       }
 
@@ -552,7 +553,7 @@ export class ProxyServerStreaming {
         logger.info(
           `Skipping ${candidate.provider}/${candidate.model} - request ~${estimatedTokens} tokens exceeds limit ${effectiveLimit}`,
         );
-        providerStrikes.set(candidate.provider, strikes + 1);
+        modelStrikes.set(candidate.provider, strikes + 1);
         continue;
       }
 
@@ -763,7 +764,7 @@ export class ProxyServerStreaming {
 
         lastError = error;
         const newStrikes = strikes + 1;
-        providerStrikes.set(candidate.provider, newStrikes);
+        modelStrikes.set(candidate.provider, newStrikes);
 
         logger.warn(
           `❌ ${candidate.provider}/${candidate.model} failed (${outcome}) in ${durationMs}ms ` +

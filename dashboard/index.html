@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cognitive Router Dashboard</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #0f0f1a;
+      color: #e0e0e0;
+    }
+    h1, h2, h3 { margin-top: 0; }
+    .grid {
+      display: grid;
+      gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    }
+    .card {
+      background: #1a1a2e;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 20px;
+    }
+    .status-healthy { color: #4ade80; }
+    .status-throttled { color: #fbbf24; }
+    .status-error { color: #f87171; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 10px;
+      text-align: left;
+      border-bottom: 1px solid #333;
+    }
+    th { color: #94a3b8; font-weight: 600; }
+    .stat { font-size: 24px; font-weight: bold; }
+    .stat-label { color: #94a3b8; font-size: 14px; }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 12px;
+      background: #2d2d44;
+    }
+    .success-rate { color: #4ade80; }
+    .latency-ms { color: #60a5fa; }
+    .refresh-btn {
+      background: #6366f1;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .refresh-btn:hover { background: #4f46e5; }
+    .loading { opacity: 0.5; }
+  </style>
+</head>
+<body>
+  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+    <h1>🧠 Cognitive Router Dashboard</h1>
+    <button class="refresh-btn" onclick="loadData()">🔄 Refresh</button>
+  </div>
+
+  <!-- Summary Stats -->
+  <div class="grid" style="margin-bottom: 20px;">
+    <div class="card">
+      <div class="stat" id="totalDecisions">-</div>
+      <div class="stat-label">Total Decisions</div>
+    </div>
+    <div class="card">
+      <div class="stat" id="decisionsToday">-</div>
+      <div class="stat-label">Decisions Today</div>
+    </div>
+    <div class="card">
+      <div class="stat" id="avgLatency">-</div>
+      <div class="stat-label">Avg Latency (ms)</div>
+    </div>
+    <div class="card">
+      <div class="stat" id="successRate">-</div>
+      <div class="stat-label">Success Rate Today</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <!-- Provider Health -->
+    <div class="card">
+      <h2>Provider Health</h2>
+      <table id="providersTable">
+        <thead>
+          <tr>
+            <th>Provider</th>
+            <th>Status</th>
+            <th>Errors</th>
+            <th>Spend ($)</th>
+          </tr>
+        </thead>
+        <tbody id="providersBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Recent Decisions -->
+    <div class="card" style="grid-column: span 2;">
+      <h2>Recent Routing Decisions</h2>
+      <table id="decisionsTable">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Intent</th>
+            <th>Confidence</th>
+            <th>Provider</th>
+            <th>Model</th>
+            <th>Score</th>
+            <th>Outcome</th>
+          </tr>
+        </thead>
+        <tbody id="decisionsBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Model Rankings -->
+    <div class="card" style="grid-column: span 2;">
+      <h2>Model Rankings (Last 7 Days)</h2>
+      <table id="rankingsTable">
+        <thead>
+          <tr>
+            <th>Intent</th>
+            <th>Provider/Model</th>
+            <th>Calls</th>
+            <th>Success Rate</th>
+            <th>Avg Score</th>
+          </tr>
+        </thead>
+        <tbody id="rankingsBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Retry Attempts -->
+    <div class="card">
+      <h2>Retry Attempts</h2>
+      <table id="retriesTable">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Failed</th>
+            <th>Outcome</th>
+            <th>Retry</th>
+          </tr>
+        </thead>
+        <tbody id="retriesBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Spend Tracking -->
+    <div class="card">
+      <h2>Spend (Daily)</h2>
+      <table id="spendTable">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Provider</th>
+            <th>Amount</th>
+          </tr>
+        </thead>
+        <tbody id="spendBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = 'http://localhost:3457/api';
+
+    async function loadData() {
+      document.body.classList.add('loading');
+
+      try {
+        await Promise.all([
+          loadStats(),
+          loadProviders(),
+          loadDecisions(),
+          loadRankings(),
+          loadRetries(),
+          loadSpend()
+        ]);
+      } catch (err) {
+        console.error('Error loading data:', err);
+        alert('Failed to load data. Make sure the API is running on port 3457.');
+      } finally {
+        document.body.classList.remove('loading');
+      }
+    }
+
+    async function loadStats() {
+      const res = await fetch(`${API_BASE}/stats/summary`);
+      const stats = await res.json();
+
+      document.getElementById('totalDecisions').textContent = stats.totalDecisions || '-';
+      document.getElementById('decisionsToday').textContent = stats.decisionsToday || '-';
+      document.getElementById('avgLatency').textContent = stats.avgLatencyMs ? Math.round(stats.avgLatencyMs) : '-';
+      document.getElementById('successRate').textContent = stats.successRateToday ? `${stats.successRateToday}%` : '-';
+    }
+
+    async function loadProviders() {
+      const res = await fetch(`${API_BASE}/providers`);
+      const providers = await res.json();
+
+      const tbody = document.getElementById('providersBody');
+      tbody.innerHTML = providers.map(p => `
+        <tr>
+          <td><strong>${p.name}</strong></td>
+          <td class="status-${p.status.toLowerCase()}">${p.status}</td>
+          <td>${p.rate_limit_errors || 0}</td>
+          <td>${p.monthly_spend_usd ? `$${p.monthly_spend_usd.toFixed(2)}` : '-'}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function loadDecisions() {
+      const res = await fetch(`${API_BASE}/decisions?limit=20`);
+      const decisions = await res.json();
+
+      const tbody = document.getElementById('decisionsBody');
+      tbody.innerHTML = decisions.map(d => `
+        <tr>
+          <td>${new Date(d.timestamp).toLocaleTimeString()}</td>
+          <td><span class="tag">${d.intent}</span></td>
+          <td>${(d.confidence * 100).toFixed(0)}%</td>
+          <td>${d.provider}</td>
+          <td style="font-size: 12px;">${d.model.split('/').pop()}</td>
+          <td>${d.score.toFixed(3)}</td>
+          <td class="${d.outcome === 'success' ? 'success-rate' : 'status-error'}">${d.outcome}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function loadRankings() {
+      const res = await fetch(`${API_BASE}/models/rankings`);
+      const rankings = await res.json();
+
+      const tbody = document.getElementById('rankingsBody');
+      tbody.innerHTML = rankings.slice(0, 15).map(r => `
+        <tr>
+          <td><span class="tag">${r.intent}</span></td>
+          <td>${r.provider}/${r.model.split('/').pop()}</td>
+          <td>${r.calls}</td>
+          <td class="${r.successRate >= 90 ? 'success-rate' : 'status-throttled'}">${r.successRate}%</td>
+          <td>${r.avgScore.toFixed(3)}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function loadRetries() {
+      const res = await fetch(`${API_BASE}/retries?limit=10`);
+      const retries = await res.json();
+
+      const tbody = document.getElementById('retriesBody');
+      tbody.innerHTML = retries.map(r => `
+        <tr>
+          <td>${new Date(r.timestamp).toLocaleTimeString()}</td>
+          <td style="font-size: 12px;">${r.failed_provider.split('/').pop()}</td>
+          <td class="status-error">${r.failed_outcome}</td>
+          <td>${r.retry_provider.split('/').pop()}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function loadSpend() {
+      const res = await fetch(`${API_BASE}/spend?period=daily`);
+      const spend = await res.json();
+
+      const tbody = document.getElementById('spendBody');
+      tbody.innerHTML = spend.slice(0, 10).map(s => `
+        <tr>
+          <td>${s.date_key}</td>
+          <td>${s.provider}</td>
+          <td>$${s.spend_usd.toFixed(2)}</td>
+        </tr>
+      `).join('');
+    }
+
+    // Auto-refresh every 30 seconds
+    setInterval(loadData, 30000);
+
+    // Initial load
+    loadData();
+  </script>
+</body>
+</html>
