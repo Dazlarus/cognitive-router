@@ -18,8 +18,10 @@ import { getProvider } from "./providers.js";
 import { loadProjectEnv } from "./env.js";
 import { buildStatsPayload } from "./stats.js";
 import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
+import { ModelCurator } from "./curator.js";
 import { JudgeEvaluator } from "./judge.js";
 import { EmbeddingBenchmark, initializeBenchmarkTables } from "./benchmark_embeddings.js";
+import type { EmbeddingModelInfo } from "./benchmark_embeddings.js";
 import { raceHedgedRequests, hedgeRetryDelayMs, type HedgeCandidate } from "./hedged_request.js";
 import { registryReadiness } from "./readiness.js";
 
@@ -28,8 +30,8 @@ const LEGACY_CHAT_ALIAS_MODEL = "CogRouter:latest";
 const EMBEDDING_ALIAS_MODEL = "Embeddings:latest";
 const CHAT_RESPONSE_MODEL = CHAT_ALIAS_MODEL;
 const EMBEDDING_RESPONSE_MODEL = EMBEDDING_ALIAS_MODEL;
-const DEFAULT_OPENROUTER_TOOL_MODEL = "qwen/qwen3-coder:free";
-const DEFAULT_OPENROUTER_FALLBACK_MODEL = "openrouter/owl-alpha";
+const DEFAULT_OPENROUTER_TOOL_MODEL = "qwen/qwen3-30b-a3b-instruct-2507";
+const DEFAULT_OPENROUTER_FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 const DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-2.5-flash";
 const DEFAULT_GEMINI_TOOL_MODEL = "gemini-2.5-flash";
 const DEFAULT_OPENROUTER_PAID_FALLBACK_MODEL = "deepseek/deepseek-v4-flash";
@@ -37,11 +39,8 @@ const ALLOWED_OPENROUTER_FALLBACK_MODELS = new Set([
   "cohere/north-mini-code:free",
   "openrouter/free",
   "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "nvidia/nemotron-3-super-120b-a12b:free",
-  "openrouter/owl-alpha",
   "poolside/laguna-m.1:free",
-  "qwen/qwen3-coder:free",
-  "qwen/qwen3.6-plus:free",
+  "qwen/qwen3-30b-a3b-instruct-2507",
 ]);
 
 // Paid OpenRouter models allowed as mid-tier fallback (after free, before local)
@@ -80,66 +79,93 @@ export interface ChatCompletionRequest {
  * This is intentionally conservative (overestimates slightly) so we err
  * on the side of skipping providers that would reject the request.
  */
+// Lazy-loaded tiktoken encoder for accurate token counting.
+// cl100k_base is used by GPT-4, Qwen, and most modern models.
+let _tiktoken: { encode(text: string): number[] } | null = null;
+let _tiktokenLoadFailed = false;
+
+function getTiktoken(): { encode(text: string): number[] } | null {
+  if (_tiktokenLoadFailed) return null;
+  if (_tiktoken) return _tiktoken;
+  try {
+    const { Tiktoken } = require("js-tiktoken");
+    _tiktoken = new (Tiktoken as any)(undefined as any, [] as any);
+    return _tiktoken;
+  } catch (e) {
+    logger.warn(`tiktoken load failed, falling back to char estimation: ${e instanceof Error ? e.message : e}`);
+    _tiktokenLoadFailed = true;
+    return null;
+  }
+}
+
 function estimateTokenCount(request: ChatCompletionRequest): number {
-  // Serialize messages + tools to approximate the full prompt payload
+  const encoder = getTiktoken();
+  if (encoder) {
+    let tokenCount = 0;
+    for (const msg of request.messages ?? []) {
+      if (typeof msg.content === "string") {
+        tokenCount += encoder.encode(msg.content).length;
+      } else if (Array.isArray(msg.content)) {
+        tokenCount += encoder.encode(JSON.stringify(msg.content)).length;
+      }
+      tokenCount += 4; // role + formatting overhead
+    }
+    if (Array.isArray(request.tools) && request.tools.length > 0) {
+      tokenCount += encoder.encode(JSON.stringify(request.tools)).length;
+    }
+    if (Array.isArray(request.functions) && request.functions.length > 0) {
+      tokenCount += encoder.encode(JSON.stringify(request.functions)).length;
+    }
+    return tokenCount;
+  }
+
+  // Fallback: char-based heuristic
   let chars = 0;
   for (const msg of request.messages ?? []) {
-    chars += (msg.content?.length ?? 0) + (msg.role?.length ?? 0) + 10;
+    if (typeof msg.content === "string") {
+      chars += msg.content.length;
+    } else if (Array.isArray(msg.content)) {
+      chars += JSON.stringify(msg.content).length;
+    }
+    chars += (msg.role?.length ?? 0) + 5;
   }
-  // Tools contribute significantly - include them in the estimate
   if (Array.isArray(request.tools)) {
     chars += JSON.stringify(request.tools).length;
   }
-  // System/tool overhead in OpenAI format
   if (Array.isArray(request.functions)) {
     chars += JSON.stringify(request.functions).length;
   }
-  return Math.ceil(chars / 4);
+  return Math.ceil(chars / 3.5);
 }
 
-/**
- * Effective input token limit per provider. This is the *real* ceiling,
- * not the advertised model context window - some providers cap lower.
- *
- * - OpenRouter free models: 66,327 tokens (hardcoded by OpenRouter)
- * - OpenRouter paid: use model's context_length (no separate cap)
- * - Gemini: 1M (very generous)
- * - ZAI: 200K
- * - Ollama: model-dependent, but we use 32K as safe default
- */
 const PROVIDER_EFFECTIVE_INPUT_LIMITS: Record<string, number> = {
   zai: 200_000,
-  openrouter: 66_327, // OpenRouter free-tier hard cap
+  openrouter: 66_327,
   gemini: 1_000_000,
   ollama: 32_768,
 };
 
-/**
- * Minimum input token capacity required for the router to be useful.
- * Requests below this threshold are likely small enough for any provider.
- */
 const MIN_USEFUL_CONTEXT_TOKENS = Number.parseInt(
   process.env.ROUTER_MIN_CONTEXT_TOKENS ?? "86000",
   10,
 ) || 86_000;
 
-/**
- * Returns the effective input token limit for a specific provider+model.
- * For OpenRouter, checks if the model is a free variant (capped at 66K)
- * vs a paid model (uses model context length).
- */
+const CONTEXT_SAFETY_MARGIN = 1 - Number.parseFloat(
+  process.env.ROUTER_CONTEXT_SAFETY_MARGIN ?? "0.20",
+);
+
 function getEffectiveInputLimit(provider: string, model: string): number {
-  if (provider === "openrouter") {
-    // Free models (ending in :free) and owl-alpha are subject to the 66K cap.
-    // Paid models through OpenRouter use the model's real context length.
-    const isFreeModel = model.endsWith(":free") || model === "openrouter/owl-alpha";
-    if (isFreeModel) {
-      return PROVIDER_EFFECTIVE_INPUT_LIMITS.openrouter;
+  const raw = (() => {
+    if (provider === "openrouter") {
+      const isFreeModel = model.endsWith(":free");
+      if (isFreeModel) {
+        return PROVIDER_EFFECTIVE_INPUT_LIMITS.openrouter;
+      }
+      return 256_000;
     }
-    // For paid OpenRouter models, be generous - use 256K as practical limit
-    return 256_000;
-  }
-  return PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
+    return PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
+  })();
+  return Math.floor(raw * CONTEXT_SAFETY_MARGIN);
 }
 
 function maxAttemptsPerProvider(): number {
@@ -150,6 +176,25 @@ function maxAttemptsPerProvider(): number {
 function routerRequestTimeoutMs(): number {
   const raw = Number.parseInt(process.env.ROUTER_REQUEST_TIMEOUT_MS ?? "55000", 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 55_000;
+}
+
+function streamStallTimeoutMs(): number {
+  const raw = Number.parseInt(process.env.ROUTER_STREAM_STALL_TIMEOUT_MS ?? "45000", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
+}
+
+// ─── Buffered streaming types ───
+
+interface BufferedChunk {
+  // Deep-cloned SSE chunk from provider, with model scrubbed
+  chunk: any;
+}
+
+interface BufferedStreamResult {
+  chunks: BufferedChunk[];
+  accumulatedContent: string;
+  finishReason: string | null;
+  hasPayload: boolean;
 }
 
 function requestUsesTools(request: ChatCompletionRequest): boolean {
@@ -251,6 +296,7 @@ export class ProxyServerStreaming {
   private config: CognitiveRouterConfig;
   private embedFn: (text: string) => Promise<number[]>;
   private judge: JudgeEvaluator;
+  private curator: ModelCurator;
   private initialized = false;
 
   constructor(config: CognitiveRouterConfig) {
@@ -272,6 +318,7 @@ export class ProxyServerStreaming {
 
     this.embedFn = this.createEmbedder();
     this.judge = new JudgeEvaluator();
+    this.curator = new ModelCurator(this.db, this.modelRegistry, config);
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res).catch((err) => {
         logger.error(`Unhandled error: ${err}`);
@@ -295,12 +342,18 @@ export class ProxyServerStreaming {
     this.server.listen(this.config.proxyPort, "127.0.0.1", () => {
       logger.info(`Cognitive Router proxy listening on http://127.0.0.1:${this.config.proxyPort}`);
       logger.info(`   POST /v1/chat/completions    - Chat (streaming + non-streaming)`);
-      logger.info(`   POST /v1/embeddings           - Embeddings (Ollama + Gemini fallback)`);
+      logger.info(`   POST /v1/embeddings           - Embeddings (caller-specified model or default)`);
+      logger.info(`   GET  /v1/embeddings/models    - List all available embedding models`);
+      logger.info(`   GET  /v1/embeddings/benchmarks - Embedding benchmark results`);
       logger.info(`   GET  /v1/models               - List available models`);
       logger.info(`   GET  /health                  - Health check`);
       logger.info(`   GET  /stats                   - Provider health + stats`);
       logger.info(`   POST /v1/benchmark/embeddings  - Run embedding model benchmark`);
+      logger.info(`   POST /v1/curate                - Trigger model curator manually`);
     });
+
+    // Start periodic curator (every 6h)
+    this.curator.startPeriodic();
 
     // Check Ollama health before starting classifier embeddings
     const ollamaHealthy = await this.checkOllamaHealth();
@@ -320,6 +373,7 @@ export class ProxyServerStreaming {
   }
 
   async stop(): Promise<void> {
+    this.curator.stopPeriodic();
     this.server.close();
     this.db.close();
   }
@@ -340,6 +394,8 @@ export class ProxyServerStreaming {
 
     try {
       const url = req.url ?? "";
+      // URL query parsing helper - avoids new URL() issues with proxied requests
+      const urlQuery = url.includes("?") ? new URLSearchParams(url.split("?")[1]) : new URLSearchParams();
 
       if (url === "/health" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -379,6 +435,50 @@ export class ProxyServerStreaming {
         return;
       }
 
+      if (url.startsWith("/last-decision") && req.method === "GET") {
+        try {
+          const rawDecisions = this.db.getRecentDecisions(parseInt(urlQuery.get("limit") ?? "5", 10) || 5);
+          const decisions = rawDecisions.map((d: any) => {
+            const out: any = { ...d };
+            if (out.candidates_json) {
+              try { out.candidates = JSON.parse(out.candidates_json); } catch { out.candidates = out.candidates_json; }
+              delete out.candidates_json;
+            }
+            if (out.context_filter_json) {
+              try { out.contextFilter = JSON.parse(out.context_filter_json); } catch { out.contextFilter = out.context_filter_json; }
+              delete out.context_filter_json;
+            }
+            if (out.routing_scores) {
+              try { out.winner_scores = JSON.parse(out.routing_scores); } catch { out.winner_scores = out.routing_scores; }
+              delete out.routing_scores;
+            }
+            return out;
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(decisions, null, 2));
+        } catch (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to fetch decisions" }));
+        }
+        return;
+      }
+
+      if (url.startsWith("/reset-circuit") && req.method === "POST") {
+        const provider = urlQuery.get("provider");
+        if (provider) {
+          this.costTracker.resetCircuit(provider);
+          logger.info(`Circuit breaker reset for ${provider}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "ok", provider, message: "circuit reset" }));
+        } else {
+          this.costTracker.resetAllCircuits();
+          logger.info("All circuit breakers reset");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "ok", message: "all circuits reset" }));
+        }
+        return;
+      }
+
       if (url === "/v1/benchmark/embeddings" && req.method === "POST") {
         const benchmark = new EmbeddingBenchmark(this.db);
         try {
@@ -400,10 +500,75 @@ export class ProxyServerStreaming {
         return;
       }
 
+      // GET /v1/embeddings/models — list all available embedding models
+      if (url === "/v1/embeddings/models" && req.method === "GET") {
+        try {
+          const benchmark = new EmbeddingBenchmark(this.db);
+          const models = await benchmark.listEmbeddingModels();
+          // Also include remote embedding providers
+          const remoteModels = this.listRemoteEmbeddingModels();
+          const allModels = [...models, ...remoteModels];
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            object: "list",
+            data: allModels.map(m => ({
+              id: m.name,
+              provider: m.provider,
+              object: "embedding_model",
+              context_window: m.contextWindow,
+              is_local: m.isLocal,
+              dimensions: m.dimensions,
+            })),
+          }, null, 2));
+        } catch (err) {
+          logger.error(`Failed to list embedding models: ${err}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to list embedding models" }));
+        }
+        return;
+      }
+
+      // GET /v1/embeddings/benchmarks — return persisted benchmark results
+      if (url === "/v1/embeddings/benchmarks" && req.method === "GET") {
+        try {
+          const benchmark = new EmbeddingBenchmark(this.db);
+          const runs = benchmark.getLatestResults(parseInt(urlQuery.get("limit") ?? "5", 10) || 5);
+          const modelScores = benchmark.getLatestModelScores();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            runs,
+            latest_model_scores: modelScores,
+          }, null, 2));
+        } catch (err) {
+          logger.error(`Failed to fetch benchmark results: ${err}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to fetch benchmark results" }));
+        }
+        return;
+      }
+
+      // POST /v1/embeddings — pure proxy, caller chooses model
       if (url === "/v1/embeddings" && req.method === "POST") {
         const body = await this.readBody(req);
-        const request = JSON.parse(body) as { model: string; input: string | string[] };
+        const request = JSON.parse(body) as { model?: string; input: string | string[] };
         await this.handleEmbeddings(request, res);
+        return;
+      }
+
+      if (url === "/v1/curate" && req.method === "POST") {
+        logger.info("Manual curator trigger received.");
+        try {
+          const result = await this.curator.run();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result, null, 2));
+        } catch (err) {
+          logger.error(`Curator manual trigger failed: ${err}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: "Curator failed",
+            message: err instanceof Error ? err.message : String(err),
+          }));
+        }
         return;
       }
 
@@ -484,9 +649,27 @@ export class ProxyServerStreaming {
         model: decision.model,
         scores: decision.scores,
         overallScore: decision.overallScore,
-        outcome: "PENDING",
+        outcome: decision.error ? "CONTEXT_TOO_LARGE" : "PENDING",
         requestId,
+        candidatesJson: decision.candidates ? JSON.stringify(decision.candidates) : null,
+        contextFilterJson: decision.contextFilter ? JSON.stringify(decision.contextFilter) : null,
       });
+    }
+
+    // Context window guard: if no model can handle the request, return error immediately
+    if (decision?.error) {
+      logger.error(`Context too large — rejecting request: ${decision.error.message}`);
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: decision.error.message,
+          type: "context_too_large",
+          code: decision.error.code,
+          estimated_tokens: decision.error.estimatedTokens,
+          max_context_window: decision.error.maxContextWindow,
+        },
+      }));
+      return;
     }
 
     logger.info(
@@ -564,17 +747,29 @@ export class ProxyServerStreaming {
         logger.info(`Trying ${candidate.provider}/${candidate.model}...`);
 
         if (isStreaming) {
-          // ── Streaming pass-through ──
-          // Request stream:true from provider and pipe SSE chunks directly to client.
-          // This eliminates double-buffering: tokens appear immediately.
+          // ── Buffered streaming ──
+          // Tokens are buffered internally and only flushed to the client when
+          // a checkpoint is reached (finish_reason received). If the upstream
+          // dies before that, the buffer is discarded and we silently retry
+          // on the next candidate — the client never sees a truncated response.
           const providerRequest = { ...request, model: candidate.model, stream: true };
-          let hasForwarded = false;
           let accumulatedContent = "";
           let hasPayload = false;
+          const bufferedChunks: any[] = [];
+          let reachedCheckpoint = false;
 
           try {
+            const stallTimeout = streamStallTimeoutMs();
+            let lastChunkTime = Date.now();
+
             for await (const chunk of adapter.chatCompletionStream(candidate.model, providerRequest, apiKey)) {
-              // Scrub provider model name - never leak to client
+              const now = Date.now();
+              if (now - lastChunkTime > stallTimeout) {
+                throw new Error(`stream_stall: no data for ${stallTimeout}ms from ${candidate.provider}/${candidate.model}`);
+              }
+              lastChunkTime = now;
+
+              // Scrub provider model name
               chunk.model = CHAT_RESPONSE_MODEL;
 
               // Track content for judge evaluation + empty-response detection
@@ -587,49 +782,43 @@ export class ProxyServerStreaming {
                 hasPayload = true;
               }
 
-              // Forward chunk to client immediately - no buffering
-              this.writeSSE(res, chunk);
-              hasForwarded = true;
+              // Buffer the chunk — do NOT forward yet
+              bufferedChunks.push(chunk);
+
+              // Check for finish_reason — this is our checkpoint
+              const finishReason = chunk.choices?.[0]?.finish_reason;
+              if (finishReason) {
+                reachedCheckpoint = true;
+                break;
+              }
             }
           } catch (streamErr) {
-            if (!hasForwarded) throw streamErr; // Pre-data error → retry via outer catch
-
-            // Mid-stream error → forward error chunk, then [DONE]
-            const error = streamErr as Error;
-            const errDurationMs = Date.now() - startTime;
-            this.writeSSE(res, {
-              error: {
-                message: sanitizeErrorForClient(error.message),
-                type: "stream_error",
-              },
-            });
-            res.write("data: [DONE]\n\n");
-            res.end();
-
-            await this.costTracker.recordCall(candidate.provider, { durationMs: errDurationMs, outcome: "error" }, candidate.model);
-            this.db.recordCallOutcome({
-              provider: candidate.provider, model: candidate.model,
-              durationMs: errDurationMs, outcome: "error", timestamp: new Date().toISOString(),
-            });
-            logger.warn(`❌ ${candidate.provider}/${candidate.model} stream error after data sent in ${errDurationMs}ms: ${sanitizeErrorForClient(error.message).substring(0, 100)}`);
-            return; // Cannot retry - data already sent to client
+            // Any stream error before checkpoint → discard buffer, retry
+            // The outer catch handles strikes, hedging, and next-candidate logic
+            logger.debug(`Buffered stream failed on ${candidate.provider}/${candidate.model} (${streamErr instanceof Error ? streamErr.message.substring(0, 80) : streamErr}) — discarding ${bufferedChunks.length} buffered chunks for retry`);
+            throw streamErr;
           }
 
-          // Stream completed - check for empty response before committing
-          if (!hasPayload && !hasForwarded) {
-            // Stream yielded zero forwardable chunks - treat as empty response and retry
-            const err = new Error(`empty_provider_response: stream from ${candidate.provider}/${candidate.model} produced no content`);
+          if (!reachedCheckpoint) {
+            // Stream ended without finish_reason — treat as incomplete, retry
+            const err = new Error(`incomplete_stream: ${candidate.provider}/${candidate.model} ended without finish_reason`);
             (err as any).code = "empty_response";
-            throw err; // Re-thrown to outer catch → retry next candidate
+            throw err;
           }
-
-          const durationMs = Date.now() - startTime;
-          res.write("data: [DONE]\n\n");
-          res.end();
 
           if (!hasPayload) {
-            logger.warn(`Empty stream from ${candidate.provider}/${candidate.model} - forwarded non-content chunks but no payload`);
+            const err = new Error(`empty_provider_response: stream from ${candidate.provider}/${candidate.model} produced no content`);
+            (err as any).code = "empty_response";
+            throw err;
           }
+
+          // ── Checkpoint reached: flush all buffered chunks to client ──
+          const durationMs = Date.now() - startTime;
+          for (const bufferedChunk of bufferedChunks) {
+            this.writeSSE(res, bufferedChunk);
+          }
+          res.write("data: [DONE]\n\n");
+          res.end();
 
           await this.costTracker.recordCall(candidate.provider, { durationMs, outcome: "success" }, candidate.model);
           this.costTracker.recordSizeLatency(candidate.provider, estimatedTokens, durationMs);
@@ -637,8 +826,9 @@ export class ProxyServerStreaming {
             provider: candidate.provider, model: candidate.model,
             durationMs, outcome: "success", timestamp: new Date().toISOString(),
           });
+          this.db.updateDecisionOutcome(requestId, "success", durationMs);
 
-          logger.info(`✅ ${candidate.provider}/${candidate.model} streamed in ${durationMs}ms`);
+          logger.info(`✅ ${candidate.provider}/${candidate.model} streamed (buffered, ${bufferedChunks.length} chunks) in ${durationMs}ms`);
 
           // ─── Async LLM-as-judge feedback ───
           if (
@@ -698,6 +888,7 @@ export class ProxyServerStreaming {
           provider: candidate.provider, model: candidate.model,
           durationMs, outcome: "success", timestamp: new Date().toISOString(),
         });
+        this.db.updateDecisionOutcome(requestId, "success", durationMs);
 
         // Track token usage for subscription providers (e.g., Z.AI quota)
         if (response.usage && candidate.provider === "zai") {
@@ -758,7 +949,7 @@ export class ProxyServerStreaming {
         const error = err as Error;
         const isRateLimit = (error as any).code === "rate_limit" || /rate.?limit|429|slow down/i.test(error.message);
         const isQuota = (error as any).code === "quota_exceeded" || /quota|monthly limit|prompt tokens limit exceeded|402/i.test(error.message);
-        const isTimeout = error.name === "TimeoutError" || error.name === "AbortError" || /timeout|aborted/i.test(error.message);
+        const isTimeout = error.name === "TimeoutError" || error.name === "AbortError" || /timeout|aborted|stream_stall/i.test(error.message);
         const isEmpty = (error as any).code === "empty_response";
         const outcome = isRateLimit || isQuota ? "rate_limit" : isTimeout ? "timeout" : isEmpty ? "empty" : "error";
 
@@ -776,6 +967,7 @@ export class ProxyServerStreaming {
           provider: candidate.provider, model: candidate.model,
           durationMs, outcome, timestamp: new Date().toISOString(),
         });
+        this.db.updateDecisionOutcome(requestId, outcome, durationMs);
 
         if (newStrikes >= providerAttemptLimit) {
           logger.info(`⏭️ ${candidate.provider} exhausted (${newStrikes} strikes) - moving to next provider`);
@@ -847,6 +1039,7 @@ export class ProxyServerStreaming {
                 provider: hedgeOutcome.winnerProvider, model: hedgeOutcome.winnerModel,
                 durationMs: winDurationMs, outcome: "success", timestamp: new Date().toISOString(),
               });
+              this.db.updateDecisionOutcome(requestId, "success", winDurationMs);
 
               // Track token usage for subscription providers (e.g., Z.AI quota)
               if (winResponse.usage && hedgeOutcome.winnerProvider === "zai") {
@@ -916,15 +1109,35 @@ export class ProxyServerStreaming {
     }
   }
 
-  // ─── Embeddings Handler ───
+  // ─── Embeddings Handler (pure proxy — caller chooses model) ───
 
   private async handleEmbeddings(
-    request: { model: string; input: string | string[] },
+    request: { model?: string; input: string | string[] },
     res: http.ServerResponse,
   ): Promise<void> {
     const inputs = Array.isArray(request.input) ? request.input : [request.input];
-    const embeddings: Array<{ object: string; index: number; embedding: number[] }> = [];
+    const requestedModel = request.model ?? "";
 
+    // If caller specified a model, use it directly (pure proxy — no routing)
+    if (requestedModel) {
+      const result = await this.proxyEmbedding(requestedModel, inputs);
+      if (result.error) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: result.error } }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        object: "list",
+        data: result.embeddings!.map((vec, i) => ({ object: "embedding", index: i, embedding: vec })),
+        model: requestedModel,
+        usage: { prompt_tokens: 0, total_tokens: 0 },
+      }));
+      return;
+    }
+
+    // No model specified — use default embedder (backward compat)
+    const embeddings: Array<{ object: string; index: number; embedding: number[] }> = [];
     for (let i = 0; i < inputs.length; i++) {
       try {
         const vector = await this.embedFn(inputs[i]);
@@ -946,6 +1159,150 @@ export class ProxyServerStreaming {
       model: EMBEDDING_RESPONSE_MODEL,
       usage: { prompt_tokens: 0, total_tokens: 0 },
     }));
+  }
+
+  /** Proxy an embedding request to the appropriate provider based on model name */
+  private async proxyEmbedding(
+    model: string,
+    inputs: string[],
+  ): Promise<{ embeddings?: number[][]; error?: string }> {
+    // Determine provider from model name
+    const { provider, endpoint } = this.resolveEmbeddingProvider(model);
+
+    try {
+      if (provider === "ollama") {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, input: inputs }),
+          signal: AbortSignal.timeout(120000),
+        });
+        if (!response.ok) throw new Error(`Ollama embed failed: ${response.status}`);
+        const data = await response.json() as any;
+        return { embeddings: data.embeddings as number[][] };
+      }
+
+      if (provider === "gemini") {
+        const apiKey = process.env.GEMINI_API_KEY ?? "";
+        const results: number[][] = [];
+        for (const text of inputs) {
+          const response = await fetch(
+            `${endpoint}?key=${apiKey}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ content: { parts: [{ text }] } }),
+              signal: AbortSignal.timeout(30000),
+            },
+          );
+          if (!response.ok) throw new Error(`Gemini embed failed: ${response.status}`);
+          const data = await response.json() as any;
+          results.push(data.embedding.values as number[]);
+        }
+        return { embeddings: results };
+      }
+
+      if (provider === "openai") {
+        const apiKey = process.env.OPENAI_API_KEY ?? "";
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({ model, input: inputs }),
+          signal: AbortSignal.timeout(60000),
+        });
+        if (!response.ok) throw new Error(`OpenAI embed failed: ${response.status}`);
+        const data = await response.json() as any;
+        return { embeddings: data.data.map((d: any) => d.embedding) };
+      }
+
+      return { error: `Unknown embedding provider for model: ${model}` };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /** Resolve which provider handles a given embedding model */
+  private resolveEmbeddingProvider(model: string): { provider: string; endpoint: string } {
+    // Ollama local models
+    if (
+      model.includes("embed") ||
+      model.includes("bge") ||
+      model.includes("nomic") ||
+      model === "embeddinggemma:latest"
+    ) {
+      return {
+        provider: "ollama",
+        endpoint: "http://localhost:11434/api/embed",
+      };
+    }
+
+    // Gemini embedding models
+    if (model.startsWith("gemini-embedding") || model.startsWith("text-embedding-004")) {
+      return {
+        provider: "gemini",
+        endpoint: `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`,
+      };
+    }
+
+    // OpenAI-compatible embedding models
+    if (model.startsWith("text-embedding-") || model.startsWith("text-embedding-3")) {
+      return {
+        provider: "openai",
+        endpoint: "https://api.openai.com/v1/embeddings",
+      };
+    }
+
+    // Default: try Ollama
+    return {
+      provider: "ollama",
+      endpoint: "http://localhost:11434/api/embed",
+    };
+  }
+
+  /** List remote embedding models that are configured but not local */
+  private listRemoteEmbeddingModels(): EmbeddingModelInfo[] {
+    const remote: EmbeddingModelInfo[] = [];
+
+    // Gemini embedding models (if API key configured)
+    if (process.env.GEMINI_API_KEY) {
+      remote.push({
+        name: "gemini-embedding-001",
+        provider: "gemini",
+        contextWindow: 2048,
+        isLocal: false,
+        dimensions: 768,
+      });
+      remote.push({
+        name: "text-embedding-004",
+        provider: "gemini",
+        contextWindow: 2048,
+        isLocal: false,
+        dimensions: 768,
+      });
+    }
+
+    // OpenAI embedding models (if API key configured)
+    if (process.env.OPENAI_API_KEY) {
+      remote.push({
+        name: "text-embedding-3-small",
+        provider: "openai",
+        contextWindow: 8192,
+        isLocal: false,
+        dimensions: 1536,
+      });
+      remote.push({
+        name: "text-embedding-3-large",
+        provider: "openai",
+        contextWindow: 8192,
+        isLocal: false,
+        dimensions: 3072,
+      });
+    }
+
+    return remote;
   }
 
   // ─── Port Cleanup ───
