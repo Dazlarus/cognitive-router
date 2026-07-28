@@ -13,11 +13,45 @@ import { logger } from "./logger.js";
 import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig, ProviderBudget } from "./config.js";
 
+/** Failure type classification for pattern detection. */
+export type FailureType = "timeout" | "rate_limit" | "error" | "empty";
+
+/** Pattern flags — aggressive deprioritization signals.
+ *
+ * These are set when the cost tracker detects repeated failure patterns and
+ * cause the model/provider to be skipped or heavily penalized in routing.
+ * Flags clear after a successful response + cooldown period. */
+export interface PatternFlags {
+  /** Model consistently times out on large contexts — skip for large requests. */
+  contextLimited?: {
+    reason: string;
+    setAt: number;
+    /** Token threshold above which this model should be skipped. */
+    skipAboveTokens: number;
+  };
+  /** Provider is rate-limited — skip entirely for a cooldown period. */
+  throttled?: {
+    reason: string;
+    setAt: number;
+    /** Timestamp when the throttle cooldown expires. */
+    expiresAt: number;
+  };
+  /** Model crashes/500s — skip entirely until manual reset or cooldown. */
+  unstable?: {
+    reason: string;
+    setAt: number;
+    /** Timestamp when the unstable flag can be probed. */
+    expiresAt: number;
+  };
+}
+
 export interface ProviderState {
   name: string;
   budget: ProviderBudget;
   status: "healthy" | "throttled" | "circuit_open";
   consecutiveFailures: number;
+  /** Type of the current consecutive failure streak. */
+  consecutiveFailureType: FailureType | null;
   recentLatencies: number[]; // rolling window
   recentCalls: number; // calls in current window
   monthlySpendUsd: number;
@@ -31,6 +65,12 @@ export interface ProviderState {
   quotaPercent: number;
   /** Whether quota warning has been logged for current period */
   quotaWarned: boolean;
+  /** Negative signal amplification: pattern flags for aggressive deprioritization. */
+  patternFlags: PatternFlags;
+  /** History of recent failure types (rolling window) for pattern detection. */
+  recentFailureTypes: FailureType[];
+  /** Timestamp of last successful response (for recovery cooldown). */
+  lastSuccessTime: number;
 }
 
 // ─── Request-size latency profiling ───
@@ -81,6 +121,36 @@ const BACKOFF_MS = [
 ];
 
 const LATENCY_WINDOW_SIZE = 20;
+
+// ─── Negative signal amplification constants ───
+
+/** Number of consecutive same-type failures before aggressive deprioritization kicks in. */
+const PATTERN_FAILURE_THRESHOLD = 3;
+
+/** Reliability floor when pattern flags are active (near-dead but not zero). */
+const PATTERN_DEPRIORITIZED_RELIABILITY = 0.1;
+
+/** Token count above which a context-limited model should be skipped. */
+const CONTEXT_LIMITED_THRESHOLD_TOKENS = 50_000;
+
+/** Cooldown after a success before pattern flags clear (prevents flapping). */
+const PATTERN_RECOVERY_COOLDOWN_MS = 60_000; // 1 minute
+
+/** How long the unstable flag blocks a model before allowing a probe. */
+const UNSTABLE_COOLDOWN_MS = 5 * 60_000; // 5 minutes
+
+/** How long the throttled flag blocks a provider. */
+const THROTTLE_COOLDOWN_MS = 2 * 60_000; // 2 minutes
+
+/** Rolling window size for failure type history. */
+const FAILURE_TYPE_WINDOW = 10;
+
+/** Threshold for timeout+large-context pattern detection: if 2+ timeouts
+ *  occurred on requests above this token count, mark model as context-limited. */
+const CONTEXT_TIMEOUT_MIN_OCCURRENCES = 2;
+
+/** Min token count for a request to be considered "large" for timeout correlation. */
+const LARGE_REQUEST_THRESHOLD_TOKENS = 30_000;
 
 /** Default daily spend budget (USD) for paid providers. */
 const DEFAULT_DAILY_BUDGET_USD = 5.0;
@@ -146,21 +216,32 @@ export class CostTracker {
       const monthlySpend = this.db.getSpend(name, "monthly");
       const dailySpend = this.db.getSpend(name, "daily");
 
+      // Restore persisted circuit state from previous session
+      const savedCircuit = this.db.loadCircuitState(name);
       this.states.set(name, {
         name,
         budget,
-        status: "healthy",
-        consecutiveFailures: 0,
+        status: (savedCircuit?.status as ProviderState["status"]) ?? "healthy",
+        consecutiveFailures: savedCircuit?.consecutiveFailures ?? 0,
+        consecutiveFailureType: null,
         recentLatencies: [],
         recentCalls: 0,
         monthlySpendUsd: monthlySpend,
         dailySpendUsd: dailySpend,
-        lastFailureTime: 0,
-        backoffTier: 0,
-        totalTokensUsed: 0, // Initialize token tracking
-        quotaPercent: 0,     // Initialize quota %
-        quotaWarned: false,  // Initialize quota warning flag
+        lastFailureTime: savedCircuit ? Date.now() : 0,
+        backoffTier: savedCircuit?.backoffTier ?? 0,
+        totalTokensUsed: 0,
+        quotaPercent: 0,
+        quotaWarned: false,
+        patternFlags: {},
+        recentFailureTypes: [],
+        lastSuccessTime: 0,
       });
+      if (savedCircuit) {
+        logger.info(
+          `Restored circuit state for ${name}: ${savedCircuit.status} (failures=${savedCircuit.consecutiveFailures}, tier=${savedCircuit.backoffTier})`,
+        );
+      }
     }
     logger.info(`Tracking ${this.states.size} providers. Budgets: daily=$${this.dailyBudgetUsd}, monthly=$${this.monthlyBudgetUsd}`);
   }
@@ -205,6 +286,7 @@ export class CostTracker {
         budget: providerState.budget,
         status: "healthy",
         consecutiveFailures: 0,
+        consecutiveFailureType: null,
         recentLatencies: [],
         recentCalls: 0,
         monthlySpendUsd: 0,
@@ -214,6 +296,9 @@ export class CostTracker {
         totalTokensUsed: 0,
         quotaPercent: 0,
         quotaWarned: false,
+        patternFlags: {},
+        recentFailureTypes: [],
+        lastSuccessTime: 0,
       };
       this.modelStates.set(key, state);
     }
@@ -233,14 +318,64 @@ export class CostTracker {
     return this.applyBackoffProbe(state, `Model ${providerName}/${modelName}`);
   }
 
+  /** Reset circuit breaker for a specific provider or model.
+   * Used by external liveness checks to recover from transient failures. */
+  resetCircuit(providerName: string, modelName?: string): void {
+    if (modelName) {
+      const ms = this.states.get(`${providerName}/${modelName}`);
+      if (ms) {
+        ms.status = "healthy";
+        ms.consecutiveFailures = 0;
+        ms.consecutiveFailureType = null;
+        ms.backoffTier = 0;
+        ms.patternFlags = {};
+        ms.recentFailureTypes = [];
+      }
+    }
+    const ps = this.states.get(providerName);
+    if (ps) {
+      ps.status = "healthy";
+      ps.consecutiveFailures = 0;
+      ps.consecutiveFailureType = null;
+      ps.backoffTier = 0;
+      ps.patternFlags = {};
+      ps.recentFailureTypes = [];
+    }
+    this.db.saveCircuitState(providerName, "healthy", 0, 0);
+  }
+
+  resetAllCircuits(): void {
+    for (const state of this.states.values()) {
+      state.status = "healthy";
+      state.consecutiveFailures = 0;
+      state.consecutiveFailureType = null;
+      state.backoffTier = 0;
+      state.patternFlags = {};
+      state.recentFailureTypes = [];
+    }
+    for (const state of this.modelStates.values()) {
+      state.status = "healthy";
+      state.consecutiveFailures = 0;
+      state.consecutiveFailureType = null;
+      state.backoffTier = 0;
+      state.patternFlags = {};
+      state.recentFailureTypes = [];
+    }
+  }
+
   isAvailable(providerName: string, modelName?: string): boolean {
     const providerState = this.getProviderState(providerName);
     if (!providerState || providerState.status === "circuit_open") return false;
 
+    // Check provider-level throttle flag
+    if (this.isThrottled(providerName)) return false;
+
     if (this.usesModelCircuit(providerName, modelName)) {
       const modelState = this.getModelState(providerName, modelName);
       if (!modelState) return false;
-      return modelState.status !== "circuit_open";
+      if (modelState.status === "circuit_open") return false;
+      // Check model-level unstable flag
+      if (this.isUnstable(providerName, modelName)) return false;
     }
 
     return true;
@@ -289,7 +424,7 @@ export class CostTracker {
     }
   }
 
-  /** Compute reliability score based on recent failures + backoff tier */
+  /** Compute reliability score based on recent failures + backoff tier + pattern flags */
   getReliabilityScore(providerName: string, modelName?: string): number {
     const providerState = this.getProviderState(providerName);
     if (!providerState || providerState.status === "circuit_open") return 0;
@@ -299,6 +434,47 @@ export class CostTracker {
       : providerState;
     if (!state) return 0;
     if (state.status === "circuit_open") return 0;
+
+    // ─── Negative signal amplification ───
+    // If any pattern flags are active and not expired, aggressively deprioritize.
+    const now = Date.now();
+
+    // Unstable flag → near-zero reliability
+    if (state.patternFlags.unstable) {
+      if (now < state.patternFlags.unstable.expiresAt) {
+        return PATTERN_DEPRIORITIZED_RELIABILITY;
+      }
+      // Expired — clear it
+      logger.info(`${state.name}: unstable flag expired — clearing.`);
+      delete state.patternFlags.unstable;
+    }
+
+    // Throttled flag → near-zero reliability for provider-level
+    if (state.patternFlags.throttled) {
+      if (now < state.patternFlags.throttled.expiresAt) {
+        return PATTERN_DEPRIORITIZED_RELIABILITY;
+      }
+      // Expired — clear it
+      logger.info(`${state.name}: throttled flag expired — clearing.`);
+      delete state.patternFlags.throttled;
+    }
+
+    // Context-limited flag doesn't affect reliability globally —
+    // it only causes the model to be skipped for large requests.
+    // The router handles that filtering.
+
+    // ─── Aggressive consecutive failure deprioritization ───
+    // 3+ consecutive same-type failures → reliability to 0.1 immediately
+    if (
+      state.consecutiveFailures >= PATTERN_FAILURE_THRESHOLD &&
+      state.consecutiveFailureType
+    ) {
+      logger.debug(
+        `${state.name}: aggressive deprioritization — ${state.consecutiveFailures} consecutive ` +
+        `${state.consecutiveFailureType} failures → reliability=${PATTERN_DEPRIORITIZED_RELIABILITY}`,
+      );
+      return PATTERN_DEPRIORITIZED_RELIABILITY;
+    }
 
     // Base reliability on consecutive failures
     const failurePenalty = state.consecutiveFailures * 0.15;
@@ -401,6 +577,7 @@ export class CostTracker {
     providerName: string,
     result: { durationMs: number; outcome: string },
     modelName?: string,
+    estimatedTokens?: number,
   ): Promise<void> {
     const providerState = this.states.get(providerName);
     if (!providerState) return;
@@ -440,6 +617,27 @@ export class CostTracker {
       state.consecutiveFailures++;
       state.lastFailureTime = Date.now();
 
+      // Classify failure type
+      const failureType: FailureType =
+        result.outcome === "timeout" ? "timeout" :
+        isRateLimit ? "rate_limit" :
+        result.outcome === "empty" ? "empty" :
+        "error";
+
+      // Track consecutive same-type failures
+      if (state.consecutiveFailureType !== failureType) {
+        state.consecutiveFailureType = failureType;
+      }
+
+      // Record failure type in rolling window
+      state.recentFailureTypes.push(failureType);
+      if (state.recentFailureTypes.length > FAILURE_TYPE_WINDOW) {
+        state.recentFailureTypes.shift();
+      }
+
+      // ─── Pattern Detection ───
+      this.detectPatterns(state, label, failureType, estimatedTokens);
+
       // Escalate backoff tier on rate limits
       if (isRateLimit) {
         // Rate limits are unpredictable — escalate fast
@@ -453,6 +651,7 @@ export class CostTracker {
           state.backoffTier = newTier;
         }
         state.status = "circuit_open";
+        this.db.saveCircuitState(providerName, state.status, state.consecutiveFailures, state.backoffTier);
       } else if (state.consecutiveFailures >= 3) {
         // Generic errors — open circuit after 3 consecutive
         state.status = "circuit_open";
@@ -461,6 +660,7 @@ export class CostTracker {
         logger.warn(
           `${label}: circuit OPENED (tier ${newTier}) after ${state.consecutiveFailures} failures.`,
         );
+        this.db.saveCircuitState(providerName, state.status, state.consecutiveFailures, state.backoffTier);
       } else if (state.status === "healthy") {
         state.status = "throttled";
         logger.info(
@@ -469,16 +669,258 @@ export class CostTracker {
       }
     } else {
       // Success — reset failure counter and de-escalate backoff
-      if (state.consecutiveFailures > 0 || state.backoffTier > 0) {
-        logger.info(
-          `${label}: recovered — clearing ${state.consecutiveFailures} failures, ` +
-          `backoff tier ${state.backoffTier} → 0.`,
-        );
-        state.consecutiveFailures = 0;
-        state.backoffTier = 0;
-        state.status = "healthy";
+      const wasFlagged =
+        state.patternFlags.unstable ||
+        state.patternFlags.throttled ||
+        state.patternFlags.contextLimited;
+
+      if (state.consecutiveFailures > 0 || state.backoffTier > 0 || wasFlagged) {
+        const now = Date.now();
+        const sinceSuccess = now - state.lastSuccessTime;
+
+        // Recovery cooldown: only clear pattern flags after cooldown period
+        // to avoid flapping between healthy/unhealthy states
+        if (wasFlagged && sinceSuccess < PATTERN_RECOVERY_COOLDOWN_MS && state.lastSuccessTime > 0) {
+          logger.info(
+            `${label}: recovered but in cooldown (${Math.round((PATTERN_RECOVERY_COOLDOWN_MS - sinceSuccess) / 1000)}s remaining) ` +
+            `— keeping pattern flags.`,
+          );
+          // Still reset failure counters so the model gets a chance
+          state.consecutiveFailures = 0;
+          state.consecutiveFailureType = null;
+        } else {
+          logger.info(
+            `${label}: recovered — clearing ${state.consecutiveFailures} failures, ` +
+            `backoff tier ${state.backoffTier} → 0, clearing pattern flags.`,
+          );
+          state.consecutiveFailures = 0;
+          state.consecutiveFailureType = null;
+          state.backoffTier = 0;
+          state.status = "healthy";
+          state.patternFlags = {};
+          state.recentFailureTypes = [];
+          state.lastSuccessTime = now;
+        }
+      } else {
+        state.lastSuccessTime = Date.now();
       }
     }
+  }
+
+  // ─── Negative Signal Amplification: Pattern Detection ───
+
+  /** Detect failure patterns and set aggressive deprioritization flags.
+   *
+   * Pattern types:
+   * - timeout + large context → context-limited (skip for large requests)
+   * - rate_limit → throttled (skip provider for cooldown period)
+   * - error/crash (500) → unstable (skip model entirely)
+   */
+  private detectPatterns(
+    state: ProviderState,
+    label: string,
+    failureType: FailureType,
+    estimatedTokens?: number,
+  ): void {
+    const now = Date.now();
+
+    // ─── Pattern: 3+ consecutive same-type failures → aggressive action ───
+    if (state.consecutiveFailures >= PATTERN_FAILURE_THRESHOLD) {
+      switch (failureType) {
+        case "rate_limit": {
+          // Provider is rate-limited — set throttled flag with cooldown
+          if (!state.patternFlags.throttled) {
+            const expiresAt = now + THROTTLE_COOLDOWN_MS;
+            state.patternFlags.throttled = {
+              reason: `${state.consecutiveFailures} consecutive rate_limit failures`,
+              setAt: now,
+              expiresAt,
+            };
+            logger.warn(
+              `${label}: 🚫 THROTTLED — ${state.consecutiveFailures} consecutive rate limits. ` +
+              `Provider will be skipped until ${new Date(expiresAt).toLocaleTimeString()}.`,
+            );
+          } else {
+            // Extend cooldown
+            state.patternFlags.throttled.expiresAt = now + THROTTLE_COOLDOWN_MS;
+          }
+          break;
+        }
+        case "error": {
+          // Model is crashing/500ing — mark as unstable
+          if (!state.patternFlags.unstable) {
+            const expiresAt = now + UNSTABLE_COOLDOWN_MS;
+            state.patternFlags.unstable = {
+              reason: `${state.consecutiveFailures} consecutive error/crash failures`,
+              setAt: now,
+              expiresAt,
+            };
+            logger.warn(
+              `${label}: ⚠️ UNSTABLE — ${state.consecutiveFailures} consecutive errors. ` +
+              `Model will be skipped until ${new Date(expiresAt).toLocaleTimeString()}.`,
+            );
+          } else {
+            // Extend cooldown
+            state.patternFlags.unstable.expiresAt = now + UNSTABLE_COOLDOWN_MS;
+          }
+          break;
+        }
+        case "timeout": {
+          // Timeout + large context → context-limited
+          if (
+            estimatedTokens &&
+            estimatedTokens >= LARGE_REQUEST_THRESHOLD_TOKENS &&
+            !state.patternFlags.contextLimited
+          ) {
+            state.patternFlags.contextLimited = {
+              reason: `Timeouts on large requests (~${estimatedTokens} tokens)`,
+              setAt: now,
+              skipAboveTokens: Math.max(estimatedTokens - 5_000, LARGE_REQUEST_THRESHOLD_TOKENS),
+            };
+            logger.warn(
+              `${label}: 📏 CONTEXT-LIMITED — timeouts on large requests (~${estimatedTokens} tokens). ` +
+              `Model will be skipped for requests > ${state.patternFlags.contextLimited.skipAboveTokens} tokens.`,
+            );
+          }
+          break;
+        }
+      }
+    }
+
+    // ─── Pattern: timeout + large context correlation (even without 3 consecutive) ───
+    // If we see 2+ timeouts in the recent window on large requests, mark as context-limited
+    if (failureType === "timeout" && estimatedTokens && estimatedTokens >= LARGE_REQUEST_THRESHOLD_TOKENS) {
+      const recentLargeTimeouts = state.recentFailureTypes.filter(t => t === "timeout").length;
+      if (recentLargeTimeouts >= CONTEXT_TIMEOUT_MIN_OCCURRENCES && !state.patternFlags.contextLimited) {
+        const skipAbove = Math.max(estimatedTokens - 5_000, LARGE_REQUEST_THRESHOLD_TOKENS);
+        state.patternFlags.contextLimited = {
+          reason: `${recentLargeTimeouts} timeouts on requests ~${estimatedTokens} tokens`,
+          setAt: now,
+          skipAboveTokens: skipAbove,
+        };
+        logger.warn(
+          `${label}: 📏 CONTEXT-LIMITED — ${recentLargeTimeouts} timeouts on large requests. ` +
+          `Model will be skipped for requests > ${skipAbove} tokens.`,
+        );
+      }
+    }
+  }
+
+  /** Check if a model is flagged as context-limited for the given request size. */
+  isContextLimited(providerName: string, modelName: string, estimatedTokens: number): boolean {
+    const state = this.usesModelCircuit(providerName, modelName)
+      ? this.getModelState(providerName, modelName)
+      : this.getProviderState(providerName);
+    if (!state?.patternFlags.contextLimited) return false;
+    return estimatedTokens >= state.patternFlags.contextLimited.skipAboveTokens;
+  }
+
+  /** Check if a provider is currently in throttle cooldown. */
+  isThrottled(providerName: string): boolean {
+    const state = this.states.get(providerName);
+    if (!state?.patternFlags.throttled) return false;
+    if (Date.now() < state.patternFlags.throttled.expiresAt) return true;
+    // Expired — clean up
+    delete state.patternFlags.throttled;
+    return false;
+  }
+
+  /** Check if a model is flagged as unstable. */
+  isUnstable(providerName: string, modelName: string): boolean {
+    const state = this.usesModelCircuit(providerName, modelName)
+      ? this.getModelState(providerName, modelName)
+      : this.getProviderState(providerName);
+    if (!state?.patternFlags.unstable) return false;
+    if (Date.now() < state.patternFlags.unstable.expiresAt) return true;
+    // Expired — clean up
+    delete state.patternFlags.unstable;
+    return false;
+  }
+
+  /** Get active pattern flags for a provider/model (for stats and decision transparency). */
+  getPatternFlags(providerName: string, modelName?: string): PatternFlags {
+    const state = modelName && this.usesModelCircuit(providerName, modelName)
+      ? this.getModelState(providerName, modelName)
+      : this.getProviderState(providerName);
+    if (!state) return {};
+    const now = Date.now();
+    const active: PatternFlags = {};
+
+    if (state.patternFlags.contextLimited) {
+      active.contextLimited = state.patternFlags.contextLimited;
+    }
+    if (state.patternFlags.throttled && now < state.patternFlags.throttled.expiresAt) {
+      active.throttled = state.patternFlags.throttled;
+    } else if (state.patternFlags.throttled) {
+      delete state.patternFlags.throttled;
+    }
+    if (state.patternFlags.unstable && now < state.patternFlags.unstable.expiresAt) {
+      active.unstable = state.patternFlags.unstable;
+    } else if (state.patternFlags.unstable) {
+      delete state.patternFlags.unstable;
+    }
+
+    return active;
+  }
+
+  /** Get a human-readable summary of all pattern flags across all providers/models. */
+  getPatternFlagSummary(): Array<{ entity: string; flag: string; reason: string; expiresAt?: string }> {
+    const summaries: Array<{ entity: string; flag: string; reason: string; expiresAt?: string }> = [];
+    const now = Date.now();
+
+    for (const state of this.states.values()) {
+      if (state.patternFlags.throttled && now < state.patternFlags.throttled.expiresAt) {
+        summaries.push({
+          entity: state.name,
+          flag: "throttled",
+          reason: state.patternFlags.throttled.reason,
+          expiresAt: new Date(state.patternFlags.throttled.expiresAt).toISOString(),
+        });
+      }
+      if (state.patternFlags.contextLimited) {
+        summaries.push({
+          entity: state.name,
+          flag: "contextLimited",
+          reason: state.patternFlags.contextLimited.reason,
+        });
+      }
+      if (state.patternFlags.unstable && now < state.patternFlags.unstable.expiresAt) {
+        summaries.push({
+          entity: state.name,
+          flag: "unstable",
+          reason: state.patternFlags.unstable.reason,
+          expiresAt: new Date(state.patternFlags.unstable.expiresAt).toISOString(),
+        });
+      }
+    }
+
+    for (const state of this.modelStates.values()) {
+      if (state.patternFlags.contextLimited) {
+        summaries.push({
+          entity: state.name,
+          flag: "contextLimited",
+          reason: state.patternFlags.contextLimited.reason,
+        });
+      }
+      if (state.patternFlags.unstable && now < state.patternFlags.unstable.expiresAt) {
+        summaries.push({
+          entity: state.name,
+          flag: "unstable",
+          reason: state.patternFlags.unstable.reason,
+          expiresAt: new Date(state.patternFlags.unstable.expiresAt).toISOString(),
+        });
+      }
+    }
+
+    return summaries;
+  }
+
+  /** Get recent failure types for a provider/model (for decision transparency). */
+  getRecentFailureTypes(providerName: string, modelName?: string): FailureType[] {
+    const state = modelName && this.usesModelCircuit(providerName, modelName)
+      ? this.getModelState(providerName, modelName)
+      : this.getProviderState(providerName);
+    return state?.recentFailureTypes ?? [];
   }
 
   /**

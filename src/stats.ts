@@ -56,17 +56,21 @@ export function buildStatsPayload(
     budgetType: s.budget.budgetType,
     budgetPriority: s.budget.priority,
     consecutiveFailures: s.consecutiveFailures,
+    consecutiveFailureType: s.consecutiveFailureType,
     backoffTier: s.backoffTier,
     monthlySpendUsd: s.monthlySpendUsd,
     dailySpendUsd: s.dailySpendUsd,
     recentCalls: s.recentCalls,
     avgLatencyMs: averageLatency(s.recentLatencies),
+    recentFailureTypes: s.recentFailureTypes,
+    patternFlags: s.patternFlags,
     scores: {
       reliability: costTracker.getReliabilityScore(s.name),
       cost: costTracker.getCostScore(s.name),
       latency: costTracker.getLatencyScore(s.name),
     },
     available: costTracker.isAvailable(s.name),
+    isThrottled: costTracker.isThrottled(s.name),
     budgetExceeded: costTracker.isBudgetExceeded(s.name),
     // Quota tracking for subscription providers (e.g., Z.AI)
     quotaPercent: s.budget.budgetType === "subscription" ? costTracker.getQuotaPercent(s.name) : null,
@@ -78,9 +82,12 @@ export function buildStatsPayload(
     name: s.name,
     status: s.status,
     consecutiveFailures: s.consecutiveFailures,
+    consecutiveFailureType: s.consecutiveFailureType,
     backoffTier: s.backoffTier,
     recentCalls: s.recentCalls,
     avgLatencyMs: averageLatency(s.recentLatencies),
+    recentFailureTypes: s.recentFailureTypes,
+    patternFlags: s.patternFlags,
     available: s.status !== "circuit_open",
   }));
 
@@ -173,6 +180,7 @@ export function buildStatsPayload(
   return {
     providers: providerStates,
     modelHealth: modelHealthStates,
+    patternFlags: costTracker.getPatternFlagSummary(),
     modelCount: models.length,
     models,
     prefixCache: PrefixCache.instance.getStats(),
@@ -194,8 +202,8 @@ export function buildStatsPayload(
       scoreFormula: "overall = capability*0.50 + reliability*0.25 + cost*0.15 + latency*0.10",
       fallbackModels: {
         openrouter: {
-          tool: process.env.ROUTER_OPENROUTER_TOOL_MODEL ?? "qwen/qwen3-coder:free",
-          chat: process.env.ROUTER_OPENROUTER_FALLBACK_MODEL ?? "openrouter/owl-alpha",
+          tool: process.env.ROUTER_OPENROUTER_TOOL_MODEL ?? "qwen/qwen3-30b-a3b-instruct-2507",
+          chat: process.env.ROUTER_OPENROUTER_FALLBACK_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b:free",
         },
         gemini: {
           tool: process.env.ROUTER_GEMINI_TOOL_MODEL ?? "gemini-2.5-flash",

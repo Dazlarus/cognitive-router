@@ -11,6 +11,22 @@ import type { Classification } from "./classifier.js";
 import { isGenerationModel } from "./model_policy.js";
 import { bucketForTokenCount, type SizeBucket } from "./cost_tracker.js";
 
+/** Context window filter result — attached to every decision for observability. */
+export interface ContextFilterInfo {
+  estimatedTokens: number;
+  /** Safety factor applied (0.8 = 80% of context window). */
+  safetyFactor: number;
+  /** Models that were excluded because their context window was too small. */
+  filteredOut: Array<{
+    provider: string;
+    model: string;
+    contextWindow: number;
+    effectiveLimit: number;
+  }>;
+  /** Largest context window among all known models (for error messaging). */
+  maxContextWindow: number;
+}
+
 export interface RoutingDecision {
   provider: string;
   model: string;
@@ -23,7 +39,25 @@ export interface RoutingDecision {
   };
   overallScore: number;
   rationale: string;
+  candidates?: Array<{
+    provider: string;
+    model: string;
+    scores: RoutingDecision["scores"];
+    overallScore: number;
+  }>;
+  /** Context window filter details — present when estimatedTokens > 0. */
+  contextFilter?: ContextFilterInfo;
+  /** Set when the request exceeds all available context windows. */
+  error?: {
+    code: "CONTEXT_TOO_LARGE";
+    message: string;
+    estimatedTokens: number;
+    maxContextWindow: number;
+  };
 }
+
+/** Context window safety factor — models must have contextWindow * this >= estimatedTokens. */
+const CONTEXT_SAFETY_FACTOR = 0.8;
 
 /** Size-aware scoring configuration.
  *
@@ -128,6 +162,32 @@ export class RoutingEngine {
         logger.debug(`Skipping ${m.provider}/${m.model} — not in coding plan (requires credits).`);
         return false;
       }
+      // ─── Negative signal amplification: skip pattern-flagged models ───
+      if (this.costTracker.isUnstable(m.provider, m.model)) {
+        const flags = this.costTracker.getPatternFlags(m.provider, m.model);
+        logger.info(
+          `Skipping ${m.provider}/${m.model} — UNSTABLE: ${flags.unstable?.reason ?? "pattern detected"}.`,
+        );
+        return false;
+      }
+      if (this.costTracker.isThrottled(m.provider)) {
+        const flags = this.costTracker.getPatternFlags(m.provider);
+        logger.info(
+          `Skipping ${m.provider}/${m.model} — THROTTLED: ${flags.throttled?.reason ?? "rate limited"}.`,
+        );
+        return false;
+      }
+      if (
+        estimatedTokens > 0 &&
+        this.costTracker.isContextLimited(m.provider, m.model, estimatedTokens)
+      ) {
+        const flags = this.costTracker.getPatternFlags(m.provider, m.model);
+        logger.info(
+          `Skipping ${m.provider}/${m.model} — CONTEXT-LIMITED: ${flags.contextLimited?.reason ?? "timeouts on large requests"} ` +
+          `(skip above ${flags.contextLimited?.skipAboveTokens ?? "?"} tokens, request ~${estimatedTokens}).`,
+        );
+        return false;
+      }
       return true;
     });
 
@@ -143,6 +203,87 @@ export class RoutingEngine {
       };
     }
 
+    // ─── Context window enforcement ───
+    // Filter out models whose effective context window (80% of nominal) is
+    // smaller than the estimated token count. This prevents the router from
+    // selecting a model that will reject or truncate the request.
+    let contextFilter: ContextFilterInfo | undefined;
+    if (estimatedTokens > 0) {
+      const filteredOut: ContextFilterInfo["filteredOut"] = [];
+      const passingContext: typeof candidates = [];
+
+      for (const m of candidates) {
+        const effectiveLimit = Math.floor(m.contextWindow * CONTEXT_SAFETY_FACTOR);
+        if (estimatedTokens > effectiveLimit) {
+          filteredOut.push({
+            provider: m.provider,
+            model: m.model,
+            contextWindow: m.contextWindow,
+            effectiveLimit,
+          });
+        } else {
+          passingContext.push(m);
+        }
+      }
+
+      // Log each filtered model for observability
+      for (const f of filteredOut) {
+        logger.info(
+          `Context filter: excluded ${f.provider}/${f.model} — ` +
+          `~${estimatedTokens} tokens > ${f.effectiveLimit} limit ` +
+          `(80% of ${f.contextWindow.toLocaleString()}).`,
+        );
+      }
+
+      const maxContextWindow = candidates.reduce(
+        (max, m) => Math.max(max, m.contextWindow), 0,
+      );
+
+      contextFilter = {
+        estimatedTokens,
+        safetyFactor: CONTEXT_SAFETY_FACTOR,
+        filteredOut,
+        maxContextWindow,
+      };
+
+      if (passingContext.length === 0) {
+        // No model can handle this request size
+        const maxModel = candidates.find(
+          (m) => m.contextWindow === maxContextWindow,
+        );
+        const maxEffective = Math.floor(maxContextWindow * CONTEXT_SAFETY_FACTOR);
+
+        logger.warn(
+          `Context filter: ALL ${candidates.length} candidates excluded — ` +
+          `~${estimatedTokens} tokens exceeds max effective ${maxEffective} ` +
+          `(largest: ${maxModel?.provider}/${maxModel?.model} at ${maxContextWindow.toLocaleString()}).`,
+        );
+
+        return {
+          provider: "",
+          model: "",
+          scores: { capability: 0, reliability: 0, cost: 0, latency: 0 },
+          overallScore: 0,
+          rationale: `CONTEXT_TOO_LARGE: ~${estimatedTokens} tokens exceeds ` +
+            `max effective context ${maxEffective.toLocaleString()} ` +
+            `(80% of ${maxContextWindow.toLocaleString()} from ` +
+            `${maxModel?.provider}/${maxModel?.model}).`,
+          contextFilter,
+          error: {
+            code: "CONTEXT_TOO_LARGE",
+            message: `Request size ~${estimatedTokens} tokens exceeds all available ` +
+              `context windows. Largest: ${maxModel?.provider}/${maxModel?.model} ` +
+              `at ${maxContextWindow.toLocaleString()} tokens ` +
+              `(effective limit: ${maxEffective.toLocaleString()} at 80% safety margin).`,
+            estimatedTokens,
+            maxContextWindow,
+          },
+        };
+      }
+
+      candidates = passingContext;
+    }
+
     if (sizeBucket) {
       logger.debug(
         `Size-aware routing: ~${estimatedTokens} tokens (${sizeBucket} bucket) — ` +
@@ -153,7 +294,7 @@ export class RoutingEngine {
     }
 
     // Score every candidate
-    const scored = candidates.map((modelEntry) => {
+    const scored: RoutingDecision[] = candidates.map((modelEntry) => {
       const capabilityScore =
         this.registry.getCapabilityScore(modelEntry.provider, modelEntry.model, intent) *
         confidence;
@@ -219,6 +360,17 @@ export class RoutingEngine {
       if (sizeAdjust !== 0) {
         rationaleParts.push(`size=${sizeAdjust >= 0 ? "+" : ""}${sizeAdjust.toFixed(3)}`);
       }
+      // Include pattern flags in rationale for decision transparency
+      const patternFlags = this.costTracker.getPatternFlags(modelEntry.provider, modelEntry.model);
+      if (patternFlags.contextLimited) {
+        rationaleParts.push(`⚠ctx_limited>${patternFlags.contextLimited.skipAboveTokens}`);
+      }
+      if (patternFlags.unstable) {
+        rationaleParts.push(`⚠unstable`);
+      }
+      if (patternFlags.throttled) {
+        rationaleParts.push(`⚠throttled`);
+      }
 
       return {
         provider: modelEntry.provider,
@@ -250,6 +402,7 @@ export class RoutingEngine {
     }
 
     const best = healthyScored[0];
+    best.candidates = healthyScored.slice(1, 6);
     const runnerUp = healthyScored[1];
 
     // If top 2 are close, pick the cheaper one
@@ -263,10 +416,12 @@ export class RoutingEngine {
         logger.debug(
           `Close call — picking cheaper: ${runnerUp.provider}/${runnerUp.model} over ${best.provider}/${best.model}`,
         );
+        if (contextFilter) runnerUp.contextFilter = contextFilter;
         return runnerUp;
       }
     }
 
+    if (contextFilter) best.contextFilter = contextFilter;
     logger.debug(
       `Winner: ${best.provider}/${best.model} (${best.overallScore.toFixed(3)}) — ${best.rationale}`,
     );

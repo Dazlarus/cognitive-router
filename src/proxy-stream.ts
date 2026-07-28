@@ -820,7 +820,7 @@ export class ProxyServerStreaming {
           res.write("data: [DONE]\n\n");
           res.end();
 
-          await this.costTracker.recordCall(candidate.provider, { durationMs, outcome: "success" }, candidate.model);
+          await this.costTracker.recordCall(candidate.provider, { durationMs, outcome: "success" }, candidate.model, estimatedTokens);
           this.costTracker.recordSizeLatency(candidate.provider, estimatedTokens, durationMs);
           this.db.recordCallOutcome({
             provider: candidate.provider, model: candidate.model,
@@ -882,7 +882,7 @@ export class ProxyServerStreaming {
           throw err;
         }
 
-        await this.costTracker.recordCall(candidate.provider, { durationMs, outcome: "success" }, candidate.model);
+        await this.costTracker.recordCall(candidate.provider, { durationMs, outcome: "success" }, candidate.model, estimatedTokens);
         this.costTracker.recordSizeLatency(candidate.provider, estimatedTokens, durationMs);
         this.db.recordCallOutcome({
           provider: candidate.provider, model: candidate.model,
@@ -962,7 +962,7 @@ export class ProxyServerStreaming {
           `[strike ${newStrikes}/${providerAttemptLimit}]: ${sanitizeErrorForClient(error.message).substring(0, 100)}`,
         );
 
-        await this.costTracker.recordCall(candidate.provider, { durationMs, outcome }, candidate.model);
+        await this.costTracker.recordCall(candidate.provider, { durationMs, outcome }, candidate.model, estimatedTokens);
         this.db.recordCallOutcome({
           provider: candidate.provider, model: candidate.model,
           durationMs, outcome, timestamp: new Date().toISOString(),
@@ -1033,6 +1033,7 @@ export class ProxyServerStreaming {
                 hedgeOutcome.winnerProvider,
                 { durationMs: winDurationMs, outcome: "success" },
                 hedgeOutcome.winnerModel,
+                estimatedTokens,
               );
               this.costTracker.recordSizeLatency(hedgeOutcome.winnerProvider, estimatedTokens, winDurationMs);
               this.db.recordCallOutcome({
