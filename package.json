@@ -37,6 +37,7 @@
   "homepage": "https://github.com/dazwritescode/cognitive-router#readme",
   "dependencies": {
     "better-sqlite3": "^11.0.0",
+    "js-tiktoken": "^1.0.21",
     "node-windows": "^1.0.0-beta.8"
   },
   "devDependencies": {

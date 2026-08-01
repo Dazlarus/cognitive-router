@@ -52,7 +52,7 @@ export class JudgeEvaluator {
   constructor() {
     this.sampleRate = parseFloat(process.env.ROUTER_JUDGE_SAMPLE_RATE ?? "0.10");
     this.judgeProvider = process.env.ROUTER_JUDGE_PROVIDER ?? "openrouter";
-    this.judgeModel = process.env.ROUTER_JUDGE_MODEL ?? "qwen/qwen3-coder:free";
+    this.judgeModel = process.env.ROUTER_JUDGE_MODEL ?? "qwen/qwen3-30b-a3b-instruct-2507";
     this.minResponseLength = parseInt(process.env.ROUTER_JUDGE_MIN_LENGTH ?? "50", 10);
     this.maxChars = parseInt(process.env.ROUTER_JUDGE_MAX_CHARS ?? "2000", 10);
     this.timeoutMs = parseInt(process.env.ROUTER_JUDGE_TIMEOUT_MS ?? "15000", 10);
@@ -104,47 +104,63 @@ export class JudgeEvaluator {
       .replace("{prompt}", truncPrompt)
       .replace("{response}", truncResponse);
 
-    const adapter = getProvider(this.judgeProvider);
-    if (!adapter) {
-      logger.debug(`Judge: provider "${this.judgeProvider}" not found, skipping`);
-      return null;
-    }
+    // Try judge candidates in priority order. Falls through on failure.
+    const candidates = this.getJudgeCandidates();
+    let lastError: Error | undefined;
 
-    const apiKey = process.env[this.judgeProvider.toUpperCase() + "_API_KEY"] ?? "";
+    for (const { provider, model } of candidates) {
+      const adapter = getProvider(provider);
+      if (!adapter) continue;
+      const apiKey = process.env[provider.toUpperCase() + "_API_KEY"] ?? "";
+      if (!apiKey && provider !== "ollama") continue;
 
-    try {
-      const result = await adapter.chatCompletion(
-        this.judgeModel,
-        {
-          model: this.judgeModel,
-          messages: [{ role: "user", content: filled }],
-          stream: false,
-          temperature: 0.1,
-          max_tokens: 100,
-        },
-        apiKey,
-      );
+      try {
+        const result = await adapter.chatCompletion(
+          model,
+          {
+            model,
+            messages: [{ role: "user", content: filled }],
+            stream: false,
+            temperature: 0.1,
+            max_tokens: 100,
+          },
+          apiKey,
+        );
 
-      const content = result.choices?.[0]?.message?.content ?? "";
-      const parsed = this.parseJudgeResponse(content);
-      if (!parsed) {
-        logger.debug(`Judge: could not parse response: ${content.slice(0, 100)}`);
-        return null;
+        const content = result.choices?.[0]?.message?.content ?? "";
+        const parsed = this.parseJudgeResponse(content);
+        if (!parsed) {
+          lastError = new Error(`unparseable: ${content.slice(0, 80)}`);
+          continue;
+        }
+
+        logger.info(
+          `Judge scored ${intent} response: ${parsed.score}/10 via ${provider}/${model} — ${parsed.note}`,
+        );
+
+        return {
+          score: parsed.score / 10,
+          rawScore: parsed.score,
+          note: parsed.note,
+        };
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        logger.debug(`Judge candidate ${provider}/${model} failed: ${lastError.message}`);
+        continue;
       }
-
-      logger.info(
-        `Judge scored ${intent} response: ${parsed.score}/10 — ${parsed.note}`,
-      );
-
-      return {
-        score: parsed.score / 10,
-        rawScore: parsed.score,
-        note: parsed.note,
-      };
-    } catch (err) {
-      logger.debug(`Judge evaluation failed (non-fatal): ${err instanceof Error ? err.message : err}`);
-      return null;
     }
+
+    logger.debug(`Judge: all candidates exhausted. Last error: ${lastError?.message}`);
+    return null;
+  }
+
+  /** Ordered list of judge provider/model candidates for fallback. */
+  private getJudgeCandidates(): Array<{ provider: string; model: string }> {
+    return [
+      { provider: this.judgeProvider, model: this.judgeModel },
+      // Fallback: use local Ollama gemma4 for judging when remote is down
+      { provider: "ollama", model: "gemma4:latest" },
+    ];
   }
 
   /**

@@ -2,6 +2,8 @@ const DEFAULT_OLLAMA_TOOL_MODELS = new Set(["gemma4:latest"]);
 const ZAI_AGENT_GENERATION_MODELS = new Set([
   "glm-5.2",
   "glm-5.1",
+  "glm-5-turbo",
+  "glm-4.7",
   "glm-4.7-flash",
 ]);
 const OLLAMA_EMERGENCY_GENERATION_MODELS = new Set([

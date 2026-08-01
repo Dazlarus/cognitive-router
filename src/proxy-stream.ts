@@ -18,12 +18,15 @@ import { getProvider } from "./providers.js";
 import { loadProjectEnv } from "./env.js";
 import { buildStatsPayload } from "./stats.js";
 import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
+import { BudgetTracker } from "./budget_tracker.js";
 import { ModelCurator } from "./curator.js";
 import { JudgeEvaluator } from "./judge.js";
 import { EmbeddingBenchmark, initializeBenchmarkTables } from "./benchmark_embeddings.js";
 import type { EmbeddingModelInfo } from "./benchmark_embeddings.js";
 import { raceHedgedRequests, hedgeRetryDelayMs, type HedgeCandidate } from "./hedged_request.js";
+import { classifyFailure, computeFallbackDecision, providerBackoff } from "./failure_classifier.js";
 import { registryReadiness } from "./readiness.js";
+import { detectModalities, type Modality } from "./modality.js";
 
 const CHAT_ALIAS_MODEL = "CognitiveRouter:latest";
 const LEGACY_CHAT_ALIAS_MODEL = "CogRouter:latest";
@@ -292,6 +295,7 @@ export class ProxyServerStreaming {
   private router: RoutingEngine;
   private db: DBService;
   private costTracker: CostTracker;
+  private budgetTracker: BudgetTracker;
   private modelRegistry: ModelRegistry;
   private config: CognitiveRouterConfig;
   private embedFn: (text: string) => Promise<number[]>;
@@ -313,8 +317,10 @@ export class ProxyServerStreaming {
 
     this.modelRegistry = new ModelRegistry(this.db, config);
     this.costTracker = new CostTracker(this.db, config);
+    this.budgetTracker = new BudgetTracker(this.db, this.costTracker);
     this.classifier = new IntentClassifier({ tiebreakerThreshold: config.tiebreakerThreshold });
     this.router = new RoutingEngine(this.modelRegistry, this.costTracker, this.db, config);
+    this.router.setBudgetTracker(this.budgetTracker);
 
     this.embedFn = this.createEmbedder();
     this.judge = new JudgeEvaluator();
@@ -348,6 +354,7 @@ export class ProxyServerStreaming {
       logger.info(`   GET  /v1/models               - List available models`);
       logger.info(`   GET  /health                  - Health check`);
       logger.info(`   GET  /stats                   - Provider health + stats`);
+      logger.info(`   GET  /v1/dashboard?range=24h   - Aggregated routing dashboard`);
       logger.info(`   POST /v1/benchmark/embeddings  - Run embedding model benchmark`);
       logger.info(`   POST /v1/curate                - Trigger model curator manually`);
     });
@@ -398,8 +405,50 @@ export class ProxyServerStreaming {
       const urlQuery = url.includes("?") ? new URLSearchParams(url.split("?")[1]) : new URLSearchParams();
 
       if (url === "/health" && req.method === "GET") {
+        // Include budget status in health response
+        const dailyProjection = this.budgetTracker.projectBudget("daily", this.costTracker.dailyBudget);
+        const monthlyProjection = this.budgetTracker.projectBudget("monthly", this.costTracker.monthlyBudget);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", initialized: this.initialized }));
+        res.end(JSON.stringify({
+          status: "ok",
+          initialized: this.initialized,
+          budget: {
+            daily: {
+              spentUsd: dailyProjection.spentUsd,
+              budgetUsd: dailyProjection.budgetUsd,
+              remainingUsd: dailyProjection.remainingUsd,
+              consumedFraction: dailyProjection.consumedFraction,
+              burnRatePerHour: dailyProjection.burnRatePerHour,
+              autoDowngradeActive: dailyProjection.autoDowngradeActive,
+              downgradeReason: dailyProjection.downgradeReason,
+            },
+            monthly: {
+              spentUsd: monthlyProjection.spentUsd,
+              budgetUsd: monthlyProjection.budgetUsd,
+              remainingUsd: monthlyProjection.remainingUsd,
+              consumedFraction: monthlyProjection.consumedFraction,
+              burnRatePerHour: monthlyProjection.burnRatePerHour,
+              autoDowngradeActive: monthlyProjection.autoDowngradeActive,
+              downgradeReason: monthlyProjection.downgradeReason,
+            },
+          },
+        }));
+        return;
+      }
+
+      // GET /v1/budget — detailed budget status with burn rate projection
+      if (url === "/v1/budget" && req.method === "GET") {
+        const status = this.budgetTracker.getBudgetStatus();
+        // Enrich with cost efficiency data from model registry
+        const allModels = this.modelRegistry.getAllModels();
+        const costEfficiencies = this.budgetTracker.getCostEfficiencyForModels(
+          allModels,
+          "conversation",
+          this.modelRegistry,
+        );
+        status.costEfficiency = costEfficiencies;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(status, null, 2));
         return;
       }
 
@@ -435,6 +484,21 @@ export class ProxyServerStreaming {
         return;
       }
 
+      // GET /v1/dashboard — aggregated routing stats and trends
+      if (url.startsWith("/v1/dashboard") && req.method === "GET") {
+        const range = urlQuery.get("range") ?? "24h";
+        try {
+          const data = this.db.getDashboardData(range);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(data, null, 2));
+        } catch (err) {
+          logger.error(`Dashboard query failed: ${err}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Dashboard query failed", message: err instanceof Error ? err.message : String(err) }));
+        }
+        return;
+      }
+
       if (url.startsWith("/last-decision") && req.method === "GET") {
         try {
           const rawDecisions = this.db.getRecentDecisions(parseInt(urlQuery.get("limit") ?? "5", 10) || 5);
@@ -447,6 +511,10 @@ export class ProxyServerStreaming {
             if (out.context_filter_json) {
               try { out.contextFilter = JSON.parse(out.context_filter_json); } catch { out.contextFilter = out.context_filter_json; }
               delete out.context_filter_json;
+            }
+            if (out.modality_filter_json) {
+              try { out.modalityFilter = JSON.parse(out.modality_filter_json); } catch { out.modalityFilter = out.modality_filter_json; }
+              delete out.modality_filter_json;
             }
             if (out.routing_scores) {
               try { out.winner_scores = JSON.parse(out.routing_scores); } catch { out.winner_scores = out.routing_scores; }
@@ -633,8 +701,26 @@ export class ProxyServerStreaming {
     // Estimate prompt token count for routing + context window guard
     const estimatedTokens = estimateTokenCount(request);
 
-    // Build candidate list - pass estimated tokens for size-aware routing
-    const decision = await this.router.decide(classification, sessionKey, { estimatedTokens });
+    // ─── Anomaly detection: flag token spikes (>2x rolling average) ───
+    const anomaly = this.budgetTracker.detectAnomaly(estimatedTokens);
+    if (anomaly.isAnomalous) {
+      logger.warn(`Token anomaly detected: ${anomaly.reason}`);
+    }
+
+    // ─── Modality detection: scan for images, audio, and other non-text content ───
+    const modalityResult = detectModalities(request.messages ?? []);
+    if (modalityResult.isMultimodal) {
+      logger.info(
+        `Modality detected: ${modalityResult.summary} — ` +
+        `routing to ${modalityResult.modalities.filter((m: Modality) => m !== "text").join(", ")}-capable models only.`,
+      );
+    }
+
+    // Build candidate list - pass estimated tokens and required modalities for routing
+    const decision = await this.router.decide(classification, sessionKey, {
+      estimatedTokens,
+      requiredModalities: modalityResult.modalities,
+    });
     const candidates = this.buildCandidateList(decision, request);
     const requestId = this.extractRequestId(request);
 
@@ -649,24 +735,32 @@ export class ProxyServerStreaming {
         model: decision.model,
         scores: decision.scores,
         overallScore: decision.overallScore,
-        outcome: decision.error ? "CONTEXT_TOO_LARGE" : "PENDING",
+        outcome: decision.error ? decision.error.code : "PENDING",
         requestId,
         candidatesJson: decision.candidates ? JSON.stringify(decision.candidates) : null,
         contextFilterJson: decision.contextFilter ? JSON.stringify(decision.contextFilter) : null,
+        modalityFilterJson: decision.modalityFilter ? JSON.stringify(decision.modalityFilter) : null,
       });
     }
 
     // Context window guard: if no model can handle the request, return error immediately
     if (decision?.error) {
-      logger.error(`Context too large — rejecting request: ${decision.error.message}`);
-      res.writeHead(413, { "Content-Type": "application/json" });
+      const errorCode = decision.error.code;
+      const isModalityError = errorCode === "MODALITY_UNSUPPORTED";
+      const httpStatus = isModalityError ? 422 : 413;
+      const errorType = isModalityError ? "modality_unsupported" : "context_too_large";
+
+      logger.error(`${errorCode} — rejecting request: ${decision.error.message}`);
+      res.writeHead(httpStatus, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         error: {
           message: decision.error.message,
-          type: "context_too_large",
+          type: errorType,
           code: decision.error.code,
           estimated_tokens: decision.error.estimatedTokens,
           max_context_window: decision.error.maxContextWindow,
+          required_modalities: decision.error.requiredModalities,
+          available_vision_models: decision.error.availableVisionModels,
         },
       }));
       return;
@@ -719,6 +813,15 @@ export class ProxyServerStreaming {
       // Check circuit breaker
       if (!this.costTracker.isAvailable(candidate.provider)) {
         logger.debug(`Skipping ${candidate.provider} - circuit open`);
+        modelStrikes.set(candidateKey, providerAttemptLimit);
+        continue;
+      }
+
+      // Check provider backoff timer (failure-type-aware)
+      if (providerBackoff.isBackedOff(candidate.provider)) {
+        const reason = providerBackoff.backoffReason(candidate.provider);
+        const remaining = Math.round(providerBackoff.remainingMs(candidate.provider) / 1000);
+        logger.debug(`Skipping ${candidate.provider} - backoff active (${remaining}s remaining: ${reason})`);
         modelStrikes.set(candidateKey, providerAttemptLimit);
         continue;
       }
@@ -830,6 +933,9 @@ export class ProxyServerStreaming {
 
           logger.info(`✅ ${candidate.provider}/${candidate.model} streamed (buffered, ${bufferedChunks.length} chunks) in ${durationMs}ms`);
 
+          // Clear any provider backoff on success
+          providerBackoff.clear(candidate.provider);
+
           // ─── Async LLM-as-judge feedback ───
           if (
             this.judge.shouldJudge() &&
@@ -908,6 +1014,9 @@ export class ProxyServerStreaming {
 
         logger.info(`✅ ${candidate.provider}/${candidate.model} succeeded in ${durationMs}ms`);
 
+        // Clear any provider backoff on success
+        providerBackoff.clear(candidate.provider);
+
         response.model = CHAT_RESPONSE_MODEL;
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(response));
@@ -947,18 +1056,21 @@ export class ProxyServerStreaming {
       } catch (err) {
         const durationMs = Date.now() - startTime;
         const error = err as Error;
-        const isRateLimit = (error as any).code === "rate_limit" || /rate.?limit|429|slow down/i.test(error.message);
+
+        // ── Classify failure type for failure-aware fallback ──
+        const failure = classifyFailure(error);
+        const isRateLimit = failure.type === "rate_limit";
         const isQuota = (error as any).code === "quota_exceeded" || /quota|monthly limit|prompt tokens limit exceeded|402/i.test(error.message);
-        const isTimeout = error.name === "TimeoutError" || error.name === "AbortError" || /timeout|aborted|stream_stall/i.test(error.message);
-        const isEmpty = (error as any).code === "empty_response";
+        const isTimeout = failure.type === "timeout";
+        const isEmpty = failure.type === "empty_response";
         const outcome = isRateLimit || isQuota ? "rate_limit" : isTimeout ? "timeout" : isEmpty ? "empty" : "error";
 
         lastError = error;
         const newStrikes = strikes + 1;
-        modelStrikes.set(candidate.provider, newStrikes);
+        modelStrikes.set(candidateKey, newStrikes);
 
         logger.warn(
-          `❌ ${candidate.provider}/${candidate.model} failed (${outcome}) in ${durationMs}ms ` +
+          `❌ ${candidate.provider}/${candidate.model} failed (${outcome}/${failure.type}) in ${durationMs}ms ` +
           `[strike ${newStrikes}/${providerAttemptLimit}]: ${sanitizeErrorForClient(error.message).substring(0, 100)}`,
         );
 
@@ -968,6 +1080,35 @@ export class ProxyServerStreaming {
           durationMs, outcome, timestamp: new Date().toISOString(),
         });
         this.db.updateDecisionOutcome(requestId, outcome, durationMs);
+
+        // ── Apply failure-type-aware fallback strategy ──
+        const fallbackDecision = computeFallbackDecision(
+          failure,
+          ci,
+          candidates.map(c => ({ provider: c.provider, model: c.model })),
+          candidate.provider,
+          candidate.model,
+        );
+
+        logger.info(fallbackDecision.logMessage);
+
+        // Apply provider backoff if the strategy calls for it
+        if (fallbackDecision.applyBackoff) {
+          providerBackoff.set(
+            fallbackDecision.applyBackoff.provider,
+            fallbackDecision.applyBackoff.durationMs,
+            fallbackDecision.applyBackoff.reason,
+          );
+        }
+
+        // Mark candidates to skip based on strategy
+        for (const skipIdx of fallbackDecision.skipIndices) {
+          if (skipIdx > ci) {
+            const skipCand = candidates[skipIdx];
+            const skipKey = `${skipCand.provider}/${skipCand.model}`;
+            modelStrikes.set(skipKey, maxAttemptsForProvider(skipCand.provider));
+          }
+        }
 
         if (newStrikes >= providerAttemptLimit) {
           logger.info(`⏭️ ${candidate.provider} exhausted (${newStrikes} strikes) - moving to next provider`);
@@ -1069,6 +1210,9 @@ export class ProxyServerStreaming {
               });
 
               logger.info(`✅ Hedge winner: ${hedgeOutcome.winnerProvider}/${hedgeOutcome.winnerModel} in ${winDurationMs}ms`);
+
+              // Clear any provider backoff on success
+              providerBackoff.clear(hedgeOutcome.winnerProvider);
 
               // Send the winning response to client
               winResponse.model = CHAT_RESPONSE_MODEL;

@@ -4,12 +4,20 @@ import { logger } from "./logger.js";
 import { registryReadiness } from "./readiness.js";
 import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig } from "./config.js";
+import { ChatBenchmark } from "./benchmark_chat.js";
 
 export interface ModelCapability {
   provider: string;
   model: string;
   contextWindow: number;
   modalities: string[]; // text, vision, audio, etc.
+  /** Convenience flag: true when modalities includes "vision". */
+  supportsVision?: boolean;
+  /** Convenience flag: true when modalities includes "audio". */
+  supportsAudio?: boolean;
+  /** Vision quality score (0.0–1.0). Higher = better vision understanding.
+   *  0 or undefined = no vision support. */
+  visionQuality?: number;
   // Capability dimensions (0-1), seeded from benchmarks, refined by observation
   capabilities: {
     coding: number;
@@ -31,7 +39,7 @@ export interface ModelCapability {
   /** VRAM required in GB (for local GPU models). 0 = unknown/N/A */
   vramRequiredGb?: number;
   isLocal: boolean;
-  source: "benchmark" | "observed" | "blended"; // how current the data is
+  source: "benchmark" | "observed" | "blended" | "auto-bench" | "inferred"; // how current the data is
   /** Whether this model is included in the provider's subscription plan (vs pay-per-credit) */
   planEligible?: boolean;
 }
@@ -44,13 +52,20 @@ function makeModel(
   id: string,
   ctx: number,
   caps: Caps,
-  opts: { input?: number; output?: number; local?: boolean; vision?: boolean; usageMultiplier?: number; vram?: number; planEligible?: boolean } = {},
+  opts: { input?: number; output?: number; local?: boolean; vision?: boolean; visionQuality?: number; audio?: boolean; usageMultiplier?: number; vram?: number; planEligible?: boolean } = {},
 ): ModelCapability {
+  const modalities: string[] = ["text"];
+  const vq = opts.visionQuality;
+  if (opts.vision || (vq !== undefined && vq > 0)) modalities.push("vision");
+  if (opts.audio) modalities.push("audio");
   return {
     provider,
     model: id,
     contextWindow: ctx,
-    modalities: opts.vision ? ["text", "vision"] : ["text"],
+    modalities,
+    supportsVision: modalities.includes("vision"),
+    supportsAudio: modalities.includes("audio"),
+    visionQuality: modalities.includes("vision") ? (vq ?? 0.5) : undefined,
     capabilities: caps,
     costPer1kInput: opts.input,
     costPer1kOutput: opts.output,
@@ -69,7 +84,7 @@ function makeModel(
 // Z.AI models NOT included in the Coding subscription - exclude from auto-discovery
 const ZAI_EXCLUDED_MODELS = new Set([
   "glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v",
-  "glm-4.6", "glm-4.6v",
+  "glm-4.6", "glm-4.6v", // glm-4.6v seeded explicitly as vision-only
   "glm-5", // base glm-5 (not turbo) - not in coding plan
 ]);
 
@@ -100,38 +115,35 @@ const SEED_MODELS: ModelCapability[] = [
     { input: 0, output: 0, planEligible: true },
   ),
 
+  // Z.AI Vision+Audio model — used for multimodal routing (not in coding plan)
+  // GLM-4.6V supports image and audio input, making it the primary multimodal option.
+  makeModel("zai", "glm-4.6v", 64_000,
+    { coding: 0.60, reasoning: 0.68, creative: 0.70, math: 0.58, analysis: 0.66, conversation: 0.78, retrieval: 0.64, science: 0.62, business: 0.64, summary: 0.72 },
+    { input: 0, output: 0, vision: true, visionQuality: 0.85, audio: true, planEligible: false },
+  ),
+
   // ═══════════════════════════════════════════════════════════════
   // OpenRouter free agent-generation candidates only. Avoid seeding
   // openrouter/free here because it is a random free-model router, not a
   // deterministic model row suitable for agent routing.
   // ═══════════════════════════════════════════════════════════════
 
-  makeModel("openrouter", "qwen/qwen3-coder:free", 1_000_000,
-    { coding: 0.84, reasoning: 0.76, creative: 0.60, math: 0.72, analysis: 0.78, conversation: 0.62, retrieval: 0.68, science: 0.68, business: 0.64, summary: 0.66 },
-    { input: 0, output: 0 },
-  ),
-  makeModel("openrouter", "poolside/laguna-m.1:free", 262_000,
-    { coding: 0.82, reasoning: 0.74, creative: 0.56, math: 0.68, analysis: 0.76, conversation: 0.58, retrieval: 0.62, science: 0.62, business: 0.60, summary: 0.62 },
-    { input: 0, output: 0 },
-  ),
-  makeModel("openrouter", "openrouter/owl-alpha", 1_000_000,
-    { coding: 0.76, reasoning: 0.78, creative: 0.66, math: 0.70, analysis: 0.80, conversation: 0.72, retrieval: 0.76, science: 0.72, business: 0.72, summary: 0.74 },
-    { input: 0, output: 0 },
-  ),
+  // NOTE: OpenRouter free model availability changes frequently.
+  // Last verified: 2026-07-27. Removed dead models:
+  //   qwen3-coder:free (moved to paid), owl-alpha (deleted),
+  //   qwen3.6-plus:free (deprecated), nemotron-3-super-120b:free (resource exhausted),
+  //   poolside/laguna-m.1:free (429 rate-limited, removed 2026-07-28).
+
   makeModel("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free", 1_000_000,
     { coding: 0.72, reasoning: 0.82, creative: 0.62, math: 0.76, analysis: 0.82, conversation: 0.68, retrieval: 0.78, science: 0.78, business: 0.76, summary: 0.76 },
     { input: 0, output: 0 },
   ),
-  makeModel("openrouter", "nvidia/nemotron-3-super-120b-a12b:free", 1_000_000,
-    { coding: 0.70, reasoning: 0.80, creative: 0.60, math: 0.76, analysis: 0.80, conversation: 0.66, retrieval: 0.76, science: 0.76, business: 0.74, summary: 0.74 },
-    { input: 0, output: 0 },
-  ),
-  makeModel("openrouter", "qwen/qwen3.6-plus:free", 1_000_000,
-    { coding: 0.80, reasoning: 0.78, creative: 0.70, math: 0.72, analysis: 0.78, conversation: 0.72, retrieval: 0.74, science: 0.72, business: 0.72, summary: 0.74 },
-    { input: 0, output: 0 },
-  ),
   makeModel("openrouter", "cohere/north-mini-code:free", 256_000,
     { coding: 0.74, reasoning: 0.62, creative: 0.50, math: 0.58, analysis: 0.64, conversation: 0.56, retrieval: 0.58, science: 0.56, business: 0.56, summary: 0.58 },
+    { input: 0, output: 0 },
+  ),
+  makeModel("openrouter", "qwen/qwen3-30b-a3b-instruct-2507", 262_000,
+    { coding: 0.80, reasoning: 0.82, creative: 0.64, math: 0.74, analysis: 0.80, conversation: 0.72, retrieval: 0.72, science: 0.76, business: 0.70, summary: 0.74 },
     { input: 0, output: 0 },
   ),
 
@@ -155,15 +167,15 @@ const SEED_MODELS: ModelCapability[] = [
   ),
   makeModel("ollama", "gemma3:12b", 8_000,
     { coding: 0.52, reasoning: 0.55, creative: 0.58, math: 0.48, analysis: 0.52, conversation: 0.68, retrieval: 0.62, science: 0.48, business: 0.50, summary: 0.65 },
-    { local: true, vision: true, vram: 8.1 },
+    { local: true, vision: true, visionQuality: 0.75, vram: 8.1 },
   ),
   makeModel("ollama", "gemma3:4b", 8_000,
     { coding: 0.42, reasoning: 0.44, creative: 0.50, math: 0.38, analysis: 0.42, conversation: 0.60, retrieval: 0.55, science: 0.38, business: 0.40, summary: 0.55 },
-    { local: true, vision: true, vram: 3.3 },
+    { local: true, vision: true, visionQuality: 0.60, vram: 3.3 },
   ),
   makeModel("ollama", "gemma3:1b", 8_000,
     { coding: 0.30, reasoning: 0.32, creative: 0.40, math: 0.25, analysis: 0.30, conversation: 0.50, retrieval: 0.42, science: 0.25, business: 0.28, summary: 0.45 },
-    { local: true, vision: true, vram: 0.8 },
+    { local: true, vision: true, visionQuality: 0.40, vram: 0.8 },
   ),
   makeModel("ollama", "mistral:7b", 32_000,
     { coding: 0.50, reasoning: 0.52, creative: 0.62, math: 0.45, analysis: 0.50, conversation: 0.65, retrieval: 0.58, science: 0.45, business: 0.48, summary: 0.60 },
@@ -211,11 +223,11 @@ const SEED_MODELS: ModelCapability[] = [
   // Vision-capable
   makeModel("ollama", "llama3.2-vision:11b", 128_000,
     { coding: 0.45, reasoning: 0.48, creative: 0.50, math: 0.40, analysis: 0.46, conversation: 0.58, retrieval: 0.52, science: 0.42, business: 0.44, summary: 0.52 },
-    { local: true, vision: true, vram: 7.8 },
+    { local: true, vision: true, visionQuality: 0.70, vram: 7.8 },
   ),
   makeModel("ollama", "moondream:latest", 8_000,
     { coding: 0.15, reasoning: 0.20, creative: 0.35, math: 0.12, analysis: 0.25, conversation: 0.40, retrieval: 0.30, science: 0.15, business: 0.18, summary: 0.35 },
-    { local: true, vision: true, vram: 1.7 },
+    { local: true, vision: true, visionQuality: 0.50, vram: 1.7 },
   ),
 
   // New additions - high-quality models that fit 11GB limit
@@ -241,6 +253,7 @@ export class ModelRegistry {
     creative: "creative",
     conversation: "conversation",
     summary: "summary",
+    "doc-summary": "summary",
     retrieval: "retrieval",
     science: "science",
     business: "business",
@@ -262,12 +275,63 @@ export class ModelRegistry {
     // Live-discover models from provider APIs
     await this.discoverModels();
 
+    // Auto-benchmark discovered Ollama chat models (non-blocking — runs after server is ready)
+    this.benchmarkDiscoveredModels().catch(err =>
+      logger.warn("Auto-benchmark failed: " + (err instanceof Error ? err.message : err))
+    );
+
     // Apply any saved capability overrides from the judge feedback loop
     this.applySavedOverrides();
 
     registryReadiness.setSynced();
 
     logger.info(`Model registry loaded - ${this.models.size} models tracked.`);
+  }
+
+  /** Auto-benchmark discovered and inferred Ollama chat models using the
+   *  persistent multi-probe ChatBenchmark system.
+   *  Replaces the old shallow single-probe heuristic.
+   *  Skips models that have fresh cached results with matching version hash. */
+  private async benchmarkDiscoveredModels(): Promise<void> {
+    const EMBEDDING_PREFIXES = ["nomic-embed", "bge", "qwen3-embedding", "embeddinggemma"];
+    const toBenchmark: Array<{ provider: string; model: string }> = [];
+
+    // Collect all models that need benchmarking
+    for (const [key, cap] of this.models) {
+      // Skip embedding models
+      if (cap.model.split(":")[0].includes("embed")) continue;
+      if (EMBEDDING_PREFIXES.some(p => cap.model.toLowerCase().startsWith(p))) continue;
+
+      // For inferred models: always benchmark
+      // For seeded models: benchmark only if no cached results exist
+      if (cap.source === "inferred") {
+        toBenchmark.push({ provider: cap.provider, model: cap.model });
+      } else if (cap.source === "benchmark" || cap.source === "auto-bench") {
+        // Check if we have fresh cached results
+        const modelId = `${cap.provider}/${cap.model}`;
+        const cached = this.db.getAllLatestChatBenchmarks(modelId);
+        const probeTypes = ["coding", "reasoning", "conversation"];
+        const hasAllFresh = probeTypes.every(pt => {
+          const entry = cached.get(pt);
+          if (!entry) return false;
+          const age = (Date.now() - new Date(entry.timestamp).getTime()) / 86_400_000;
+          return age < 7;
+        });
+        if (!hasAllFresh) {
+          toBenchmark.push({ provider: cap.provider, model: cap.model });
+        }
+      }
+    }
+
+    if (toBenchmark.length === 0) {
+      logger.info("Chat benchmark: all models have fresh cached results, skipping.");
+      return;
+    }
+
+    logger.info(`Chat benchmark: ${toBenchmark.length} model(s) need probing.`);
+
+    const bench = new ChatBenchmark(this.db, this);
+    await bench.benchmarkModels(toBenchmark);
   }
 
   /** Discover available models from Z.AI and Ollama APIs at startup */
@@ -329,11 +393,11 @@ export class ModelRegistry {
         const data = await resp.json() as any;
         for (const m of data.models ?? []) {
           if (m.name && !this.models.has(`ollama/${m.name}`)) {
-            logger.info(`Discovered unseeded Ollama model: ollama/${m.name}`);
-            this.models.set(`ollama/${m.name}`, makeModel("ollama", m.name, 8_000,
-              { coding: 0.40, reasoning: 0.40, creative: 0.45, math: 0.35, analysis: 0.40, conversation: 0.50, retrieval: 0.45, science: 0.35, business: 0.38, summary: 0.48 },
-              { local: true },
-            ));
+            const caps = this.inferOllamaCapabilities(m.name, m.size);
+            logger.info(`Discovered unseeded Ollama model: ollama/${m.name} (inferred from name/size)`);
+            const discovered = makeModel("ollama", m.name, 8_000, caps, { local: true });
+            discovered.source = "inferred";
+            this.models.set(`ollama/${m.name}`, discovered);
           }
         }
       }
@@ -344,6 +408,29 @@ export class ModelRegistry {
 
   getCapability(provider: string, model: string): ModelCapability | undefined {
     return this.models.get(`${provider}/${model}`);
+  }
+
+  /** Remove a model from the registry (used by curator pruning). */
+  removeModel(provider: string, model: string): boolean {
+    const key = `${provider}/${model}`;
+    const existed = this.models.delete(key);
+    if (existed) {
+      logger.info(`Removed model from registry: ${key}`);
+    }
+    return existed;
+  }
+
+  /** Add a dynamically discovered model to the registry (used by curator). */
+  addDiscoveredModel(cap: ModelCapability): void {
+    const key = `${cap.provider}/${cap.model}`;
+    if (this.models.has(key)) {
+      // Update existing entry
+      this.models.set(key, cap);
+      logger.debug(`Updated discovered model: ${key}`);
+      return;
+    }
+    this.models.set(key, cap);
+    logger.info(`Added discovered model to registry: ${key} (source: ${cap.source})`);
   }
 
   getAllModels(): ModelCapability[] {
@@ -362,6 +449,20 @@ export class ModelRegistry {
     const dim = ModelRegistry.INTENT_MAP[intent];
     if (!dim) return 0.5;
     return cap.capabilities[dim];
+  }
+
+  /** Check if a model supports a given modality (e.g. "vision", "audio"). */
+  supportsModality(provider: string, model: string, modality: string): boolean {
+    const cap = this.getCapability(provider, model);
+    if (!cap) return false;
+    return cap.modalities.includes(modality);
+  }
+
+  /** Get all models that support a given modality, from the available providers. */
+  getModelsByModality(modality: string, availableProviders: string[]): ModelCapability[] {
+    return this.getAvailableModels(availableProviders).filter(
+      (m) => m.modalities.includes(modality),
+    );
   }
 
   /**
@@ -401,6 +502,45 @@ export class ModelRegistry {
   }
 
   /** Load judge-adjusted scores from the database on startup. */
+
+  /** Infer capability scores for an unseeded Ollama model based on name and size.
+   *  Uses family detection (deepseek, qwen, gemma, etc.) and size scaling. */
+  private inferOllamaCapabilities(modelName: string, sizeBytes?: number): { coding: number; reasoning: number; creative: number; math: number; analysis: number; conversation: number; retrieval: number; science: number; business: number; summary: number } {
+    const lower = modelName.toLowerCase();
+    const familyScores: Record<string, Record<string, number>> = {
+      deepseek:  { coding: 0.82, reasoning: 0.80, creative: 0.60, math: 0.78, analysis: 0.80, conversation: 0.64, retrieval: 0.70, science: 0.72, business: 0.62, summary: 0.68 },
+      qwen:      { coding: 0.78, reasoning: 0.76, creative: 0.62, math: 0.72, analysis: 0.76, conversation: 0.66, retrieval: 0.70, science: 0.68, business: 0.64, summary: 0.66 },
+      starcoder: { coding: 0.85, reasoning: 0.60, creative: 0.35, math: 0.55, analysis: 0.58, conversation: 0.30, retrieval: 0.40, science: 0.40, business: 0.30, summary: 0.50 },
+      gemma:     { coding: 0.72, reasoning: 0.74, creative: 0.65, math: 0.68, analysis: 0.72, conversation: 0.72, retrieval: 0.68, science: 0.68, business: 0.64, summary: 0.70 },
+      llama:     { coding: 0.70, reasoning: 0.72, creative: 0.64, math: 0.66, analysis: 0.70, conversation: 0.68, retrieval: 0.66, science: 0.66, business: 0.62, summary: 0.66 },
+      phi:       { coding: 0.68, reasoning: 0.70, creative: 0.58, math: 0.66, analysis: 0.66, conversation: 0.62, retrieval: 0.62, science: 0.64, business: 0.60, summary: 0.64 },
+      mistral:   { coding: 0.66, reasoning: 0.68, creative: 0.60, math: 0.62, analysis: 0.68, conversation: 0.66, retrieval: 0.62, science: 0.60, business: 0.58, summary: 0.64 },
+      nomic:     { coding: 0.30, reasoning: 0.30, creative: 0.35, math: 0.25, analysis: 0.32, conversation: 0.40, retrieval: 0.80, science: 0.30, business: 0.28, summary: 0.45 },
+      bge:       { coding: 0.20, reasoning: 0.20, creative: 0.20, math: 0.20, analysis: 0.25, conversation: 0.20, retrieval: 0.85, science: 0.20, business: 0.20, summary: 0.30 },
+      minicpm:   { coding: 0.60, reasoning: 0.62, creative: 0.55, math: 0.60, analysis: 0.62, conversation: 0.60, retrieval: 0.58, science: 0.58, business: 0.54, summary: 0.60 },
+    };
+    const defaultCaps = { coding: 0.40, reasoning: 0.40, creative: 0.45, math: 0.35, analysis: 0.40, conversation: 0.50, retrieval: 0.45, science: 0.35, business: 0.38, summary: 0.48 };
+
+    let caps = { ...defaultCaps };
+    for (const [family, scores] of Object.entries(familyScores)) {
+      if (lower.includes(family)) { caps = { ...scores } as typeof caps; break; }
+    }
+
+    // Size-based scaling: rough bytes→params (1.5 bytes/param for quantized)
+    if (sizeBytes) {
+      const params = sizeBytes / 1.5e9;
+      let scale = 1;
+      if (params >= 70) scale = 1.18;
+      else if (params >= 30) scale = 1.12;
+      else if (params < 3) scale = 0.85;
+      for (const k of Object.keys(caps) as Array<keyof typeof caps>) {
+        caps[k] = Math.min(0.95, Math.max(0.15, caps[k] * scale));
+      }
+    }
+
+    return caps;
+  }
+
   private applySavedOverrides(): void {
     const overrides = this.db.loadCapabilityOverrides();
     if (overrides.length === 0) return;

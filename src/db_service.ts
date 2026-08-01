@@ -16,6 +16,9 @@ export interface DecisionRecord {
   overallScore: number;
   outcome: string;
   requestId?: string;
+  candidatesJson?: string | null;
+  contextFilterJson?: string | null;
+  modalityFilterJson?: string | null;
 }
 
 export interface CallOutcomeRecord {
@@ -56,6 +59,9 @@ export class DBService {
       logger.warn(`Schema initialization warning: ${err}`);
     }
     this.addColumnIfMissing("routing_decisions", "request_id", "TEXT");
+    this.addColumnIfMissing("routing_decisions", "candidates_json", "TEXT");
+    this.addColumnIfMissing("routing_decisions", "context_filter_json", "TEXT");
+    this.addColumnIfMissing("routing_decisions", "modality_filter_json", "TEXT");
     this.db.exec(INDEX_SCHEMA_SQL);
     logger.info("Database schema verified.");
   }
@@ -83,8 +89,8 @@ export class DBService {
     const stmt = this.db.prepare(`
       INSERT INTO routing_decisions
         (timestamp, session_key, message_hash, intent, confidence,
-         chosen_provider, chosen_model, routing_scores, overall_score, outcome, request_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         chosen_provider, chosen_model, routing_scores, overall_score, outcome, request_id, candidates_json, context_filter_json, modality_filter_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       data.timestamp,
@@ -98,7 +104,54 @@ export class DBService {
       data.overallScore,
       data.outcome,
       data.requestId ?? null,
+      data.candidatesJson ?? null,
+      data.contextFilterJson ?? null,
+      data.modalityFilterJson ?? null,
     );
+  }
+
+  updateDecisionOutcome(requestId: string, outcome: string, durationMs: number): void {
+    if (!requestId) return;
+    this.db.prepare(
+      `UPDATE routing_decisions SET outcome = ? WHERE request_id = ? AND outcome = 'PENDING'`
+    ).run(outcome, requestId);
+  }
+
+  saveCircuitState(providerName: string, status: string, consecutiveFailures: number, backoffTier: number): void {
+    this.db.prepare(
+      `INSERT INTO provider_health (provider_name, status, rate_limit_errors, circuit_open, last_check, metadata)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(provider_name) DO UPDATE SET
+         status = excluded.status,
+         rate_limit_errors = excluded.rate_limit_errors,
+         circuit_open = excluded.circuit_open,
+         last_check = excluded.last_check,
+         metadata = excluded.metadata`
+    ).run(
+      providerName,
+      status,
+      consecutiveFailures,
+      status === "circuit_open" ? 1 : 0,
+      new Date().toISOString(),
+      JSON.stringify({ consecutiveFailures, backoffTier }),
+    );
+  }
+
+  loadCircuitState(providerName: string): { status: string; consecutiveFailures: number; backoffTier: number } | null {
+    const row = this.db.prepare(
+      `SELECT status, metadata FROM provider_health WHERE provider_name = ?`
+    ).get(providerName) as any;
+    if (!row || row.status === 'HEALTHY') return null;
+    try {
+      const meta = JSON.parse(row.metadata || '{}');
+      return {
+        status: row.status.toLowerCase(),
+        consecutiveFailures: meta.consecutiveFailures || 0,
+        backoffTier: meta.backoffTier || 0,
+      };
+    } catch {
+      return null;
+    }
   }
 
   recordCallOutcome(data: CallOutcomeRecord): void {
@@ -154,7 +207,7 @@ export class DBService {
   getRecentDecisions(limit = 100): any[] {
     return this.db
       .prepare(
-        "SELECT * FROM routing_decisions ORDER BY timestamp DESC LIMIT ?",
+        "SELECT id, timestamp, session_key, intent, confidence, chosen_provider, chosen_model, routing_scores, overall_score, outcome, candidates_json, context_filter_json FROM routing_decisions ORDER BY timestamp DESC LIMIT ?",
       )
       .all(limit);
   }
@@ -342,6 +395,590 @@ export class DBService {
     `).all(key, period) as Array<{ provider: string; spendUsd: number }>;
   }
 
+  // ─── Curator Methods ───
+
+  /** Record a curator cycle result. */
+  recordCuratorRun(result: import("./curator.js").CuratorResult): void {
+    this.db.prepare(`
+      INSERT INTO curator_runs
+        (timestamp, ollama_scanned, ollama_pulled, ollama_skipped,
+         openrouter_scanned, openrouter_added, openrouter_pruned, errors)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      result.timestamp,
+      result.ollamaScanned,
+      JSON.stringify(result.ollamaPulled),
+      JSON.stringify(result.ollamaSkipped),
+      result.openrouterScanned,
+      JSON.stringify(result.openrouterAdded),
+      JSON.stringify(result.openrouterPruned),
+      JSON.stringify(result.errors),
+    );
+  }
+
+  /** Get recent curator runs for diagnostics. */
+  getRecentCuratorRuns(limit = 10): any[] {
+    return this.db.prepare(`
+      SELECT * FROM curator_runs ORDER BY timestamp DESC LIMIT ?
+    `).all(limit);
+  }
+
+  /** Record a model pull attempt (success or failure). */
+  recordCuratorModelAttempt(provider: string, model: string, success: boolean): void {
+    const existing = this.getCuratorModelAttempt(provider, model);
+    const failures = existing ? (success ? 0 : existing.consecutiveFailures + 1) : (success ? 0 : 1);
+
+    this.db.prepare(`
+      INSERT INTO curator_model_attempts
+        (provider, model, last_attempt, consecutive_failures, last_success)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(provider, model) DO UPDATE SET
+        last_attempt = excluded.last_attempt,
+        consecutive_failures = excluded.consecutive_failures,
+        last_success = CASE WHEN ? = 1 THEN excluded.last_success ELSE last_success END
+    `).run(
+      provider,
+      model,
+      new Date().toISOString(),
+      failures,
+      success ? new Date().toISOString() : null,
+      success ? 1 : 0,
+    );
+  }
+
+  /** Get the last attempt record for a model. */
+  getCuratorModelAttempt(provider: string, model: string): { lastAttempt: string; consecutiveFailures: number; lastSuccess: string | null } | null {
+    const row = this.db.prepare(`
+      SELECT last_attempt AS lastAttempt, consecutive_failures AS consecutiveFailures, last_success AS lastSuccess
+      FROM curator_model_attempts
+      WHERE provider = ? AND model = ?
+    `).get(provider, model) as any;
+    return row ?? null;
+  }
+
+  /** Increment the prune miss counter for a model. Returns the new count. */
+  incrementPruneCounter(provider: string, model: string): number {
+    this.db.prepare(`
+      INSERT INTO curator_prune_tracking
+        (provider, model, miss_count, first_miss, last_miss)
+      VALUES (?, ?, 1, ?, ?)
+      ON CONFLICT(provider, model) DO UPDATE SET
+        miss_count = miss_count + 1,
+        last_miss = excluded.last_miss
+    `).run(
+      provider,
+      model,
+      new Date().toISOString(),
+      new Date().toISOString(),
+    );
+
+    const row = this.db.prepare(`
+      SELECT miss_count FROM curator_prune_tracking WHERE provider = ? AND model = ?
+    `).get(provider, model) as { miss_count: number } | undefined;
+
+    return row?.miss_count ?? 1;
+  }
+
+  /** Get the current prune miss counter for a model. */
+  getPruneCounter(provider: string, model: string): number {
+    const row = this.db.prepare(`
+      SELECT miss_count FROM curator_prune_tracking WHERE provider = ? AND model = ?
+    `).get(provider, model) as { miss_count: number } | undefined;
+    return row?.miss_count ?? 0;
+  }
+
+  /** Reset the prune counter for a model (it was found alive). */
+  resetPruneCounter(provider: string, model: string): void {
+    this.db.prepare(`
+      DELETE FROM curator_prune_tracking WHERE provider = ? AND model = ?
+    `).run(provider, model);
+  }
+
+  // ─── Chat Benchmark Methods ───
+
+  /** Save a chat benchmark result for a specific model + probe type. */
+  saveChatBenchmarkResult(data: {
+    modelId: string;
+    provider: string;
+    model: string;
+    probeType: string;
+    scoresJson: string;
+    latencyMs: number;
+    modelVersionHash: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO chat_benchmark_results
+        (model_id, provider, model, probe_type, scores_json, latency_ms, model_version_hash, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      data.modelId,
+      data.provider,
+      data.model,
+      data.probeType,
+      data.scoresJson,
+      data.latencyMs,
+      data.modelVersionHash,
+      new Date().toISOString(),
+    );
+  }
+
+  /** Get the most recent benchmark result for a model + probe type.
+   *  Returns null if not found. */
+  getLatestChatBenchmark(
+    modelId: string,
+    probeType: string,
+  ): { scoresJson: string; latencyMs: number; modelVersionHash: string; timestamp: string } | null {
+    const row = this.db.prepare(`
+      SELECT scores_json AS scoresJson, latency_ms AS latencyMs,
+             model_version_hash AS modelVersionHash, timestamp
+      FROM chat_benchmark_results
+      WHERE model_id = ? AND probe_type = ?
+      ORDER BY timestamp DESC LIMIT 1
+    `).get(modelId, probeType) as any;
+    return row ?? null;
+  }
+
+  /** Get all latest benchmark results for a model (across all probe types).
+   *  Returns a map of probeType -> result. */
+  getAllLatestChatBenchmarks(
+    modelId: string,
+  ): Map<string, { scoresJson: string; latencyMs: number; modelVersionHash: string; timestamp: string }> {
+    const rows = this.db.prepare(`
+      SELECT probe_type AS probeType, scores_json AS scoresJson,
+             latency_ms AS latencyMs, model_version_hash AS modelVersionHash, timestamp
+      FROM chat_benchmark_results
+      WHERE model_id = ?
+      AND id IN (
+        SELECT MAX(id) FROM chat_benchmark_results
+        WHERE model_id = ?
+        GROUP BY probe_type
+      )
+    `).all(modelId, modelId) as Array<any>;
+
+    const result = new Map();
+    for (const row of rows) {
+      result.set(row.probeType, {
+        scoresJson: row.scoresJson,
+        latencyMs: row.latencyMs,
+        modelVersionHash: row.modelVersionHash,
+        timestamp: row.timestamp,
+      });
+    }
+    return result;
+  }
+
+  /** Get the intent distribution from recent routing decisions.
+   *  Returns a map of intent -> proportion (0-1). */
+  getTrafficDistribution(days: number = 7): Map<string, number> {
+    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+    const rows = this.db.prepare(`
+      SELECT intent, COUNT(*) AS count
+      FROM routing_decisions
+      WHERE timestamp >= ?
+      GROUP BY intent
+    `).all(since) as Array<{ intent: string; count: number }>;
+
+    const total = rows.reduce((sum, r) => sum + r.count, 0);
+    const result = new Map<string, number>();
+    for (const row of rows) {
+      result.set(row.intent, total > 0 ? row.count / total : 0);
+    }
+    return result;
+  }
+
+  // ─── Dashboard Aggregation Queries ───
+
+  /** Parse a time range string (e.g. "1h", "24h", "7d") into an ISO cutoff timestamp. */
+  static parseTimeRange(range: string): string {
+    const match = range.match(/^(\d+)([hdw])$/);
+    if (!match) return new Date(Date.now() - 24 * 3_600_000).toISOString(); // default 24h
+    const value = parseInt(match[1], 10);
+    const unit = match[2];
+    const multiplier = unit === "h" ? 3_600_000 : unit === "d" ? 86_400_000 : 7 * 86_400_000;
+    return new Date(Date.now() - value * multiplier).toISOString();
+  }
+
+  /** Get provider distribution: request count, percentage, success/failure counts. */
+  getDashboardProviderDistribution(sinceIso: string): Array<{
+    provider: string; requests: number; percentage: number;
+    successes: number; failures: number; successRate: number;
+  }> {
+    const rows = this.db.prepare(`
+      SELECT
+        chosen_provider AS provider,
+        COUNT(*) AS requests,
+        SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS successes,
+        SUM(CASE WHEN outcome NOT IN ('success', 'PENDING') THEN 1 ELSE 0 END) AS failures
+      FROM routing_decisions
+      WHERE timestamp >= ?
+      GROUP BY chosen_provider
+      ORDER BY requests DESC
+    `).all(sinceIso) as Array<{ provider: string; requests: number; successes: number; failures: number }>;
+
+    const total = rows.reduce((sum, r) => sum + r.requests, 0);
+    return rows.map(r => ({
+      provider: r.provider,
+      requests: r.requests,
+      percentage: total > 0 ? Math.round((r.requests / total) * 10000) / 100 : 0,
+      successes: r.successes,
+      failures: r.failures,
+      successRate: r.requests > 0 ? Math.round((r.successes / r.requests) * 10000) / 100 : 0,
+    }));
+  }
+
+  /** Get cost breakdown by intent classification.
+   *  Joins routing_decisions with provider_spend to estimate per-intent spend.
+   *  When spend data isn't available, falls back to decision counts per intent. */
+  getDashboardCostByIntent(sinceIso: string): Array<{
+    intent: string; decisions: number; estimatedSpendUsd: number;
+  }> {
+    // Get decision counts per intent
+    const decisionRows = this.db.prepare(`
+      SELECT intent, COUNT(*) AS decisions
+      FROM routing_decisions
+      WHERE timestamp >= ?
+      GROUP BY intent
+      ORDER BY decisions DESC
+    `).all(sinceIso) as Array<{ intent: string; decisions: number }>;
+
+    // Get spend per provider for the period (from provider_spend)
+    const sinceDateKey = sinceIso.slice(0, 10);
+    const spendRows = this.db.prepare(`
+      SELECT provider, SUM(spend_usd) AS total_spend
+      FROM provider_spend
+      WHERE period = 'daily' AND date_key >= ?
+      GROUP BY provider
+    `).all(sinceDateKey) as Array<{ provider: string; total_spend: number }>;
+
+    // Get provider distribution per intent to allocate spend proportionally
+    const providerPerIntent = this.db.prepare(`
+      SELECT
+        intent,
+        chosen_provider AS provider,
+        COUNT(*) AS cnt
+      FROM routing_decisions
+      WHERE timestamp >= ?
+      GROUP BY intent, chosen_provider
+    `).all(sinceIso) as Array<{ intent: string; provider: string; cnt: number }>;
+
+    // Build provider→spend map
+    const providerSpend = new Map<string, number>();
+    for (const s of spendRows) {
+      providerSpend.set(s.provider, s.total_spend);
+    }
+
+    // Build intent→provider count map
+    const intentProviderCounts = new Map<string, Map<string, number>>();
+    const intentTotals = new Map<string, number>();
+    for (const r of providerPerIntent) {
+      if (!intentProviderCounts.has(r.intent)) intentProviderCounts.set(r.intent, new Map());
+      intentProviderCounts.get(r.intent)!.set(r.provider, r.cnt);
+      intentTotals.set(r.intent, (intentTotals.get(r.intent) ?? 0) + r.cnt);
+    }
+
+    return decisionRows.map(r => {
+      let estimatedSpend = 0;
+      const providerCounts = intentProviderCounts.get(r.intent);
+      const totalForIntent = intentTotals.get(r.intent) ?? 1;
+      if (providerCounts) {
+        for (const [provider, cnt] of providerCounts) {
+          const spend = providerSpend.get(provider) ?? 0;
+          estimatedSpend += spend * (cnt / totalForIntent);
+        }
+      }
+      return {
+        intent: r.intent,
+        decisions: r.decisions,
+        estimatedSpendUsd: Math.round(estimatedSpend * 10000) / 10000,
+      };
+    });
+  }
+
+  /** Get rolling average latency per provider for multiple bucket sizes.
+   *  Returns nested structure: provider → bucket → { avgMs, samples }. */
+  getDashboardLatencyTrends(sinceIso: string): Array<{
+    provider: string;
+    buckets: Array<{ bucket: string; avgMs: number | null; samples: number }>;
+  }> {
+    const providers = this.db.prepare(`
+      SELECT DISTINCT provider FROM call_outcomes WHERE timestamp >= ?
+    `).all(sinceIso) as Array<{ provider: string }>;
+
+    const bucketDefs = [
+      { name: "1h", ms: 3_600_000 },
+      { name: "6h", ms: 6 * 3_600_000 },
+      { name: "24h", ms: 24 * 3_600_000 },
+      { name: "7d", ms: 7 * 24 * 3_600_000 },
+    ];
+
+    const now = Date.now();
+
+    return providers.map(({ provider }) => {
+      const buckets = bucketDefs.map(bd => {
+        const bucketSince = new Date(now - bd.ms).toISOString();
+        const row = this.db.prepare(`
+          SELECT
+            AVG(duration_ms) AS avg_ms,
+            COUNT(*) AS samples
+          FROM call_outcomes
+          WHERE provider = ? AND timestamp >= ? AND outcome = 'success'
+        `).get(provider, bucketSince) as { avg_ms: number | null; samples: number } | undefined;
+
+        return {
+          bucket: bd.name,
+          avgMs: row?.avg_ms != null ? Math.round(row.avg_ms) : null,
+          samples: row?.samples ?? 0,
+        };
+      });
+
+      return { provider, buckets };
+    });
+  }
+
+  /** Get model market share: which specific models are picked and how that changes over time.
+   *  Returns total counts plus time-series buckets for trend visualization. */
+  getDashboardModelMarketShare(sinceIso: string, rangeLabel: string): Array<{
+    provider: string; model: string; requests: number; percentage: number;
+    timeseries: Array<{ bucket: string; count: number }>;
+  }> {
+    // Determine bucket size based on range
+    const bucketFmt = rangeLabel.endsWith("h") ? "%Y-%m-%dT%H:00:00" : "%Y-%m-%d";
+
+    const rows = this.db.prepare(`
+      SELECT
+        chosen_provider AS provider,
+        chosen_model AS model,
+        COUNT(*) AS requests
+      FROM routing_decisions
+      WHERE timestamp >= ?
+      GROUP BY chosen_provider, chosen_model
+      ORDER BY requests DESC
+    `).all(sinceIso) as Array<{ provider: string; model: string; requests: number }>;
+
+    const total = rows.reduce((sum, r) => sum + r.requests, 0);
+
+    // Get timeseries for each model
+    const tsRows = this.db.prepare(`
+      SELECT
+        chosen_provider AS provider,
+        chosen_model AS model,
+        strftime('${bucketFmt}', timestamp) AS bucket,
+        COUNT(*) AS count
+      FROM routing_decisions
+      WHERE timestamp >= ?
+      GROUP BY chosen_provider, chosen_model, bucket
+      ORDER BY bucket ASC
+    `).all(sinceIso) as Array<{ provider: string; model: string; bucket: string; count: number }>;
+
+    // Group timeseries by provider/model
+    const tsMap = new Map<string, Array<{ bucket: string; count: number }>>();
+    for (const t of tsRows) {
+      const key = `${t.provider}/${t.model}`;
+      if (!tsMap.has(key)) tsMap.set(key, []);
+      tsMap.get(key)!.push({ bucket: t.bucket, count: t.count });
+    }
+
+    return rows.map(r => {
+      const key = `${r.provider}/${r.model}`;
+      return {
+        provider: r.provider,
+        model: r.model,
+        requests: r.requests,
+        percentage: total > 0 ? Math.round((r.requests / total) * 10000) / 100 : 0,
+        timeseries: tsMap.get(key) ?? [],
+      };
+    });
+  }
+
+  /** Get success/failure rates per provider and model.
+   *  Uses call_outcomes for detailed outcome breakdown. */
+  getDashboardModelSuccessRates(sinceIso: string): Array<{
+    provider: string; model: string; total: number;
+    successes: number; failures: number; successRate: number;
+    avgLatencyMs: number | null;
+  }> {
+    const rows = this.db.prepare(`
+      SELECT
+        provider,
+        model,
+        COUNT(*) AS total,
+        SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS successes,
+        SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END) AS failures,
+        AVG(CASE WHEN outcome = 'success' THEN duration_ms END) AS avg_latency_ms
+      FROM call_outcomes
+      WHERE timestamp >= ?
+      GROUP BY provider, model
+      ORDER BY total DESC
+    `).all(sinceIso) as Array<{
+      provider: string; model: string; total: number;
+      successes: number; failures: number; avg_latency_ms: number | null;
+    }>;
+
+    return rows.map(r => ({
+      provider: r.provider,
+      model: r.model,
+      total: r.total,
+      successes: r.successes,
+      failures: r.failures,
+      successRate: r.total > 0 ? Math.round((r.successes / r.total) * 10000) / 100 : 0,
+      avgLatencyMs: r.avg_latency_ms != null ? Math.round(r.avg_latency_ms) : null,
+    }));
+  }
+
+  /** Get outcome distribution: success/timeout/error/fallback percentages. */
+  getDashboardOutcomeDistribution(sinceIso: string): Array<{
+    outcome: string; count: number; percentage: number;
+  }> {
+    const rows = this.db.prepare(`
+      SELECT outcome, COUNT(*) AS count
+      FROM routing_decisions
+      WHERE timestamp >= ?
+      GROUP BY outcome
+      ORDER BY count DESC
+    `).all(sinceIso) as Array<{ outcome: string; count: number }>;
+
+    const total = rows.reduce((sum, r) => sum + r.count, 0);
+    return rows.map(r => ({
+      outcome: r.outcome,
+      count: r.count,
+      percentage: total > 0 ? Math.round((r.count / total) * 10000) / 100 : 0,
+    }));
+  }
+
+  /** Get total spend for the dashboard period. */
+  getDashboardTotalSpend(sinceIso: string): number {
+    const sinceDateKey = sinceIso.slice(0, 10);
+    const row = this.db.prepare(`
+      SELECT COALESCE(SUM(spend_usd), 0) AS total
+      FROM provider_spend
+      WHERE period = 'daily' AND date_key >= ?
+    `).get(sinceDateKey) as { total: number } | undefined;
+    return row?.total ?? 0;
+  }
+
+  /** Build the complete dashboard payload for a given time range. */
+  getDashboardData(rangeLabel: string = "24h"): Record<string, unknown> {
+    const sinceIso = DBService.parseTimeRange(rangeLabel);
+
+    return {
+      timeRange: {
+        label: rangeLabel,
+        since: sinceIso,
+        generatedAt: new Date().toISOString(),
+      },
+      summary: {
+        totalRequests: this.db.prepare(`
+          SELECT COUNT(*) AS cnt FROM routing_decisions WHERE timestamp >= ?
+        `).get(sinceIso) as { cnt: number },
+        totalOutcomes: (() => {
+          const row = this.db.prepare(`
+            SELECT COUNT(*) AS cnt FROM call_outcomes WHERE timestamp >= ?
+          `).get(sinceIso) as { cnt: number } | undefined;
+          return row?.cnt ?? 0;
+        })(),
+        totalSpendUsd: this.getDashboardTotalSpend(sinceIso),
+        activeProviders: (this.db.prepare(`
+          SELECT COUNT(DISTINCT chosen_provider) AS cnt FROM routing_decisions WHERE timestamp >= ?
+        `).get(sinceIso) as { cnt: number }).cnt,
+        activeModels: (this.db.prepare(`
+          SELECT COUNT(DISTINCT chosen_model) AS cnt FROM routing_decisions WHERE timestamp >= ?
+        `).get(sinceIso) as { cnt: number }).cnt,
+      },
+      providerDistribution: this.getDashboardProviderDistribution(sinceIso),
+      costByIntent: this.getDashboardCostByIntent(sinceIso),
+      latencyTrends: this.getDashboardLatencyTrends(sinceIso),
+      modelMarketShare: this.getDashboardModelMarketShare(sinceIso, rangeLabel),
+      modelSuccessRates: this.getDashboardModelSuccessRates(sinceIso),
+      outcomeDistribution: this.getDashboardOutcomeDistribution(sinceIso),
+    };
+  }
+
+  // ─── Budget Burn-Rate Queries ───
+
+  /** Get hourly spend for the last N hours, grouped by hour.
+   *  Returns array of { hour_bucket, provider, spend_usd } sorted oldest-first. */
+  getHourlySpend(hours: number = 24): Array<{ hourBucket: string; provider: string; spendUsd: number }> {
+    const since = new Date(Date.now() - hours * 3_600_000).toISOString().slice(0, 13) + "00:00:00";
+    const rows = this.db.prepare(`
+      SELECT
+        SUBSTR(date_key, 1, 13) || ':00:00' AS hour_bucket,
+        provider,
+        SUM(spend_usd) AS spend_usd
+      FROM provider_spend
+      WHERE period = 'daily'
+        AND date_key >= ?
+      GROUP BY hour_bucket, provider
+      ORDER BY hour_bucket ASC, provider ASC
+    `).all(since) as Array<{ hour_bucket: string; provider: string; spend_usd: number }>;
+
+    return rows.map((r) => ({
+      hourBucket: r.hour_bucket,
+      provider: r.provider,
+      spendUsd: r.spend_usd,
+    }));
+  }
+
+  /** Get total spend across all providers for a specific period. */
+  getTotalSpend(period: "daily" | "monthly", dateKey?: string): number {
+    const key = dateKey ?? (period === "daily"
+      ? new Date().toISOString().slice(0, 10)
+      : new Date().toISOString().slice(0, 7));
+
+    const row = this.db.prepare(`
+      SELECT COALESCE(SUM(spend_usd), 0) AS total
+      FROM provider_spend
+      WHERE period = ? AND date_key = ?
+    `).get(period, key) as { total: number } | undefined;
+
+    return row?.total ?? 0;
+  }
+
+  /** Get recent request token counts for anomaly detection.
+   *  Returns estimated token counts derived from recent routing decisions.
+   *  Uses context_filter_json when available, otherwise falls back to
+   *  spend-per-request proxy from the provider_spend table. */
+  getRecentTokenCounts(limit: number = 50): number[] {
+    // Try to extract estimated token counts from recent routing decisions
+    // that have context_filter_json populated (contains estimatedTokens)
+    const rows = this.db.prepare(`
+      SELECT context_filter_json
+      FROM routing_decisions
+      WHERE context_filter_json IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(limit) as Array<{ context_filter_json: string }>;
+
+    if (rows.length > 0) {
+      const tokens: number[] = [];
+      for (const row of rows) {
+        try {
+          const parsed = JSON.parse(row.context_filter_json);
+          if (parsed?.estimatedTokens && typeof parsed.estimatedTokens === 'number') {
+            tokens.push(parsed.estimatedTokens);
+          }
+        } catch {
+          // skip unparseable rows
+        }
+      }
+      if (tokens.length > 0) return tokens;
+    }
+
+    // Fallback: estimate from recent call outcomes count as a proxy
+    // (at least gives us *something* for anomaly detection baseline)
+    const outcomeCount = this.db.prepare(`
+      SELECT COUNT(*) AS cnt FROM call_outcomes
+      WHERE timestamp >= datetime('now', '-1 hour')
+    `).get() as { cnt: number } | undefined;
+
+    if (outcomeCount && outcomeCount.cnt > 0) {
+      // Return a synthetic baseline based on request frequency
+      // This is a rough proxy; real token counts come from context_filter_json
+      return Array(Math.min(outcomeCount.cnt, limit)).fill(1000);
+    }
+
+    return [];
+  }
+
   close(): void {
     this.db.close();
     logger.info("Database connection closed.");
@@ -443,6 +1080,48 @@ CREATE TABLE IF NOT EXISTS provider_spend (
   spend_usd   REAL NOT NULL DEFAULT 0,
   UNIQUE(date_key, period, provider)
 );
+
+CREATE TABLE IF NOT EXISTS curator_runs (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp           TEXT NOT NULL,
+  ollama_scanned      INTEGER DEFAULT 0,
+  ollama_pulled       TEXT,
+  ollama_skipped      TEXT,
+  openrouter_scanned  INTEGER DEFAULT 0,
+  openrouter_added    TEXT,
+  openrouter_pruned   TEXT,
+  errors              TEXT
+);
+
+CREATE TABLE IF NOT EXISTS curator_model_attempts (
+  provider            TEXT NOT NULL,
+  model               TEXT NOT NULL,
+  last_attempt        TEXT NOT NULL,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_success        TEXT,
+  PRIMARY KEY (provider, model)
+);
+
+CREATE TABLE IF NOT EXISTS curator_prune_tracking (
+  provider    TEXT NOT NULL,
+  model       TEXT NOT NULL,
+  miss_count  INTEGER NOT NULL DEFAULT 0,
+  first_miss  TEXT NOT NULL,
+  last_miss   TEXT NOT NULL,
+  PRIMARY KEY (provider, model)
+);
+
+CREATE TABLE IF NOT EXISTS chat_benchmark_results (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_id        TEXT NOT NULL,
+  provider        TEXT NOT NULL,
+  model           TEXT NOT NULL,
+  probe_type      TEXT NOT NULL,
+  scores_json     TEXT NOT NULL,
+  latency_ms      INTEGER,
+  model_version_hash TEXT NOT NULL,
+  timestamp       TEXT NOT NULL
+);
 `;
 
 const INDEX_SCHEMA_SQL = `
@@ -456,4 +1135,10 @@ CREATE INDEX IF NOT EXISTS idx_retry_timestamp ON retry_attempts(timestamp);
 CREATE INDEX IF NOT EXISTS idx_outcomes_provider ON call_outcomes(provider);
 CREATE INDEX IF NOT EXISTS idx_outcomes_timestamp ON call_outcomes(timestamp);
 CREATE INDEX IF NOT EXISTS idx_spend_lookup ON provider_spend(period, provider, date_key);
+CREATE INDEX IF NOT EXISTS idx_curator_runs_timestamp ON curator_runs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_curator_attempts_provider ON curator_model_attempts(provider);
+CREATE INDEX IF NOT EXISTS idx_curator_prune_provider ON curator_prune_tracking(provider);
+CREATE INDEX IF NOT EXISTS idx_chat_bench_model ON chat_benchmark_results(model_id);
+CREATE INDEX IF NOT EXISTS idx_chat_bench_probe ON chat_benchmark_results(probe_type);
+CREATE INDEX IF NOT EXISTS idx_chat_bench_timestamp ON chat_benchmark_results(timestamp);
 `;

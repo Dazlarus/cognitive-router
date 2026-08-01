@@ -10,6 +10,9 @@ import type { CognitiveRouterConfig } from "./config.js";
 import type { Classification } from "./classifier.js";
 import { isGenerationModel } from "./model_policy.js";
 import { bucketForTokenCount, type SizeBucket } from "./cost_tracker.js";
+import type { BudgetTracker, CostEfficiency } from "./budget_tracker.js";
+import { OllamaWarmthChecker, type WarmthInfo } from "./ollama_warmth.js";
+import type { Modality } from "./modality.js";
 
 /** Context window filter result — attached to every decision for observability. */
 export interface ContextFilterInfo {
@@ -25,6 +28,20 @@ export interface ContextFilterInfo {
   }>;
   /** Largest context window among all known models (for error messaging). */
   maxContextWindow: number;
+}
+
+/** Modality filter result — attached to decisions for observability. */
+export interface ModalityFilterInfo {
+  /** Modalities required by the request. */
+  requiredModalities: Modality[];
+  /** Models that were excluded because they lack a required modality. */
+  filteredOut: Array<{
+    provider: string;
+    model: string;
+    modalities: string[];
+  }>;
+  /** Whether multimodal routing was active. */
+  wasMultimodal: boolean;
 }
 
 export interface RoutingDecision {
@@ -47,12 +64,16 @@ export interface RoutingDecision {
   }>;
   /** Context window filter details — present when estimatedTokens > 0. */
   contextFilter?: ContextFilterInfo;
-  /** Set when the request exceeds all available context windows. */
+  /** Modality filter details — present when request is multimodal. */
+  modalityFilter?: ModalityFilterInfo;
+  /** Set when the request requires a modality no model supports. */
   error?: {
-    code: "CONTEXT_TOO_LARGE";
+    code: "CONTEXT_TOO_LARGE" | "MODALITY_UNSUPPORTED";
     message: string;
-    estimatedTokens: number;
-    maxContextWindow: number;
+    estimatedTokens?: number;
+    maxContextWindow?: number;
+    requiredModalities?: Modality[];
+    availableVisionModels?: string[];
   };
 }
 
@@ -105,12 +126,25 @@ function sizeScoreAdjust(
 }
 
 export class RoutingEngine {
+  private budgetTracker: BudgetTracker | null = null;
+  private warmthChecker: OllamaWarmthChecker | null = null;
+
   constructor(
     private registry: ModelRegistry,
     private costTracker: CostTracker,
     private db: DBService,
     private config: CognitiveRouterConfig,
   ) {}
+
+  /** Inject a BudgetTracker instance for budget-aware routing. */
+  setBudgetTracker(bt: BudgetTracker): void {
+    this.budgetTracker = bt;
+  }
+
+  /** Inject an OllamaWarmthChecker for warm model awareness. */
+  setWarmthChecker(wc: OllamaWarmthChecker): void {
+    this.warmthChecker = wc;
+  }
 
   async decide(
     classification: Classification,
@@ -154,13 +188,33 @@ export class RoutingEngine {
         return false;
       }
       if (!isGenerationModel(m.provider, m.model)) {
-        logger.debug(`Skipping ${m.provider}/${m.model} — embedding-only model.`);
-        return false;
+        // Allow non-generation models (e.g. vision-only, audio-only) when the
+        // request requires a modality they support.  Embedding-only models are
+        // still filtered out because they never carry non-text modalities.
+        const requiredMods: string[] = context?.requiredModalities ?? [];
+        const nonTextMods = requiredMods.filter((r) => r !== "text");
+        const supportsNeeded = nonTextMods.length > 0 &&
+          nonTextMods.every((mod) => m.modalities.includes(mod));
+        if (!supportsNeeded) {
+          logger.debug(`Skipping ${m.provider}/${m.model} — not a generation model.`);
+          return false;
+        }
+        logger.debug(`Allowing ${m.provider}/${m.model} — needed for [${nonTextMods.join(", ")}] modality.`);
       }
-      // Filter out ZAI models not covered by the coding plan
+      // Filter out ZAI models not covered by the coding plan — UNLESS the
+      // request requires a modality (vision/audio) that this model supports.
+      // Vision models like glm-4.6v are not in the coding plan but are the
+      // only option for multimodal requests.
       if (m.provider === "zai" && m.planEligible === false) {
-        logger.debug(`Skipping ${m.provider}/${m.model} — not in coding plan (requires credits).`);
-        return false;
+        const requiredMods: string[] = context?.requiredModalities ?? [];
+        const needsVision = requiredMods.includes("vision");
+        const needsAudio = requiredMods.includes("audio");
+        const supportsNeeded = (needsVision && m.modalities.includes("vision")) ||
+                              (needsAudio && m.modalities.includes("audio"));
+        if (!supportsNeeded) {
+          logger.debug(`Skipping ${m.provider}/${m.model} — not in coding plan (requires credits).`);
+          return false;
+        }
       }
       // ─── Negative signal amplification: skip pattern-flagged models ───
       if (this.costTracker.isUnstable(m.provider, m.model)) {
@@ -201,6 +255,87 @@ export class RoutingEngine {
         overallScore: 0,
         rationale: "Fallback — no models available",
       };
+    }
+
+    // ─── Modality filtering ───
+    // If the request contains images or audio, filter candidates to only
+    // those models that support the required modality.
+    let modalityFilter: ModalityFilterInfo | undefined;
+    const requiredModalities: Modality[] = context?.requiredModalities ?? [];
+    const nonTextModalities = requiredModalities.filter((m) => m !== "text");
+
+    if (nonTextModalities.length > 0) {
+      const modalityLabel = nonTextModalities.join(", ");
+      const modalityFilteredOut: ModalityFilterInfo["filteredOut"] = [];
+      const passingModality: typeof candidates = [];
+
+      for (const m of candidates) {
+        const supportsAll = nonTextModalities.every((mod) => m.modalities.includes(mod));
+        if (!supportsAll) {
+          modalityFilteredOut.push({
+            provider: m.provider,
+            model: m.model,
+            modalities: [...m.modalities],
+          });
+        } else {
+          passingModality.push(m);
+        }
+      }
+
+      // Log each filtered model
+      for (const f of modalityFilteredOut) {
+        logger.info(
+          `Modality filter: excluded ${f.provider}/${f.model} — ` +
+          `needs [${nonTextModalities.join(", ")}] but model only supports [${f.modalities.join(", ")}].`,
+        );
+      }
+
+      modalityFilter = {
+        requiredModalities,
+        filteredOut: modalityFilteredOut,
+        wasMultimodal: true,
+      };
+
+      if (passingModality.length === 0) {
+        // No model supports the required modality
+        const availableVisionModels = this.registry
+          .getAvailableModels(priorityProviders)
+          .filter((m) => nonTextModalities.some((mod) => m.modalities.includes(mod)))
+          .map((m) => `${m.provider}/${m.model}`);
+
+        logger.warn(
+          `Modality filter: ALL ${candidates.length} candidates excluded — ` +
+          `no model supports [${modalityLabel}]. ` +
+          `Known vision-capable: [${availableVisionModels.slice(0, 5).join(", ")}${availableVisionModels.length > 5 ? "..." : ""}].`,
+        );
+
+        return {
+          provider: "",
+          model: "",
+          scores: { capability: 0, reliability: 0, cost: 0, latency: 0 },
+          overallScore: 0,
+          rationale: `MODALITY_UNSUPPORTED: request requires [${modalityLabel}] ` +
+            `but no available model supports it.`,
+          modalityFilter,
+          error: {
+            code: "MODALITY_UNSUPPORTED",
+            message: `Request requires modality [${modalityLabel}] but no available ` +
+              `model supports it. ${availableVisionModels.length > 0
+                ? `Vision-capable models exist but are unavailable: ${availableVisionModels.slice(0, 3).join(", ")}`
+                : "No vision-capable models configured."}`,
+            requiredModalities,
+            availableVisionModels,
+          },
+        };
+      }
+
+      logger.info(
+        `Modality routing: [${modalityLabel}] required — ` +
+        `${passingModality.length}/${candidates.length} candidates support it ` +
+        `(${passingModality.map((m) => `${m.provider}/${m.model}`).slice(0, 3).join(", ")}${passingModality.length > 3 ? "..." : ""}).`,
+      );
+
+      candidates = passingModality;
     }
 
     // ─── Context window enforcement ───
@@ -293,6 +428,52 @@ export class RoutingEngine {
       );
     }
 
+    // ─── Budget-aware routing ───
+    // Check if auto-downgrade should be active (computed once per decision)
+    let budgetCostWeightBoost = 1.0;
+    let budgetDowngradeActive = false;
+    let budgetDowngradeReason = "";
+    if (this.budgetTracker) {
+      const projection = this.budgetTracker.projectBudget("daily", this.costTracker.dailyBudget);
+      if (projection.autoDowngradeActive) {
+        budgetCostWeightBoost = projection.costWeightBoost;
+        budgetDowngradeActive = true;
+        budgetDowngradeReason = projection.downgradeReason;
+        logger.info(
+          `Budget auto-downgrade ACTIVE: ${budgetDowngradeReason} — ` +
+          `cost weight ×${budgetCostWeightBoost.toFixed(1)}, paid providers penalized.`,
+        );
+      }
+    }
+
+    // ─── Cost efficiency scoring ───
+    // Compute cost efficiency for all candidates relative to each other
+    let costEfficiencyMap: Map<string, CostEfficiency> | null = null;
+    if (this.budgetTracker) {
+      const efficiencies = this.budgetTracker.computeCostEfficiency(candidates, intent, this.registry);
+      costEfficiencyMap = new Map();
+      for (const ce of efficiencies) {
+        costEfficiencyMap.set(`${ce.provider}/${ce.model}`, ce);
+      }
+    }
+
+    // ─── Ollama warmth pre-check ───
+    // Batch-check all Ollama candidates for GPU residency before scoring.
+    const ollamaModels = candidates
+      .filter((m) => m.isLocal)
+      .map((m) => m.model);
+    const warmthMap = new Map<string, WarmthInfo>();
+    if (this.warmthChecker && ollamaModels.length > 0) {
+      try {
+        const batch = await this.warmthChecker.checkWarmthBatch(ollamaModels);
+        for (const [name, info] of batch) {
+          warmthMap.set(name, info);
+        }
+      } catch (err) {
+        logger.debug(`Warmth check failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
     // Score every candidate
     const scored: RoutingDecision[] = candidates.map((modelEntry) => {
       const capabilityScore =
@@ -302,7 +483,38 @@ export class RoutingEngine {
       const reliabilityScore =
         this.costTracker.getReliabilityScore(modelEntry.provider, modelEntry.model);
       let costScore = this.costTracker.getCostScore(modelEntry.provider);
-      const latencyScore = this.costTracker.getLatencyScore(modelEntry.provider);
+      let latencyScore = this.costTracker.getLatencyScore(modelEntry.provider);
+
+      // ─── Ollama warm/cold scoring adjustments ───
+      let warmthAdjust = 0;
+      let warmthLabel = "";
+      const warmth = warmthMap.get(modelEntry.model);
+      if (modelEntry.isLocal && warmth) {
+        if (warmth.isWarm) {
+          // Model is already in GPU memory — free hit, no cold start
+          warmthLabel = "warm";
+          warmthAdjust = 0.10;
+          latencyScore = Math.min(1.0, latencyScore + 0.15);
+        } else {
+          // Model is cold — estimate cold-start penalty
+          warmthLabel = warmth.ollamaReachable ? "cold" : "cold(ollama_unreachable)";
+          const coldStartSeconds = warmth.estimatedColdStartMs / 1000;
+          warmthAdjust = -0.05 * Math.min(coldStartSeconds / 5, 2);
+          latencyScore = Math.max(0.0, latencyScore - 0.20);
+        }
+      }
+
+      // ─── Budget auto-downgrade: penalize paid providers ───
+      if (budgetDowngradeActive) {
+        const providerBudget = this.config.providers[modelEntry.provider];
+        const budgetType = providerBudget?.budgetType ?? "free";
+        const isPaid = budgetType === "pay_per_token" || budgetType === "credits";
+        const hasTokenCost = (modelEntry.costPer1kInput ?? 0) > 0 || (modelEntry.costPer1kOutput ?? 0) > 0;
+        if (isPaid || hasTokenCost) {
+          const penalty = this.budgetTracker!.getPaidProviderPenalty();
+          costScore = Math.max(0, costScore - penalty);
+        }
+      }
 
       // Apply usage multiplier to cost score
       const usageMultiplier = modelEntry.usageMultiplier ?? 1;
@@ -310,9 +522,12 @@ export class RoutingEngine {
         costScore = costScore / usageMultiplier;
       }
 
-      // Penalize local models slightly — they tie up GPU resources
+      // Penalize local models for GPU resource usage — UNLESS already warm
       if (modelEntry.isLocal) {
-        costScore *= 0.85;
+        const isWarm = warmthMap.get(modelEntry.model)?.isWarm ?? false;
+        if (!isWarm) {
+          costScore *= 0.85;
+        }
       }
 
       // ─── Size-aware scoring adjustment ───
@@ -342,13 +557,35 @@ export class RoutingEngine {
         }
       }
 
+      // ─── Cost efficiency adjustment ───
+      // Models with poor cost efficiency (expensive but not much better) get penalized
+      let efficiencyAdjust = 0;
+      if (costEfficiencyMap) {
+        const ce = costEfficiencyMap.get(`${modelEntry.provider}/${modelEntry.model}`);
+        if (ce && !ce.recommended && ce.costRatio > 1.5) {
+          // Model costs >1.5x the cheapest but isn't in the top efficiency tier
+          // Scale penalty by how overpriced it is relative to capability gain
+          const capabilityDelta = ce.capabilityScore - 0.5; // relative to mediocre baseline
+          const expectedValue = capabilityDelta / ce.costRatio;
+          if (expectedValue < 0.2) {
+            // Poor value: penalize up to -0.05
+            efficiencyAdjust = Math.max(-0.05, -0.02 * ce.costRatio);
+          }
+        }
+      }
+
       const w = this.config.weights;
+      // Apply budget cost weight boost: when auto-downgrade is active,
+      // cost scoring carries more influence in the overall score
+      const effectiveCostWeight = w.cost * budgetCostWeightBoost;
       const overall =
         w.capability * capabilityScore +
         w.reliability * reliabilityScore +
-        w.cost * costScore +
+        effectiveCostWeight * costScore +
         w.latency * latencyScore +
-        sizeAdjust; // additive adjustment (not weighted)
+        sizeAdjust + // additive adjustment (not weighted)
+        efficiencyAdjust +
+        warmthAdjust; // additive warmth adjustment
 
       const rationaleParts = [
         `cap=${capabilityScore.toFixed(2)}`,
@@ -359,6 +596,19 @@ export class RoutingEngine {
       ];
       if (sizeAdjust !== 0) {
         rationaleParts.push(`size=${sizeAdjust >= 0 ? "+" : ""}${sizeAdjust.toFixed(3)}`);
+      }
+      if (efficiencyAdjust !== 0) {
+        rationaleParts.push(`eff=${efficiencyAdjust >= 0 ? "+" : ""}${efficiencyAdjust.toFixed(3)}`);
+      }
+      // Log warm/cold status for Ollama models in decision transparency output
+      if (warmthLabel) {
+        rationaleParts.push(`ollama=${warmthLabel}`);
+      }
+      if (warmthAdjust !== 0) {
+        rationaleParts.push(`warmth=${warmthAdjust >= 0 ? "+" : ""}${warmthAdjust.toFixed(3)}`);
+      }
+      if (budgetDowngradeActive) {
+        rationaleParts.push(`⚠budget_downgrade`);
       }
       // Include pattern flags in rationale for decision transparency
       const patternFlags = this.costTracker.getPatternFlags(modelEntry.provider, modelEntry.model);
@@ -417,11 +667,13 @@ export class RoutingEngine {
           `Close call — picking cheaper: ${runnerUp.provider}/${runnerUp.model} over ${best.provider}/${best.model}`,
         );
         if (contextFilter) runnerUp.contextFilter = contextFilter;
+        if (modalityFilter) runnerUp.modalityFilter = modalityFilter;
         return runnerUp;
       }
     }
 
     if (contextFilter) best.contextFilter = contextFilter;
+    if (modalityFilter) best.modalityFilter = modalityFilter;
     logger.debug(
       `Winner: ${best.provider}/${best.model} (${best.overallScore.toFixed(3)}) — ${best.rationale}`,
     );

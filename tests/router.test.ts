@@ -2045,3 +2045,224 @@ describe("IntentClassifier — Startup Fallback", () => {
     assert.ok(result.confidence > 0);
   });
 });
+
+// ─── Modality Routing Tests ──────────────────────────────────
+
+describe("Modality Detection (detectModalities)", () => {
+  const { detectModalities } = require("../src/modality.ts");
+
+  it("should detect text-only requests as non-multimodal", () => {
+    const result = detectModalities([
+      { role: "user", content: "Hello, how are you?" },
+    ]);
+    assert.equal(result.isMultimodal, false);
+    assert.deepEqual(result.modalities, ["text"]);
+    assert.equal(result.imageCount, 0);
+    assert.equal(result.audioCount, 0);
+  });
+
+  it("should detect image_url content blocks", () => {
+    const result = detectModalities([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What is in this image?" },
+          { type: "image_url", image_url: { url: "https://example.com/cat.jpg" } },
+        ],
+      },
+    ]);
+    assert.equal(result.isMultimodal, true);
+    assert.ok(result.modalities.includes("vision"));
+    assert.equal(result.imageCount, 1);
+  });
+
+  it("should detect Anthropic-style image blocks", () => {
+    const result = detectModalities([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "abc" } },
+        ],
+      },
+    ]);
+    assert.equal(result.isMultimodal, true);
+    assert.ok(result.modalities.includes("vision"));
+    assert.equal(result.imageCount, 1);
+  });
+
+  it("should detect input_audio content blocks", () => {
+    const result = detectModalities([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Transcribe this audio" },
+          { type: "input_audio", input_audio: { data: "base64data", format: "wav" } },
+        ],
+      },
+    ]);
+    assert.equal(result.isMultimodal, true);
+    assert.ok(result.modalities.includes("audio"));
+    assert.equal(result.audioCount, 1);
+  });
+
+  it("should detect inline base64 image data URIs in string content", () => {
+    const result = detectModalities([
+      {
+        role: "user",
+        content: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+      },
+    ]);
+    assert.equal(result.isMultimodal, true);
+    assert.ok(result.modalities.includes("vision"));
+    assert.equal(result.imageCount, 1);
+  });
+
+  it("should handle multiple images and audio in a single request", () => {
+    const result = detectModalities([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Compare these" },
+          { type: "image_url", image_url: { url: "https://example.com/a.jpg" } },
+          { type: "image_url", image_url: { url: "https://example.com/b.jpg" } },
+          { type: "input_audio", input_audio: { data: "abc", format: "mp3" } },
+        ],
+      },
+    ]);
+    assert.equal(result.isMultimodal, true);
+    assert.ok(result.modalities.includes("vision"));
+    assert.ok(result.modalities.includes("audio"));
+    assert.equal(result.imageCount, 2);
+    assert.equal(result.audioCount, 1);
+  });
+
+  it("should handle non-array messages gracefully", () => {
+    const result = detectModalities(null as any);
+    assert.equal(result.isMultimodal, false);
+    assert.deepEqual(result.modalities, ["text"]);
+  });
+});
+
+describe("RoutingEngine — Modality Filtering", () => {
+  let registry: ModelRegistry;
+  let costTracker: CostTracker;
+  let db: DBService;
+  let config: CognitiveRouterConfig;
+  let router: RoutingEngine;
+
+  beforeEach(async () => {
+    config = makeConfig();
+    db = makeMockDB();
+    costTracker = new CostTracker(db, config);
+    await costTracker.refreshProviderStatus();
+    registry = new ModelRegistry(db, config);
+    await registry.loadCachedState();
+    router = new RoutingEngine(registry, costTracker, db, config);
+  });
+
+  it("should route vision requests only to vision-capable models", async () => {
+    const decision = await router.decide(
+      makeClassification("conversation", 0.9),
+      "test-vision",
+      { requiredModalities: ["text", "vision"] },
+    );
+
+    assert.ok(decision, "Should get a decision for vision request");
+    // The chosen model must support vision
+    const cap = registry.getCapability(decision!.provider, decision!.model);
+    assert.ok(cap, "Chosen model should exist in registry");
+    assert.ok(
+      cap!.modalities.includes("vision"),
+      `Chosen model ${decision!.provider}/${decision!.model} must support vision — modalities: ${cap!.modalities.join(", ")}`,
+    );
+  });
+
+  it("should include modalityFilter info in the decision", async () => {
+    const decision = await router.decide(
+      makeClassification("conversation", 0.9),
+      "test-vision",
+      { requiredModalities: ["text", "vision"] },
+    );
+
+    assert.ok(decision);
+    assert.ok(decision!.modalityFilter, "modalityFilter should be present on multimodal decisions");
+    assert.equal(decision!.modalityFilter!.wasMultimodal, true);
+    assert.ok(decision!.modalityFilter!.requiredModalities.includes("vision"));
+    // Should have filtered out text-only models
+    assert.ok(
+      decision!.modalityFilter!.filteredOut.length > 0,
+      "Should have filtered out text-only models",
+    );
+    // Every filtered-out model should lack vision
+    for (const f of decision!.modalityFilter!.filteredOut) {
+      assert.ok(!f.modalities.includes("vision"), `${f.provider}/${f.model} should not support vision`);
+    }
+  });
+
+  it("should NOT include modalityFilter for text-only requests", async () => {
+    const decision = await router.decide(
+      makeClassification("conversation", 0.9),
+      "test-text",
+      { requiredModalities: ["text"] },
+    );
+
+    assert.ok(decision);
+    assert.equal(decision!.modalityFilter, undefined, "modalityFilter should not be set for text-only");
+  });
+
+  it("should return MODALITY_UNSUPPORTED error when no model supports required modality", async () => {
+    // Request audio modality — no model in the seed data supports audio
+    const decision = await router.decide(
+      makeClassification("conversation", 0.9),
+      "test-audio-unsupported",
+      { requiredModalities: ["text", "audio"] },
+    );
+
+    assert.ok(decision, "Should get a decision even on error");
+    assert.ok(decision!.error, "Should have an error");
+    assert.equal(decision!.error!.code, "MODALITY_UNSUPPORTED");
+    assert.ok(decision!.error!.message.includes("audio"));
+    assert.ok(decision!.modalityFilter, "Should still include modalityFilter for observability");
+  });
+
+  it("should never route a vision request to a text-only model", async () => {
+    // Run multiple vision requests and verify every one goes to a vision model
+    for (let i = 0; i < 5; i++) {
+      const decision = await router.decide(
+        makeClassification("analysis", 0.85),
+        `test-vision-${i}`,
+        { requiredModalities: ["text", "vision"] },
+      );
+      assert.ok(decision);
+      assert.ok(!decision!.error, `Vision request ${i} should not error`);
+      const cap = registry.getCapability(decision!.provider, decision!.model);
+      assert.ok(cap!.modalities.includes("vision"),
+        `Iteration ${i}: ${decision!.provider}/${decision!.model} must support vision`);
+    }
+  });
+
+  it("should filter out all ZAI text-only models for vision requests", async () => {
+    // ZAI's glm-5.2, glm-5.1, glm-5-turbo, glm-4.7 are text-only
+    // Only glm-4.6v supports vision
+    const decision = await router.decide(
+      makeClassification("coding", 0.95),
+      "test-vision-zai",
+      { requiredModalities: ["text", "vision"] },
+    );
+
+    assert.ok(decision);
+    assert.ok(!decision!.error, "Vision request should find a model");
+
+    // Check that text-only ZAI models were filtered
+    const filteredZai = decision!.modalityFilter?.filteredOut.filter(f => f.provider === "zai") ?? [];
+    assert.ok(
+      filteredZai.some(f => f.model === "glm-5.2"),
+      "glm-5.2 (text-only) should be filtered out for vision requests",
+    );
+    assert.ok(
+      filteredZai.some(f => f.model === "glm-4.7"),
+      "glm-4.7 (text-only) should be filtered out for vision requests",
+    );
+  });
+});
