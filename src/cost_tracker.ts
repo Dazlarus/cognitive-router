@@ -71,6 +71,7 @@ export interface ProviderState {
   recentFailureTypes: FailureType[];
   /** Timestamp of last successful response (for recovery cooldown). */
   lastSuccessTime: number;
+  abortPenalty?: number;
 }
 
 // ─── Request-size latency profiling ───
@@ -168,6 +169,7 @@ export interface HedgeStats {
 export class CostTracker {
   private states = new Map<string, ProviderState>();
   private modelStates = new Map<string, ProviderState>();
+  private zombieStallCounts = new Map<string, number>();
   private dailyBudgetUsd: number;
   private monthlyBudgetUsd: number;
   private budgetWarnedProviders = new Set<string>();
@@ -217,7 +219,7 @@ export class CostTracker {
       const dailySpend = this.db.getSpend(name, "daily");
 
       // Restore persisted circuit state from previous session
-      const savedCircuit = this.db.loadCircuitState(name);
+      const savedCircuit = this.db.loadCircuitState ? this.db.loadCircuitState(name) : null;
       this.states.set(name, {
         name,
         budget,
@@ -341,7 +343,9 @@ export class CostTracker {
       ps.patternFlags = {};
       ps.recentFailureTypes = [];
     }
-    this.db.saveCircuitState(providerName, "healthy", 0, 0);
+    if (this.db.saveCircuitState) {
+      this.db.saveCircuitState(providerName, "healthy", 0, 0);
+    }
   }
 
   resetAllCircuits(): void {
@@ -439,6 +443,16 @@ export class CostTracker {
     // If any pattern flags are active and not expired, aggressively deprioritize.
     const now = Date.now();
 
+    // Model-level unstable flag can exist even if usesModelCircuit is false
+    const modelState = modelName ? this.getOrCreateModelState(providerName, modelName) : undefined;
+    if (modelState && modelState.patternFlags.unstable) {
+      if (now < modelState.patternFlags.unstable.expiresAt) {
+        return PATTERN_DEPRIORITIZED_RELIABILITY;
+      }
+      logger.info(`${modelState.name}: unstable flag expired — clearing.`);
+      delete modelState.patternFlags.unstable;
+    }
+
     // Unstable flag → near-zero reliability
     if (state.patternFlags.unstable) {
       if (now < state.patternFlags.unstable.expiresAt) {
@@ -488,7 +502,52 @@ export class CostTracker {
       tierPenalty = state.backoffTier * 0.10;
     }
 
-    return Math.max(0, 1.0 - failurePenalty - tierPenalty);
+    const abortPenalty = (state.abortPenalty ?? 0) + (modelState && modelState !== state ? (modelState.abortPenalty ?? 0) : 0);
+
+    return Math.max(0, 1.0 - failurePenalty - tierPenalty - abortPenalty);
+  }
+
+  applyAbortPenalty(provider: string, model: string, reason: string = "abort"): void {
+    const penaltyAmount = this.config.reliabilityAbortPenalty ?? 0.2;
+
+    const modelState = this.getOrCreateModelState(provider, model);
+    if (modelState) {
+      const currentPenalty = modelState.abortPenalty ?? 0;
+      modelState.abortPenalty = Math.min(1.0, currentPenalty + penaltyAmount);
+      logger.info(
+        `Applied abort penalty of ${penaltyAmount} to model ${provider}/${model}. ` +
+        `New model abort penalty: ${modelState.abortPenalty}`
+      );
+
+      if (reason === "stall") {
+        const key = `${provider}/${model}`;
+        const currentZombies = (this.zombieStallCounts.get(key) ?? 0) + 1;
+        this.zombieStallCounts.set(key, currentZombies);
+        logger.info(`Stall abort detected. Model ${key} zombie stall count: ${currentZombies}`);
+
+        if (currentZombies >= 3) {
+          modelState.patternFlags.unstable = {
+            reason: "zombie_stalls",
+            setAt: Date.now(),
+            expiresAt: Date.now() + UNSTABLE_COOLDOWN_MS,
+          };
+          logger.warn(`Model ${key} reached 3 zombie stalls — flagged as unstable.`);
+        }
+      }
+    } else {
+      const providerState = this.states.get(provider);
+      if (providerState) {
+        const currentPenalty = providerState.abortPenalty ?? 0;
+        providerState.abortPenalty = Math.min(1.0, currentPenalty + penaltyAmount);
+        logger.info(
+          `Applied abort penalty of ${penaltyAmount} to provider ${provider}. ` +
+          `New provider abort penalty: ${providerState.abortPenalty}`
+        );
+      } else {
+        logger.warn(`Could not apply abort penalty: state not found for ${provider}/${model}`);
+      }
+    }
+
   }
 
   /** Compute latency score from rolling average */
@@ -593,6 +652,20 @@ export class CostTracker {
       ? this.getOrCreateModelState(providerName, modelName)
       : providerState;
     if (!state) return;
+
+    if (result.outcome === "success" && modelName) {
+      const key = `${providerName}/${modelName}`;
+      this.zombieStallCounts.delete(key);
+      // Decay abort penalty on success: reduce by 0.1 per successful completion
+      const modelState = this.getOrCreateModelState(providerName, modelName);
+      if (modelState && modelState.abortPenalty && modelState.abortPenalty > 0) {
+        modelState.abortPenalty = Math.max(0, modelState.abortPenalty - 0.1);
+        if (modelState.abortPenalty === 0) {
+          delete modelState.abortPenalty;
+        }
+        logger.info(`Abort penalty decayed for ${key}: now ${(modelState.abortPenalty ?? 0).toFixed(1)}`);
+      }
+    }
 
     if (state !== providerState) {
       state.recentLatencies.push(result.durationMs);

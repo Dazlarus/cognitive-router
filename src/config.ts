@@ -45,6 +45,8 @@ export interface CognitiveRouterConfig {
 
   /** Port for standalone proxy mode (default 3456) */
   proxyPort?: number;
+
+  reliabilityAbortPenalty: number;
 }
 
 export interface RoutingOverride {
@@ -93,6 +95,7 @@ export function loadConfig(pluginConfig: Record<string, any>): CognitiveRouterCo
     overrides: pluginConfig.overrides ?? [],
     proxyPort: pluginConfig.proxyPort ?? 3456,
     providerPriority: pluginConfig.providerPriority ?? DEFAULT_PROVIDER_PRIORITY,
+    reliabilityAbortPenalty: pluginConfig.reliabilityAbortPenalty ?? 0.2,
   };
 
   setLevel(config.logLevel as any);

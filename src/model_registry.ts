@@ -129,15 +129,11 @@ const SEED_MODELS: ModelCapability[] = [
   // ═══════════════════════════════════════════════════════════════
 
   // NOTE: OpenRouter free model availability changes frequently.
-  // Last verified: 2026-07-27. Removed dead models:
+  // Last verified: 2026-08-01. Removed dead models:
   //   qwen3-coder:free (moved to paid), owl-alpha (deleted),
   //   qwen3.6-plus:free (deprecated), nemotron-3-super-120b:free (resource exhausted),
-  //   poolside/laguna-m.1:free (429 rate-limited, removed 2026-07-28).
-
-  makeModel("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free", 1_000_000,
-    { coding: 0.72, reasoning: 0.82, creative: 0.62, math: 0.76, analysis: 0.82, conversation: 0.68, retrieval: 0.78, science: 0.78, business: 0.76, summary: 0.76 },
-    { input: 0, output: 0 },
-  ),
+  //   poolside/laguna-m.1:free (429 rate-limited, removed 2026-07-28),
+  //   nvidia/nemotron-3-ultra-550b-a55b:free (502 resource exhausted, removed 2026-08-01).
   makeModel("openrouter", "cohere/north-mini-code:free", 256_000,
     { coding: 0.74, reasoning: 0.62, creative: 0.50, math: 0.58, analysis: 0.64, conversation: 0.56, retrieval: 0.58, science: 0.56, business: 0.56, summary: 0.58 },
     { input: 0, output: 0 },

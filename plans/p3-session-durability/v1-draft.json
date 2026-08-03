@@ -1,0 +1,117 @@
+{
+  "plan_id": "a93baef9-edca-4ceb-88ad-6dc65bbef55c",
+  "version": 1,
+  "status": "draft",
+  "cycle": 1,
+  "title": "Phase 3: Session-Level Durability for Cognitive Router",
+  "description": "Implement session-level durability mechanisms to prevent single model failures from aborting entire cron jobs or agent sessions. This involves adding an abort feedback loop, session-level fallback chains, idle timeout/stall detection, and a cron-specific routing profile.",
+  "goal_statement": "Make the Cognitive Router durable enough that a single slow or hung model cannot kill an entire cron job or agent session, by adding abort feedback loops, session-level fallback chains, proactive stall detection, and cron-optimized routing profiles.",
+  "steps": [
+    {
+      "id": "update-database-schema-for-abort-events",
+      "order": 1,
+      "title": "Update database schema for abort events",
+      "description": "Modify the SQLite database schema in db_service.ts to include a new table for storing abort events (provider, model, turnsCompleted, durationMs, sessionKey). Create a migration script if necessary or handle schema creation on startup.",
+      "dependencies": [],
+      "intended_outcome": "Database schema supports recording abort events with all required fields, and the application starts successfully with the updated schema."
+    },
+    {
+      "id": "implement-post-v1-report-abort-endpoint",
+      "order": 2,
+      "title": "Implement POST /v1/report/abort endpoint",
+      "description": "Add the POST /v1/report/abort endpoint to server.ts. Validate the request body {provider, model, turnsCompleted, durationMs, sessionKey}. Call a new method in cost_tracker.ts to record the abort event and update reliability scores.",
+      "dependencies": ["update-database-schema-for-abort-events"],
+      "intended_outcome": "The endpoint accepts valid abort reports, persists them to the database, and triggers the cost tracker update logic."
+    },
+    {
+      "id": "update-cost-tracker-for-abort-penalties",
+      "order": 3,
+      "title": "Update cost tracker for abort penalties",
+      "description": "Modify cost_tracker.ts to handle abort events. Implement logic to decrement the reliability score for the specific provider/model by at least 0.2 per event. Ensure this state is persisted and affects subsequent routing decisions.",
+      "dependencies": ["implement-post-v1-report-abort-endpoint"],
+      "intended_outcome": "Reported aborts result in a measurable reduction (>= 0.2) of the offending model's reliability score in the cost tracker."
+    },
+    {
+      "id": "implement-get-v1-fallback-endpoint",
+      "order": 4,
+      "title": "Implement GET /v1/fallback endpoint",
+      "description": "Add the GET /v1/fallback endpoint to server.ts. It should accept query parameters provider, model, turn, and reason. It calls router.ts to find the next-best candidate excluding the failed one.",
+      "dependencies": ["update-cost-tracker-for-abort-penalties"],
+      "intended_outcome": "The endpoint returns a JSON response with the next best candidate and rationale, ensuring the failed provider/model is excluded."
+    },
+    {
+      "id": "implement-mid-stream-stall-detection",
+      "order": 5,
+      "title": "Implement mid-stream stall detection",
+      "description": "Modify proxy-stream.ts to detect stalled connections. Use the ROUTER_STREAM_STALL_TIMEOUT_MS configuration. If no data is received within the timeout, abort the request and mark the connection as a zombie.",
+      "dependencies": [],
+      "intended_outcome": "Active streams that idle for longer than ROUTER_STREAM_STALL_TIMEOUT_MS are aborted and tagged as zombies."
+    },
+    {
+      "id": "update-cost-tracker-zombie-pattern-flags",
+      "order": 6,
+      "title": "Update cost tracker zombie pattern flags",
+      "description": "Enhance cost_tracker.ts to track zombie connection patterns per provider/model. If a model accumulates 3+ zombie stalls, automatically set the unstable or contextLimited flag.",
+      "dependencies": ["implement-mid-stream-stall-detection"],
+      "intended_outcome": "Models causing frequent stalls are flagged as unstable or contextLimited in the cost tracker."
+    },
+    {
+      "id": "implement-cron-specific-routing-profile",
+      "order": 7,
+      "title": "Implement cron-specific routing profile",
+      "description": "Update router.ts to accept an optional routingProfile parameter in decide(). If profile is 'cron', adjust the scoring algorithm to weigh proven completion rates higher than raw capability. Update cost_tracker to track completion rates per model/intent.",
+      "dependencies": [],
+      "intended_outcome": "The decide() function supports a 'cron' profile that prioritizes reliable models over theoretically capable ones."
+    },
+    {
+      "id": "write-integration-tests-for-new-features",
+      "order": 8,
+      "title": "Write integration tests for new features",
+      "description": "Create tests in the tests/ directory covering: the abort endpoint writing to DB, reliability score reduction, fallback endpoint selection, stall detection timeouts, zombie flagging, and cron profile selection.",
+      "dependencies": ["update-cost-tracker-for-abort-penalties", "implement-get-v1-fallback-endpoint", "update-cost-tracker-zombie-pattern-flags", "implement-cron-specific-routing-profile"],
+      "intended_outcome": "All new functionality is covered by automated tests that verify the specific success criteria."
+    },
+    {
+      "id": "run-full-test-suite-and-verify-compatibility",
+      "order": 9,
+      "title": "Run full test suite and verify compatibility",
+      "description": "Run npm test to ensure all existing Phase 1+2 tests pass and the new tests pass. Verify that the application builds correctly with tsc.",
+      "dependencies": ["write-integration-tests-for-new-features"],
+      "intended_outcome": "All tests pass, the build succeeds, and no existing functionality is broken."
+    }
+  ],
+  "assumptions": [
+    "The existing SQLite database setup in db_service.ts is accessible and writable.",
+    "ROUTER_STREAM_STALL_TIMEOUT_MS is defined in the configuration.",
+    "The project environment has Node.js and npm installed.",
+    "Existing cost_tracker metrics infrastructure can be extended without major refactoring."
+  ],
+  "risks": [
+    "Modifying the database schema on a live system could cause downtime if not handled carefully.",
+    "Aggressive reliability score reduction (0.2) might unfairly deprioritize a generally good model that had a transient issue.",
+    "Stall detection logic might mistakenly abort long-running valid computations if the timeout is too aggressive.",
+    "Adding new parameters to decide() might break compatibility with existing clients not expecting them (though it is optional)."
+  ],
+  "success_criteria": [
+    "POST /v1/report/abort endpoint exists and writes abort events to SQLite with provider, model, turnsCompleted, durationMs, sessionKey fields",
+    "GET /v1/fallback endpoint returns next-best candidate excluding the failed provider/model, with rationale",
+    "Abort events reduce reliability score for the reported provider+model by at least 0.2 per event",
+    "Mid-stream stall detection aborts zombie connections after configurable idle period (ROUTER_STREAM_STALL_TIMEOUT_MS already exists at 45s default)",
+    "Zombie connection tracking feeds into cost_tracker pattern flags — 3+ zombie stalls set unstable or contextLimited flag",
+    "decide() accepts optional routingProfile parameter; 'cron' profile biases scoring toward models with proven completion rates over raw capability",
+    "All existing tests pass (npm test)",
+    "New tests cover abort feedback, fallback chain, stall detection, and cron profile selection"
+  ],
+  "scope_in": [
+    "cognitive-router/src/proxy-stream.ts", "cognitive-router/src/router.ts",
+    "cognitive-router/src/cost_tracker.ts", "cognitive-router/src/failure_classifier.ts",
+    "cognitive-router/src/server.ts", "cognitive-router/src/config.ts",
+    "cognitive-router/src/db_service.ts", "cognitive-router/tests/"
+  ],
+  "scope_out": [
+    "OpenClaw core (gateway session management)", "OpenClaw cron subsystem",
+    "OpenClaw agent runtime", "cognitive-router/src/benchmark*",
+    "cognitive-router/src/judge.ts", "cognitive-router/src/curator.ts",
+    "cognitive-router/src/ollama_warmth.ts"
+  ]
+}

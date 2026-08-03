@@ -484,6 +484,72 @@ export class ProxyServerStreaming {
         return;
       }
 
+      if (url.startsWith("/v1/fallback") && req.method === "GET") {
+        const providerParam = urlQuery.get("provider");
+        const modelParam = urlQuery.get("model");
+        const turnParam = urlQuery.get("turn");
+        const reasonParam = urlQuery.get("reason");
+
+        if (!providerParam || typeof providerParam !== "string" || !providerParam.trim()) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "provider query param is required and must be non-empty" }));
+          return;
+        }
+
+        // Must match configured provider
+        if (!this.config.providers[providerParam]) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `provider '${providerParam}' is not a configured provider` }));
+          return;
+        }
+
+        if (!modelParam || typeof modelParam !== "string" || !modelParam.trim()) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "model query param is required and must be non-empty" }));
+          return;
+        }
+
+        if (turnParam !== null) {
+          const turn = parseInt(turnParam, 10);
+          if (isNaN(turn) || turn < 0 || turn > 1000) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "turn must be an integer between 0 and 1000" }));
+            return;
+          }
+        }
+
+        if (reasonParam !== null) {
+          const validReasons = ["abort", "timeout", "stall", "context_overflow"];
+          if (!validReasons.includes(reasonParam)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `reason must be one of: ${validReasons.join(", ")}` }));
+            return;
+          }
+        }
+
+        try {
+          const decision = await this.router.getFallback(providerParam, modelParam, reasonParam ?? undefined);
+          if (!decision) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "No fallback candidate available" }));
+            return;
+          }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            provider: decision.provider,
+            model: decision.model,
+            rationale: decision.rationale,
+            score: decision.overallScore,
+          }));
+        } catch (err) {
+          logger.error(`Fallback calculation failed: ${err}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Fallback calculation failed", message: err instanceof Error ? err.message : String(err) }));
+        }
+        return;
+      }
+
       // GET /v1/dashboard — aggregated routing stats and trends
       if (url.startsWith("/v1/dashboard") && req.method === "GET") {
         const range = urlQuery.get("range") ?? "24h";
@@ -564,7 +630,67 @@ export class ProxyServerStreaming {
       if (url === "/v1/chat/completions" && req.method === "POST") {
         const body = await this.readBody(req);
         const request = JSON.parse(body) as ChatCompletionRequest;
-        await this.handleChat(request, res, this.extractSessionKey(req, request));
+        await this.handleChat(request, res, this.extractSessionKey(req, request), req);
+        return;
+      }
+
+      if (url === "/v1/report/abort" && req.method === "POST") {
+        try {
+          const body = await this.readBody(req);
+          const data = JSON.parse(body);
+
+          if (!data || typeof data.provider !== "string" || !data.provider.trim()) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "provider must be a non-empty string" }));
+            return;
+          }
+          if (typeof data.model !== "string" || !data.model.trim()) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "model must be a non-empty string" }));
+            return;
+          }
+
+          if (data.turnsCompleted !== undefined && (typeof data.turnsCompleted !== "number" || !Number.isInteger(data.turnsCompleted) || data.turnsCompleted < 0)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "turnsCompleted must be a non-negative integer" }));
+            return;
+          }
+
+          if (data.durationMs !== undefined && (typeof data.durationMs !== "number" || !Number.isInteger(data.durationMs) || data.durationMs < 0)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "durationMs must be a non-negative integer" }));
+            return;
+          }
+
+          let dbWriteSuccess = true;
+          try {
+            this.db.recordAbortEvent({
+              provider: data.provider,
+              model: data.model,
+              turnsCompleted: data.turnsCompleted,
+              durationMs: data.durationMs,
+              sessionKey: data.sessionKey,
+            });
+          } catch (dbErr) {
+            logger.warn(`Failed to record abort event in database: ${dbErr}`);
+            dbWriteSuccess = false;
+          }
+
+          // Apply in-memory penalty
+          this.costTracker.applyAbortPenalty(data.provider, data.model);
+
+          if (!dbWriteSuccess) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Database write failure" }));
+            return;
+          }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "success" }));
+        } catch (err) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON or request processing error", message: err instanceof Error ? err.message : String(err) }));
+        }
         return;
       }
 
@@ -664,6 +790,7 @@ export class ProxyServerStreaming {
     request: ChatCompletionRequest,
     res: http.ServerResponse,
     sessionKey: string,
+    req?: http.IncomingMessage,
   ): Promise<void> {
     if (!this.initialized) throw new Error("Proxy not initialized");
     const isStreaming = request.stream === true;
@@ -720,7 +847,7 @@ export class ProxyServerStreaming {
     const decision = await this.router.decide(classification, sessionKey, {
       estimatedTokens,
       requiredModalities: modalityResult.modalities,
-    });
+    }, req?.headers?.["x-routing-profile"] as string | undefined);
     const candidates = this.buildCandidateList(decision, request);
     const requestId = this.extractRequestId(request);
 
@@ -760,7 +887,7 @@ export class ProxyServerStreaming {
           estimated_tokens: decision.error.estimatedTokens,
           max_context_window: decision.error.maxContextWindow,
           required_modalities: decision.error.requiredModalities,
-          available_vision_models: decision.error.availableVisionModels,
+          available_modality_models: decision.error.availableModalityModels,
         },
       }));
       return;
@@ -868,6 +995,7 @@ export class ProxyServerStreaming {
             for await (const chunk of adapter.chatCompletionStream(candidate.model, providerRequest, apiKey)) {
               const now = Date.now();
               if (now - lastChunkTime > stallTimeout) {
+                this.costTracker.applyAbortPenalty(candidate.provider, candidate.model, "stall");
                 throw new Error(`stream_stall: no data for ${stallTimeout}ms from ${candidate.provider}/${candidate.model}`);
               }
               lastChunkTime = now;

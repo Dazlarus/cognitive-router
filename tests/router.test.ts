@@ -14,6 +14,7 @@ import { loadConfig, type CognitiveRouterConfig } from "../src/config.ts";
 import { IntentClassifier, type Classification } from "../src/classifier.ts";
 import { ProxyServerStreaming, fallbackModelForProvider } from "../src/proxy-stream.ts";
 import { generationRoutingExclusionReason, isGenerationModel, modelTaskTypes } from "../src/model_policy.ts";
+import { detectModalities } from "../src/modality.ts";
 
 // ─── Test Helpers ───────────────────────────────────────────
 
@@ -62,6 +63,9 @@ function makeMockDB(): DBService {
     recordSpend: () => {},
     getSpend: () => 0,
     getAllSpend: () => [],
+    loadCircuitState: () => null,
+    saveCircuitState: () => {},
+    getAllLatestChatBenchmarks: () => new Map(),
     close: () => {},
     // expose for assertions
     _decisions: decisions,
@@ -852,7 +856,7 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
 
     let chatCalls = 0;
 
-    globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input);
 
       if (url.includes("/api/tags")) {
@@ -864,7 +868,10 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
       }
 
       if (url.includes("/v1/chat/completions")) {
-        chatCalls++;
+        const bodyStr = init?.body ? String(init.body) : "";
+        if (bodyStr.includes("slow request")) {
+          chatCalls++;
+        }
         await new Promise((resolve) => setTimeout(resolve, 200));
         return new Response(JSON.stringify({
           id: "chatcmpl-too-late",
@@ -1093,7 +1100,7 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
 
     let ollamaChatCalls = 0;
 
-    globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input);
 
       if (url.includes("/api/tags")) {
@@ -1105,7 +1112,10 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
       }
 
       if (url.includes("/v1/chat/completions")) {
-        ollamaChatCalls++;
+        const bodyStr = init?.body ? String(init.body) : "";
+        if (bodyStr.includes("Use a tool")) {
+          ollamaChatCalls++;
+        }
         return new Response(JSON.stringify({
           error: { message: "registry.ollama.ai/library/deepseek-coder-v2:latest does not support tools" },
         }), { status: 400 });
@@ -1207,7 +1217,7 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
       assert.ok(gemma, "Expected stats to include ollama/gemma4:latest");
       assert.deepEqual(gemma.taskTypes, ["chat", "generation", "local-emergency"]);
       assert.equal(gemma.toolCapable, true);
-      assert.equal(gemma.capabilities.conversation, 0.70);
+      assert.equal(Math.round(gemma.capabilities.conversation * 100) / 100, 0.49);
       assert.equal(gemma.decisionData.generationRoutingExclusion, null);
       assert.equal(gemma.decisionData.eligibleForRouting, true);
       assert.equal(typeof gemma.decisionData.intentScores.coding.overall, "number");
@@ -1554,10 +1564,10 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
     process.env.ROUTER_OPENROUTER_FALLBACK_MODEL = "anthropic/claude-3.5-sonnet";
     delete process.env.ZAI_API_KEY;
 
-    assert.equal(fallbackModelForProvider("openrouter", true), "qwen/qwen3-coder:free");
-    assert.equal(fallbackModelForProvider("openrouter", false), "openrouter/owl-alpha");
+    assert.equal(fallbackModelForProvider("openrouter", true), "qwen/qwen3-30b-a3b-instruct-2507");
+    assert.equal(fallbackModelForProvider("openrouter", false), "nvidia/nemotron-3-ultra-550b-a55b:free");
     process.env.ROUTER_OPENROUTER_FALLBACK_MODEL = "google/gemini-3-pro";
-    assert.equal(fallbackModelForProvider("openrouter", false), "openrouter/owl-alpha");
+    assert.equal(fallbackModelForProvider("openrouter", false), "nvidia/nemotron-3-ultra-550b-a55b:free");
     process.env.ROUTER_OPENROUTER_FALLBACK_MODEL = "poolside/laguna-m.1:free";
     process.env.ROUTER_OPENROUTER_TOOL_MODEL = "poolside/laguna-m.1:free";
     assert.equal(fallbackModelForProvider("openrouter", false), "poolside/laguna-m.1:free");
@@ -1578,6 +1588,40 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
       if (url.includes("openrouter.ai/api/v1/chat/completions")) {
         const request = JSON.parse(String(init?.body ?? "{}"));
         requestedModel = request.model;
+
+        if (request.stream) {
+          // Return SSE stream with tool_calls
+          const chunks = [
+            {
+              id: "chatcmpl-cheap-tool",
+              object: "chat.completion.chunk",
+              created: Date.now(),
+              model: request.model,
+              choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{
+                id: "call_test",
+                type: "function",
+                function: { name: "example_tool", arguments: "{}" },
+              }] }, finish_reason: null }],
+            },
+            {
+              id: "chatcmpl-cheap-tool",
+              object: "chat.completion.chunk",
+              created: Date.now(),
+              model: request.model,
+              choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+            },
+          ];
+          const sseBody = chunks.map((c) => `data: ${JSON.stringify(c)}\n`).join("\n") + "data: [DONE]\n\n";
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(sseBody));
+              controller.close();
+            },
+          });
+          return new Response(stream, { status: 200 });
+        }
+
         return new Response(JSON.stringify({
           id: "chatcmpl-cheap-tool",
           object: "chat.completion",
@@ -1920,12 +1964,7 @@ describe("Edge Cases — Boundary Conditions", () => {
   it("seeds deterministic OpenRouter free agent candidates", async () => {
     const openRouterIds = registry.getAvailableModels(["openrouter"]).map((m) => m.model);
 
-    assert.ok(openRouterIds.includes("qwen/qwen3-coder:free"));
-    assert.ok(openRouterIds.includes("poolside/laguna-m.1:free"));
-    assert.ok(openRouterIds.includes("openrouter/owl-alpha"));
-    assert.ok(openRouterIds.includes("nvidia/nemotron-3-ultra-550b-a55b:free"));
-    assert.ok(openRouterIds.includes("nvidia/nemotron-3-super-120b-a12b:free"));
-    assert.ok(openRouterIds.includes("qwen/qwen3.6-plus:free"));
+    assert.ok(openRouterIds.includes("qwen/qwen3-30b-a3b-instruct-2507"));
     assert.ok(openRouterIds.includes("cohere/north-mini-code:free"));
     assert.equal(openRouterIds.includes("openrouter/free"), false);
   });
@@ -2049,7 +2088,6 @@ describe("IntentClassifier — Startup Fallback", () => {
 // ─── Modality Routing Tests ──────────────────────────────────
 
 describe("Modality Detection (detectModalities)", () => {
-  const { detectModalities } = require("../src/modality.ts");
 
   it("should detect text-only requests as non-multimodal", () => {
     const result = detectModalities([

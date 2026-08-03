@@ -8,7 +8,7 @@ import type { CostTracker } from "./cost_tracker.js";
 import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig } from "./config.js";
 import type { Classification } from "./classifier.js";
-import { isGenerationModel } from "./model_policy.js";
+import { isGenerationModel, generationRoutingExclusionReason } from "./model_policy.js";
 import { bucketForTokenCount, type SizeBucket } from "./cost_tracker.js";
 import type { BudgetTracker, CostEfficiency } from "./budget_tracker.js";
 import { OllamaWarmthChecker, type WarmthInfo } from "./ollama_warmth.js";
@@ -42,6 +42,12 @@ export interface ModalityFilterInfo {
   }>;
   /** Whether multimodal routing was active. */
   wasMultimodal: boolean;
+  /** Vision quality scores for all vision-capable candidates (if vision is required) */
+  visionQualityScores?: Array<{
+    provider: string;
+    model: string;
+    visionQuality: number;
+  }>;
 }
 
 export interface RoutingDecision {
@@ -73,7 +79,7 @@ export interface RoutingDecision {
     estimatedTokens?: number;
     maxContextWindow?: number;
     requiredModalities?: Modality[];
-    availableVisionModels?: string[];
+    availableModalityModels?: string[];
   };
 }
 
@@ -150,6 +156,7 @@ export class RoutingEngine {
     classification: Classification,
     sessionKey: string,
     context: any = {},
+    routingProfile?: string,
   ): Promise<RoutingDecision | null> {
     const { intent, confidence } = classification;
 
@@ -178,6 +185,16 @@ export class RoutingEngine {
     // Get all models from registry for these providers
     let candidates = this.registry.getAvailableModels(priorityProviders);
 
+    // Filter out the excluded provider/model if specified in context
+    if (context?.excludeProvider && context?.excludeModel) {
+      candidates = candidates.filter(
+        (m) => !(m.provider === context.excludeProvider && m.model === context.excludeModel)
+      );
+    }
+
+    const requiredMods: string[] = context?.requiredModalities ?? [];
+    const nonTextMods = requiredMods.filter((r) => r !== "text");
+
     // Filter out local models that exceed GPU VRAM limit
     const vramLimit = this.config.localVramLimitGb ?? 11;
     candidates = candidates.filter((m) => {
@@ -187,19 +204,16 @@ export class RoutingEngine {
         );
         return false;
       }
-      if (!isGenerationModel(m.provider, m.model)) {
-        // Allow non-generation models (e.g. vision-only, audio-only) when the
-        // request requires a modality they support.  Embedding-only models are
-        // still filtered out because they never carry non-text modalities.
-        const requiredMods: string[] = context?.requiredModalities ?? [];
-        const nonTextMods = requiredMods.filter((r) => r !== "text");
-        const supportsNeeded = nonTextMods.length > 0 &&
-          nonTextMods.every((mod) => m.modalities.includes(mod));
-        if (!supportsNeeded) {
-          logger.debug(`Skipping ${m.provider}/${m.model} — not a generation model.`);
+      if (nonTextMods.length === 0) {
+        const exclusionReason = generationRoutingExclusionReason(m.provider, m.model);
+        if (exclusionReason) {
+          logger.debug(`Skipping ${m.provider}/${m.model} — excluded: ${exclusionReason}`);
           return false;
         }
-        logger.debug(`Allowing ${m.provider}/${m.model} — needed for [${nonTextMods.join(", ")}] modality.`);
+      }
+      if (nonTextMods.length === 0 && !isGenerationModel(m.provider, m.model)) {
+        logger.debug(`Skipping ${m.provider}/${m.model} — not a generation model.`);
+        return false;
       }
       // Filter out ZAI models not covered by the coding plan — UNLESS the
       // request requires a modality (vision/audio) that this model supports.
@@ -290,15 +304,30 @@ export class RoutingEngine {
         );
       }
 
+      let visionQualityScores: Array<{ provider: string; model: string; visionQuality: number }> | undefined;
+      if (requiredModalities.includes("vision")) {
+        visionQualityScores = [];
+        for (const m of candidates) {
+          if (m.modalities.includes("vision") && m.visionQuality !== undefined) {
+            visionQualityScores.push({
+              provider: m.provider,
+              model: m.model,
+              visionQuality: m.visionQuality,
+            });
+          }
+        }
+      }
+
       modalityFilter = {
         requiredModalities,
         filteredOut: modalityFilteredOut,
         wasMultimodal: true,
+        ...(visionQualityScores ? { visionQualityScores } : {}),
       };
 
       if (passingModality.length === 0) {
         // No model supports the required modality
-        const availableVisionModels = this.registry
+        const availableModalityModels = this.registry
           .getAvailableModels(priorityProviders)
           .filter((m) => nonTextModalities.some((mod) => m.modalities.includes(mod)))
           .map((m) => `${m.provider}/${m.model}`);
@@ -306,7 +335,7 @@ export class RoutingEngine {
         logger.warn(
           `Modality filter: ALL ${candidates.length} candidates excluded — ` +
           `no model supports [${modalityLabel}]. ` +
-          `Known vision-capable: [${availableVisionModels.slice(0, 5).join(", ")}${availableVisionModels.length > 5 ? "..." : ""}].`,
+          `Known modality-capable: [${availableModalityModels.slice(0, 5).join(", ")}${availableModalityModels.length > 5 ? "..." : ""}].`,
         );
 
         return {
@@ -320,11 +349,11 @@ export class RoutingEngine {
           error: {
             code: "MODALITY_UNSUPPORTED",
             message: `Request requires modality [${modalityLabel}] but no available ` +
-              `model supports it. ${availableVisionModels.length > 0
-                ? `Vision-capable models exist but are unavailable: ${availableVisionModels.slice(0, 3).join(", ")}`
-                : "No vision-capable models configured."}`,
+              `model supports it. ${availableModalityModels.length > 0
+                ? `Models with some required modalities exist but are unavailable: ${availableModalityModels.slice(0, 3).join(", ")}`
+                : "No modality-capable models configured."}`,
             requiredModalities,
-            availableVisionModels,
+            availableModalityModels,
           },
         };
       }
@@ -475,6 +504,13 @@ export class RoutingEngine {
     }
 
     // Score every candidate
+    let w = { ...this.config.weights };
+    if (routingProfile === "cron") {
+      const reliabilityIncrease = w.reliability;
+      w.reliability = w.reliability * 2.0;
+      w.capability = Math.max(0, w.capability - reliabilityIncrease);
+    }
+
     const scored: RoutingDecision[] = candidates.map((modelEntry) => {
       const capabilityScore =
         this.registry.getCapabilityScore(modelEntry.provider, modelEntry.model, intent) *
@@ -574,7 +610,6 @@ export class RoutingEngine {
         }
       }
 
-      const w = this.config.weights;
       // Apply budget cost weight boost: when auto-downgrade is active,
       // cost scoring carries more influence in the overall score
       const effectiveCostWeight = w.cost * budgetCostWeightBoost;
@@ -594,6 +629,9 @@ export class RoutingEngine {
         `lat=${latencyScore.toFixed(2)}`,
         `mult=${usageMultiplier}`,
       ];
+      if (requiredModalities.includes("vision") && modelEntry.visionQuality !== undefined) {
+        rationaleParts.push(`visionQ=${modelEntry.visionQuality.toFixed(2)}`);
+      }
       if (sizeAdjust !== 0) {
         rationaleParts.push(`size=${sizeAdjust >= 0 ? "+" : ""}${sizeAdjust.toFixed(3)}`);
       }
@@ -690,5 +728,22 @@ export class RoutingEngine {
     }
     if (latencies.length === 0) return undefined;
     return latencies.reduce((a, b) => a + b, 0) / latencies.length;
+  }
+
+  async getFallback(
+    excludeProvider: string,
+    excludeModel: string,
+    reason?: string
+  ): Promise<RoutingDecision | null> {
+    const classification: Classification = {
+      intent: "conversation",
+      confidence: 1.0,
+    };
+    const context = {
+      excludeProvider,
+      excludeModel,
+      reason,
+    };
+    return this.decide(classification, "fallback-session", context);
   }
 }

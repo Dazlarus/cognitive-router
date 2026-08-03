@@ -71,6 +71,13 @@ const INTENT_PROTOTYPES: Record<string, string[]> = {
     "evaluate the risks of this architecture decision",
     "assess the feasibility of this project timeline",
   ],
+  "doc-summary": [
+    "analyze this documentation change and explain what was updated",
+    "summarize the changes in this API changelog diff",
+    "what changed in this developer documentation page",
+    "describe the new SDK release notes and breaking changes",
+    "explain the impact of this API reference update on developers",
+  ],
 };
 
 export class IntentClassifier {
@@ -167,6 +174,7 @@ export class IntentClassifier {
       business: ["business", "market", "strategy", "metrics", "plan", "revenue", "saas"],
       math: ["solve", "integral", "matrix", "eigenvalue", "equation", "prove", "calculate"],
       analysis: ["analyze", "trade-off", "evaluate", "assess", "compare", "risk", "feasibility"],
+      "doc-summary": ["documentation change", "changelog", "diff", "api reference", "release notes", "sdk", "breaking change", "deprecation"],
     };
 
     let bestIntent = "conversation";

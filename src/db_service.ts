@@ -63,7 +63,77 @@ export class DBService {
     this.addColumnIfMissing("routing_decisions", "context_filter_json", "TEXT");
     this.addColumnIfMissing("routing_decisions", "modality_filter_json", "TEXT");
     this.db.exec(INDEX_SCHEMA_SQL);
+    this.migrate_v3();
     logger.info("Database schema verified.");
+  }
+
+  migrate_v3(): void {
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version < 3) {
+      logger.info(`Migrating database to user_version = 3...`);
+      const migration = this.db.transaction(() => {
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS abort_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            turns_completed INTEGER,
+            duration_ms INTEGER,
+            session_key TEXT
+          )
+        `).run();
+
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS session_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            turns_completed INTEGER,
+            duration_ms INTEGER,
+            timestamp TEXT NOT NULL
+          )
+        `).run();
+
+        this.db.prepare("PRAGMA user_version = 3").run();
+      });
+      migration();
+      logger.info(`Database migrated to user_version = 3 successfully.`);
+    }
+  }
+
+  rollback_v3(): void {
+    logger.info(`Rolling back database user_version to 2...`);
+    const rollback = this.db.transaction(() => {
+      this.db.prepare(`DROP TABLE IF EXISTS abort_events`).run();
+      this.db.prepare(`DROP TABLE IF EXISTS session_outcomes`).run();
+      this.db.prepare("PRAGMA user_version = 2").run();
+    });
+    rollback();
+    logger.info(`Database rolled back to user_version = 2 successfully.`);
+  }
+
+  recordAbortEvent(data: {
+    provider: string;
+    model: string;
+    turnsCompleted?: number;
+    durationMs?: number;
+    sessionKey?: string;
+  }): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO abort_events (timestamp, provider, model, turns_completed, duration_ms, session_key)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      new Date().toISOString(),
+      data.provider,
+      data.model,
+      data.turnsCompleted ?? null,
+      data.durationMs ?? null,
+      data.sessionKey ?? null
+    );
   }
 
   private addColumnIfMissing(tableName: string, columnName: string, definition: string): void {
