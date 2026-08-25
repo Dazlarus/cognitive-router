@@ -5,6 +5,21 @@ import { registryReadiness } from "./readiness.js";
 import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig } from "./config.js";
 import { ChatBenchmark } from "./benchmark_chat.js";
+import {
+  clampCapability,
+  classifyAttribution,
+  decayTowardSeed,
+  decayIdleDays,
+  learningShadowMode,
+  normalizeNote,
+  noteHash,
+  noteCanaryThreshold,
+  noteHoldThreshold,
+  rocMax24h,
+  rocMax7d,
+  ucbBonus,
+  type GateArm,
+} from "./learning_guards.js";
 
 export interface ModelCapability {
   provider: string;
@@ -243,6 +258,10 @@ const SEED_MODELS: ModelCapability[] = [
 
 export class ModelRegistry {
   private models = new Map<string, ModelCapability>();
+  /** Learned sample counts per provider/model/intent (UCB n). */
+  private sampleCounts = new Map<string, number>();
+  /** Manually pinned cells the learner refuses to overwrite. */
+  private pinnedCells = new Set<string>();
   private static readonly INTENT_MAP: Record<string, keyof Caps> = {
     coding: "coding",
     research: "retrieval",
@@ -447,6 +466,31 @@ export class ModelRegistry {
     return cap.capabilities[dim];
   }
 
+  /** Read-path capability with UCB exploration bonus: learned + k/√n (n=0→1).
+   *  While shadow mode is ON this returns the plain learned score — live
+   *  routing stays untouched until the shadow gates pass and a human flips it. */
+  getExplorationScore(provider: string, model: string, intent: string): number {
+    const learned = this.getCapabilityScore(provider, model, intent);
+    if (learningShadowMode()) return learned;
+    const n = this.sampleCounts.get(`${provider}/${model}/${intent}`) ?? 0;
+    return Math.min(1, learned + ucbBonus(n));
+  }
+
+  /** Manual pin accessor: pinned cells refuse learner updates (§4.2). */
+  setCapabilityPin(provider: string, model: string, intent: string, pinned: boolean): void {
+    const key = `${provider}/${model}/${intent}`;
+    if (pinned) this.pinnedCells.add(key);
+    else this.pinnedCells.delete(key);
+    if (typeof this.db.setCapabilityPin === "function") {
+      this.db.setCapabilityPin(provider, model, intent, pinned);
+    }
+    logger.info(`Capability cell ${key} ${pinned ? "pinned" : "unpinned"}.`);
+  }
+
+  isCapabilityPinned(provider: string, model: string, intent: string): boolean {
+    return this.pinnedCells.has(`${provider}/${model}/${intent}`);
+  }
+
   /** Check if a model supports a given modality (e.g. "vision", "audio"). */
   supportsModality(provider: string, model: string, modality: string): boolean {
     const cap = this.getCapability(provider, model);
@@ -482,9 +526,40 @@ export class ModelRegistry {
 
     const current = cap.capabilities[dim];
     const alpha = 0.25; // EMA smoothing - new observations weighted 25%
-    const updated = current * (1 - alpha) + observedScore * alpha;
+    const updated = clampCapability(current * (1 - alpha) + observedScore * alpha);
+    const cellKey = `${provider}/${model}/${intent}`;
+
+    if (typeof this.db.applyGuardedCapabilityUpdate === "function") {
+      // Hardened path: atomic pin re-check + RoC window sums inside a
+      // BEGIN IMMEDIATE transaction; reject-and-log over Δmax (§4.2).
+      const existing = this.db.getCapabilityOverride(provider, model, intent);
+      const baseline = existing?.score ?? current;
+      const deltaAbs = Math.abs(updated - baseline);
+      const result = this.db.applyGuardedCapabilityUpdate(
+        provider, model, intent, updated, deltaAbs,
+        new Date().toISOString(), rocMax24h(), rocMax7d(),
+      );
+      if (!result.applied) {
+        logger.info(
+          `Capability update rejected (${result.reason}): ${key} [${intent}] ` +
+          `stays ${current.toFixed(3)} (judge=${observedScore.toFixed(2)})`,
+        );
+        return;
+      }
+      cap.capabilities[dim] = updated;
+      cap.source = "blended";
+      this.sampleCounts.set(cellKey, result.sampleCount);
+      logger.info(
+        `Capability evolved: ${key} [${intent}] ${current.toFixed(3)} → ${updated.toFixed(3)} ` +
+        `(sample #${result.sampleCount}, judge=${observedScore.toFixed(2)})`,
+      );
+      return;
+    }
+
+    // Legacy path (mock DBs / pre-v4 databases): EMA + clamp only.
     cap.capabilities[dim] = updated;
     cap.source = "blended";
+    this.sampleCounts.set(cellKey, (this.sampleCounts.get(cellKey) ?? 0) + 1);
 
     // Persist to DB
     const existing = this.db.getCapabilityOverride(provider, model, intent);
@@ -498,6 +573,146 @@ export class ModelRegistry {
   }
 
   /** Load judge-adjusted scores from the database on startup. */
+
+  /**
+   * Full Phase-1 judged-score pipeline (§4.1): attribution gate → quarantine
+   * → guardrails → apply, with shadow-mode logging. Returns the outcome.
+   * Replaces the old updateCapability+recordJudgeEvaluation call pairs.
+   */
+  applyJudgedScore(
+    provider: string,
+    model: string,
+    intent: string,
+    normalizedScore: number,
+    opts: {
+      rawScore: number;
+      judgeNote: string;
+      judgeModelId: string;
+      confidence?: number | null;
+      truncated?: boolean;
+      malformed?: boolean;
+    },
+  ): { applied: boolean; arm: GateArm; reason: string; quarantined: boolean; wouldBe: number | null } {
+    const shadow = learningShadowMode();
+    const v = classifyAttribution({
+      truncated: opts.truncated,
+      malformed: opts.malformed,
+      confidence: opts.confidence ?? null,
+    });
+    const norm = normalizeNote(opts.judgeNote);
+    const hash = noteHash(norm);
+    const canary = noteCanaryThreshold();
+
+    const logEval = (noApply: boolean, reason: string, arm: string) => {
+      if (typeof this.db.recordJudgeEvaluationEx === "function") {
+        this.db.recordJudgeEvaluationEx({
+          provider, model, intent,
+          judgeScore: opts.rawScore,
+          judgeNote: opts.judgeNote,
+          judgeModel: opts.judgeModelId,
+          noApply, gateArm: arm, gateReason: reason, noteHash: hash,
+        });
+      } else {
+        this.db.recordJudgeEvaluation(provider, model, intent, opts.rawScore, opts.judgeNote, opts.judgeModelId);
+      }
+    };
+    const logShadow = (reason: string | null, arm: string, preClamp: number | null, wouldBe: number | null, n: number | null) => {
+      if (shadow && typeof this.db.recordShadowDecision === "function") {
+        this.db.recordShadowDecision({
+          provider, model, intent,
+          confidence: opts.confidence ?? null,
+          gateArm: arm,
+          rejectionReason: reason,
+          preClamp,
+          wouldBeValue: wouldBe,
+          sampleN: n,
+        });
+      }
+    };
+
+    // Arm A — provider-attributable fault: reliability trackers only, never capability.
+    if (v.arm === "A") {
+      logEval(true, v.reason, "A");
+      logShadow(v.reason, "A", null, null, null);
+      logger.info(`Judge gate Arm A (${v.reason}): ${provider}/${model} [${intent}] — reliability only, no capability write.`);
+      return { applied: false, arm: "A", reason: v.reason, quarantined: false, wouldBe: null };
+    }
+
+    // Arm B — low/missing classifier confidence or malformed verdict: no_apply.
+    if (v.arm === "B") {
+      logEval(true, v.reason, "B");
+      logShadow(v.reason, "B", null, null, null);
+      logger.info(`Judge gate Arm B (${v.reason}): ${provider}/${model} [${intent}] — no_apply.`);
+      return { applied: false, arm: "B", reason: v.reason, quarantined: false, wouldBe: null };
+    }
+
+    // Arm C — model-attributable: quarantine checks, then guardrails.
+    const cap = this.models.get(`${provider}/${model}`);
+    const dim = ModelRegistry.INTENT_MAP[intent];
+    if (!cap || !dim) {
+      logEval(true, "unknown_model_or_intent", "C");
+      logShadow("unknown_model_or_intent", "C", null, null, null);
+      return { applied: false, arm: "C", reason: "unknown_model_or_intent", quarantined: false, wouldBe: null };
+    }
+
+    const existing = typeof this.db.getCapabilityOverride === "function"
+      ? this.db.getCapabilityOverride(provider, model, intent)
+      : null;
+    const baseline = existing?.score ?? cap.capabilities[dim];
+    const n = existing?.sampleCount ?? this.sampleCounts.get(`${provider}/${model}/${intent}`) ?? 0;
+    const alpha = 0.25;
+    const preClamp = baseline * (1 - alpha) + normalizedScore * alpha;
+    const wouldBe = clampCapability(preClamp);
+
+    // Quarantined pair already? Never apply.
+    if (typeof this.db.isPairQuarantined === "function" && this.db.isPairQuarantined(provider, model, intent)) {
+      logEval(true, "pair_quarantined", "C");
+      logShadow("pair_quarantined", "C", preClamp, wouldBe, n);
+      return { applied: false, arm: "C", reason: "pair_quarantined", quarantined: true, wouldBe };
+    }
+
+    // Pre/post application note-similarity quarantine (§4.1).
+    let priorCount = 0;
+    if (typeof this.db.countJudgeNoteHash === "function") {
+      priorCount = this.db.countJudgeNoteHash(provider, model, intent, hash);
+    }
+    if (priorCount >= canary) {
+      // Post-application canary: ≥5 same note historically → quarantine + alert.
+      if (typeof this.db.quarantinePair === "function") {
+        this.db.quarantinePair(provider, model, intent, hash, norm, priorCount + 1);
+      }
+      logger.warn(
+        `⚠ QUARANTINE: ${provider}/${model} [${intent}] — identical judge note ×${priorCount + 1} ` +
+        `(task mix suspect, not model). Pair quarantined.`
+      );
+      logEval(true, "quarantine_canary", "C");
+      logShadow("quarantine_canary", "C", preClamp, wouldBe, n);
+      return { applied: false, arm: "C", reason: "quarantine_canary", quarantined: true, wouldBe };
+    }
+    if (priorCount >= noteHoldThreshold()) {
+      // Pre-application hold: near-identical verdict seen recently — hold, inspect.
+      logEval(true, "note_hold", "C");
+      logShadow("note_hold", "C", preClamp, wouldBe, n);
+      logger.info(`Judge gate hold (note seen ×${priorCount}): ${provider}/${model} [${intent}] — not applied.`);
+      return { applied: false, arm: "C", reason: "note_hold", quarantined: false, wouldBe };
+    }
+
+    if (shadow) {
+      // Shadow window: log the would-be value; never touch capability_overrides.
+      logEval(false, "shadow_mode", "C");
+      logShadow(null, "C", preClamp, wouldBe, n);
+      logger.info(
+        `Shadow: would evolve ${provider}/${model} [${intent}] ${baseline.toFixed(3)} → ${wouldBe.toFixed(3)} (n=${n})`
+      );
+      return { applied: false, arm: "C", reason: "shadow_mode", quarantined: false, wouldBe };
+    }
+
+    // Live apply through the guarded path (pin re-check + RoC inside txn).
+    this.updateCapability(provider, model, intent, normalizedScore);
+    logEval(false, "applied", "C");
+    logShadow(null, "C", preClamp, wouldBe, n + 1);
+    return { applied: true, arm: "C", reason: "applied", quarantined: false, wouldBe };
+  }
 
   /** Infer capability scores for an unseeded Ollama model based on name and size.
    *  Uses family detection (deepseek, qwen, gemma, etc.) and size scaling. */
@@ -538,29 +753,60 @@ export class ModelRegistry {
   }
 
   private applySavedOverrides(): void {
-    const overrides = this.db.loadCapabilityOverrides();
+    const overrides = typeof this.db.loadCapabilityOverrideRows === "function"
+      ? this.db.loadCapabilityOverrideRows()
+      : this.db.loadCapabilityOverrides().map(o => ({ ...o, lastJudged: new Date().toISOString(), pinned: false }));
     if (overrides.length === 0) return;
 
     let applied = 0;
+    let decayed = 0;
+    const idleDays = decayIdleDays();
+    const now = Date.now();
     for (const o of overrides) {
       const cap = this.models.get(`${o.provider}/${o.model}`);
       if (!cap) continue;
       const dim = ModelRegistry.INTENT_MAP[o.intent];
       if (!dim) continue;
 
+      const cellKey = `${o.provider}/${o.model}/${o.intent}`;
+      this.sampleCounts.set(cellKey, o.sampleCount);
+      if (o.pinned) this.pinnedCells.add(cellKey);
+
       const seedScore = cap.capabilities[dim];
-      cap.capabilities[dim] = o.score;
+      let score = o.score;
+
+      // Decay-to-prior on idle (§4.2): pinned cells exempt.
+      if (!o.pinned) {
+        const lastJudgedMs = o.lastJudged ? new Date(o.lastJudged).getTime() : now;
+        const idle = (now - lastJudgedMs) / 86_400_000;
+        if (idle > idleDays) {
+          const decayedScore = clampCapability(decayTowardSeed(score, seedScore, idle - idleDays));
+          if (Math.abs(decayedScore - score) > 0.0005) {
+            logger.info(
+              `Decay-to-prior: ${o.provider}/${o.model} [${o.intent}] ` +
+              `${score.toFixed(3)} → ${decayedScore.toFixed(3)} (idle ${idle.toFixed(1)}d, seed=${seedScore.toFixed(3)})`
+            );
+            score = decayedScore;
+            decayed++;
+            if (typeof this.db.updateCapabilityScoreOnly === "function") {
+              this.db.updateCapabilityScoreOnly(o.provider, o.model, o.intent, decayedScore);
+            }
+          }
+        }
+      }
+
+      cap.capabilities[dim] = score;
       cap.source = "blended";
       applied++;
 
       logger.debug(
         `Override applied: ${o.provider}/${o.model} [${o.intent}] ` +
-        `seed=${seedScore.toFixed(3)} → learned=${o.score.toFixed(3)} (${o.sampleCount} samples)`,
+        `seed=${seedScore.toFixed(3)} → learned=${score.toFixed(3)} (${o.sampleCount} samples)`,
       );
     }
 
     if (applied > 0) {
-      logger.info(`Applied ${applied} capability overrides from judge feedback.`);
+      logger.info(`Applied ${applied} capability overrides from judge feedback (${decayed} decayed toward seed).`);
     }
   }
 }
