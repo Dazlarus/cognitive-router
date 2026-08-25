@@ -14,20 +14,32 @@ import type { BudgetTracker, CostEfficiency } from "./budget_tracker.js";
 import { OllamaWarmthChecker, type WarmthInfo } from "./ollama_warmth.js";
 import type { Modality } from "./modality.js";
 
+/** Machine-readable reason a candidate was excluded from scoring before
+ *  the ranking stage. Clean, reusable vocabulary for decision logs — the
+ *  planned decision-source taxonomy (observability work) should extend
+ *  these codes, not replace them. */
+export type CandidateSkipReason = "context_window_exceeded";
+
 /** Context window filter result — attached to every decision for observability. */
 export interface ContextFilterInfo {
   estimatedTokens: number;
   /** Safety factor applied (0.8 = 80% of context window). */
   safetyFactor: number;
-  /** Models that were excluded because their context window was too small. */
+  /** Models that were excluded because their context window was too small.
+   *  Each entry carries a machine-readable skipReason for decision logs. */
   filteredOut: Array<{
     provider: string;
     model: string;
     contextWindow: number;
     effectiveLimit: number;
+    skipReason: CandidateSkipReason;
   }>;
   /** Largest context window among all known models (for error messaging). */
   maxContextWindow: number;
+  /** True when EVERY candidate was filtered out and the router degraded
+   *  gracefully: the pre-filter candidate set is kept and the best-scoring
+   *  model wins (with a warn). Never hard-fail on a heuristic estimate. */
+  allFilteredDegraded?: boolean;
 }
 
 /** Modality filter result — attached to decisions for observability. */
@@ -72,9 +84,12 @@ export interface RoutingDecision {
   contextFilter?: ContextFilterInfo;
   /** Modality filter details — present when request is multimodal. */
   modalityFilter?: ModalityFilterInfo;
-  /** Set when the request requires a modality no model supports. */
+  /** Set when the request requires a modality no model supports.
+   *  Context-window overruns no longer produce an error: the filter degrades
+   *  gracefully (contextFilter.allFilteredDegraded=true) and the best-scoring
+   *  model still serves the request. */
   error?: {
-    code: "CONTEXT_TOO_LARGE" | "MODALITY_UNSUPPORTED";
+    code: "MODALITY_UNSUPPORTED";
     message: string;
     estimatedTokens?: number;
     maxContextWindow?: number;
@@ -384,16 +399,17 @@ export class RoutingEngine {
             model: m.model,
             contextWindow: m.contextWindow,
             effectiveLimit,
+            skipReason: "context_window_exceeded",
           });
         } else {
           passingContext.push(m);
         }
       }
 
-      // Log each filtered model for observability
+      // Log each filtered model for observability (structured skip reason)
       for (const f of filteredOut) {
         logger.info(
-          `Context filter: excluded ${f.provider}/${f.model} — ` +
+          `Context filter: excluded ${f.provider}/${f.model} (skip_reason=${f.skipReason}) — ` +
           `~${estimatedTokens} tokens > ${f.effectiveLimit} limit ` +
           `(80% of ${f.contextWindow.toLocaleString()}).`,
         );
@@ -411,41 +427,28 @@ export class RoutingEngine {
       };
 
       if (passingContext.length === 0) {
-        // No model can handle this request size
+        // ALL candidates filtered out — degrade gracefully, never hard-fail.
+        // Keep the pre-filter candidate set: the best-scoring model wins and
+        // the request still gets a chance upstream (the estimate is a
+        // heuristic; a wrong estimate must not kill the request). The proxy's
+        // per-provider effective-limit guard still skips hopeless candidates.
         const maxModel = candidates.find(
           (m) => m.contextWindow === maxContextWindow,
         );
         const maxEffective = Math.floor(maxContextWindow * CONTEXT_SAFETY_FACTOR);
 
+        contextFilter.allFilteredDegraded = true;
+
         logger.warn(
-          `Context filter: ALL ${candidates.length} candidates excluded — ` +
-          `~${estimatedTokens} tokens exceeds max effective ${maxEffective} ` +
-          `(largest: ${maxModel?.provider}/${maxModel?.model} at ${maxContextWindow.toLocaleString()}).`,
+          `Context filter: ALL ${candidates.length} candidates excluded ` +
+          `(skip_reason=context_window_exceeded) — ~${estimatedTokens} tokens exceeds ` +
+          `max effective ${maxEffective} (largest: ${maxModel?.provider}/${maxModel?.model} ` +
+          `at ${maxContextWindow.toLocaleString()}). Degrading gracefully: falling back to ` +
+          `best-scoring model from the unfiltered candidate set.`,
         );
-
-        return {
-          provider: "",
-          model: "",
-          scores: { capability: 0, reliability: 0, cost: 0, latency: 0 },
-          overallScore: 0,
-          rationale: `CONTEXT_TOO_LARGE: ~${estimatedTokens} tokens exceeds ` +
-            `max effective context ${maxEffective.toLocaleString()} ` +
-            `(80% of ${maxContextWindow.toLocaleString()} from ` +
-            `${maxModel?.provider}/${maxModel?.model}).`,
-          contextFilter,
-          error: {
-            code: "CONTEXT_TOO_LARGE",
-            message: `Request size ~${estimatedTokens} tokens exceeds all available ` +
-              `context windows. Largest: ${maxModel?.provider}/${maxModel?.model} ` +
-              `at ${maxContextWindow.toLocaleString()} tokens ` +
-              `(effective limit: ${maxEffective.toLocaleString()} at 80% safety margin).`,
-            estimatedTokens,
-            maxContextWindow,
-          },
-        };
+      } else {
+        candidates = passingContext;
       }
-
-      candidates = passingContext;
     }
 
     if (sizeBucket) {

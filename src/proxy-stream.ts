@@ -101,7 +101,7 @@ function getTiktoken(): { encode(text: string): number[] } | null {
   }
 }
 
-function estimateTokenCount(request: ChatCompletionRequest): number {
+export function estimateTokenCount(request: ChatCompletionRequest): number {
   const encoder = getTiktoken();
   if (encoder) {
     let tokenCount = 0;
