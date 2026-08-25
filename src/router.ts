@@ -512,8 +512,13 @@ export class RoutingEngine {
     }
 
     const scored: RoutingDecision[] = candidates.map((modelEntry) => {
+      // Phase-1: UCB exploration read path (learned + k/√n; §4.2). While the
+      // learning shadow window is ON this returns the plain learned score —
+      // live routing is untouched until gates pass and a human flips it.
       const capabilityScore =
-        this.registry.getCapabilityScore(modelEntry.provider, modelEntry.model, intent) *
+        (typeof this.registry.getExplorationScore === "function"
+          ? this.registry.getExplorationScore(modelEntry.provider, modelEntry.model, intent)
+          : this.registry.getCapabilityScore(modelEntry.provider, modelEntry.model, intent)) *
         confidence;
 
       const reliabilityScore =

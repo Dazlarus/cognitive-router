@@ -12,6 +12,7 @@
 import { logger } from "./logger.js";
 import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig, ProviderBudget } from "./config.js";
+import { ageWeightedEpisodic } from "./learning_guards.js";
 
 /** Failure type classification for pattern detection. */
 export type FailureType = "timeout" | "rate_limit" | "error" | "empty";
@@ -218,20 +219,41 @@ export class CostTracker {
       const monthlySpend = this.db.getSpend(name, "monthly");
       const dailySpend = this.db.getSpend(name, "daily");
 
-      // Restore persisted circuit state from previous session
+      // Restore persisted circuit state from previous session — age-weighted
+      // per §4.6: episodic counters (consecutive failures / backoff tier) decay
+      // with a 1h half-life since last_check; drift toward healthy. Cold-start = healthy.
       const savedCircuit = this.db.loadCircuitState ? this.db.loadCircuitState(name) : null;
+      let restoredFailures = 0;
+      let restoredTier = 0;
+      let restoredStatus: ProviderState["status"] = "healthy";
+      if (savedCircuit) {
+        const ageMs = savedCircuit.lastCheck
+          ? Math.max(0, Date.now() - new Date(savedCircuit.lastCheck).getTime())
+          : 0;
+        const decayed = ageWeightedEpisodic(savedCircuit.consecutiveFailures, savedCircuit.backoffTier, ageMs);
+        restoredFailures = decayed.consecutiveFailures;
+        restoredTier = decayed.backoffTier;
+        restoredStatus = (savedCircuit.status as ProviderState["status"]) ?? "healthy";
+        // A fully-decayed circuit is no longer evidence of anything.
+        if (restoredFailures === 0 && restoredTier === 0) restoredStatus = "healthy";
+        logger.info(
+          `Restored circuit state for ${name}: ${savedCircuit.status} → ${restoredStatus} ` +
+          `(failures=${savedCircuit.consecutiveFailures}→${restoredFailures}, tier=${savedCircuit.backoffTier}→${restoredTier}, ` +
+          `age=${(ageMs / 3_600_000).toFixed(1)}h, episodic half-life 1h)`,
+        );
+      }
       this.states.set(name, {
         name,
         budget,
-        status: (savedCircuit?.status as ProviderState["status"]) ?? "healthy",
-        consecutiveFailures: savedCircuit?.consecutiveFailures ?? 0,
+        status: restoredStatus,
+        consecutiveFailures: restoredFailures,
         consecutiveFailureType: null,
         recentLatencies: [],
         recentCalls: 0,
         monthlySpendUsd: monthlySpend,
         dailySpendUsd: dailySpend,
         lastFailureTime: savedCircuit ? Date.now() : 0,
-        backoffTier: savedCircuit?.backoffTier ?? 0,
+        backoffTier: restoredTier,
         totalTokensUsed: 0,
         quotaPercent: 0,
         quotaWarned: false,
@@ -239,11 +261,6 @@ export class CostTracker {
         recentFailureTypes: [],
         lastSuccessTime: 0,
       });
-      if (savedCircuit) {
-        logger.info(
-          `Restored circuit state for ${name}: ${savedCircuit.status} (failures=${savedCircuit.consecutiveFailures}, tier=${savedCircuit.backoffTier})`,
-        );
-      }
     }
     logger.info(`Tracking ${this.states.size} providers. Budgets: daily=$${this.dailyBudgetUsd}, monthly=$${this.monthlyBudgetUsd}`);
   }
