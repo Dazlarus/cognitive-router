@@ -630,6 +630,27 @@ export class ModelRegistry {
       }
     };
 
+    // Post-application canary (§4.1): ≥5 identical normalized notes historically
+    // (every event is logged with its hash, regardless of arm) → quarantine the
+    // pair + alert. Repeated identical verdicts mean the task mix is broken,
+    // not the model. Runs before arm dispatch so no-apply clusters still trip it.
+    let priorCount = 0;
+    if (norm.length > 0 && typeof this.db.countJudgeNoteHash === "function") {
+      priorCount = this.db.countJudgeNoteHash(provider, model, intent, hash);
+    }
+    if (norm.length > 0 && priorCount >= canary) {
+      if (typeof this.db.quarantinePair === "function") {
+        this.db.quarantinePair(provider, model, intent, hash, norm, priorCount + 1);
+      }
+      logger.warn(
+        `⚠ QUARANTINE: ${provider}/${model} [${intent}] — identical judge note ×${priorCount + 1} ` +
+        `(task mix suspect, not model). Pair quarantined.`
+      );
+      logEval(true, "quarantine_canary", v.arm);
+      logShadow("quarantine_canary", v.arm, null, null, priorCount);
+      return { applied: false, arm: v.arm, reason: "quarantine_canary", quarantined: true, wouldBe: null };
+    }
+
     // Arm A — provider-attributable fault: reliability trackers only, never capability.
     if (v.arm === "A") {
       logEval(true, v.reason, "A");
@@ -671,26 +692,9 @@ export class ModelRegistry {
       return { applied: false, arm: "C", reason: "pair_quarantined", quarantined: true, wouldBe };
     }
 
-    // Pre/post application note-similarity quarantine (§4.1).
-    let priorCount = 0;
-    if (typeof this.db.countJudgeNoteHash === "function") {
-      priorCount = this.db.countJudgeNoteHash(provider, model, intent, hash);
-    }
-    if (priorCount >= canary) {
-      // Post-application canary: ≥5 same note historically → quarantine + alert.
-      if (typeof this.db.quarantinePair === "function") {
-        this.db.quarantinePair(provider, model, intent, hash, norm, priorCount + 1);
-      }
-      logger.warn(
-        `⚠ QUARANTINE: ${provider}/${model} [${intent}] — identical judge note ×${priorCount + 1} ` +
-        `(task mix suspect, not model). Pair quarantined.`
-      );
-      logEval(true, "quarantine_canary", "C");
-      logShadow("quarantine_canary", "C", preClamp, wouldBe, n);
-      return { applied: false, arm: "C", reason: "quarantine_canary", quarantined: true, wouldBe };
-    }
+    // Pre-application hold: near-identical verdict seen recently — hold, inspect
+    // (§4.1: catches the confident-misclassifier on punishment #2, not #5).
     if (priorCount >= noteHoldThreshold()) {
-      // Pre-application hold: near-identical verdict seen recently — hold, inspect.
       logEval(true, "note_hold", "C");
       logShadow("note_hold", "C", preClamp, wouldBe, n);
       logger.info(`Judge gate hold (note seen ×${priorCount}): ${provider}/${model} [${intent}] — not applied.`);
