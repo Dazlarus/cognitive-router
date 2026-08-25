@@ -116,7 +116,8 @@ describe("Phase 3: Session-Level Durability Tests", () => {
     it("should migrate schema to v3 and create required tables", () => {
       const sqliteDb = db.getDb();
       const userVersion = sqliteDb.pragma("user_version", { simple: true }) as number;
-      assert.equal(userVersion, 3, "Database user_version should be 3");
+      // v3 tables must exist; user_version is >= 3 (v4 learning-loop hardening supersedes v3).
+      assert.ok(userVersion >= 3, `Database user_version should be >= 3, got ${userVersion}`);
 
       // Verify tables exist
       const tables = sqliteDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[];
