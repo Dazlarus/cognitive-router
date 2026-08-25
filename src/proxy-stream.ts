@@ -1076,14 +1076,20 @@ export class ProxyServerStreaming {
             const evalPrompt = prompt;
 
             // Fire and forget - don't await, don't block
+            // Phase-1 hardened path: attribution gate → quarantine → guardrails →
+            // shadow-aware apply (§4.1). Confidence + truncation feed the gate.
             this.judge.evaluate(evalPrompt, accumulatedContent, evalIntent)
               .then((result) => {
                 if (result) {
-                  this.modelRegistry.updateCapability(evalProvider, evalModel, evalIntent, result.score);
-                  this.db.recordJudgeEvaluation(
-                    evalProvider, evalModel, evalIntent,
-                    result.rawScore, result.note,
-                    `${this.judge.judgeModelId}`,
+                  this.modelRegistry.applyJudgedScore(
+                    evalProvider, evalModel, evalIntent, result.score,
+                    {
+                      rawScore: result.rawScore,
+                      judgeNote: result.note,
+                      judgeModelId: `${this.judge.judgeModelId}`,
+                      confidence: classification.confidence,
+                      truncated: result.truncated,
+                    },
                   );
                 }
               })
@@ -1164,14 +1170,20 @@ export class ProxyServerStreaming {
           const evalResponse = content;
 
           // Fire and forget - don't await, don't block
+          // Phase-1 hardened path: attribution gate → quarantine → guardrails →
+          // shadow-aware apply (§4.1). Confidence + truncation feed the gate.
           this.judge.evaluate(evalPrompt, evalResponse, evalIntent)
             .then((result) => {
               if (result) {
-                this.modelRegistry.updateCapability(evalProvider, evalModel, evalIntent, result.score);
-                this.db.recordJudgeEvaluation(
-                  evalProvider, evalModel, evalIntent,
-                  result.rawScore, result.note,
-                  `${this.judge.judgeModelId}`,
+                this.modelRegistry.applyJudgedScore(
+                  evalProvider, evalModel, evalIntent, result.score,
+                  {
+                    rawScore: result.rawScore,
+                    judgeNote: result.note,
+                    judgeModelId: `${this.judge.judgeModelId}`,
+                    confidence: classification.confidence,
+                    truncated: result.truncated,
+                  },
                 );
               }
             })
