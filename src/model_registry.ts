@@ -517,12 +517,12 @@ export class ModelRegistry {
     model: string,
     intent: string,
     observedScore: number,
-  ): void {
+  ): { applied: boolean; reason: string } {
     const key = `${provider}/${model}`;
     const cap = this.models.get(key);
-    if (!cap) return;
+    if (!cap) return { applied: false, reason: "unknown_model" };
     const dim = ModelRegistry.INTENT_MAP[intent];
-    if (!dim) return;
+    if (!dim) return { applied: false, reason: "unknown_intent" };
 
     const current = cap.capabilities[dim];
     const alpha = 0.25; // EMA smoothing - new observations weighted 25%
@@ -544,7 +544,7 @@ export class ModelRegistry {
           `Capability update rejected (${result.reason}): ${key} [${intent}] ` +
           `stays ${current.toFixed(3)} (judge=${observedScore.toFixed(2)})`,
         );
-        return;
+        return { applied: false, reason: result.reason };
       }
       cap.capabilities[dim] = updated;
       cap.source = "blended";
@@ -553,7 +553,7 @@ export class ModelRegistry {
         `Capability evolved: ${key} [${intent}] ${current.toFixed(3)} → ${updated.toFixed(3)} ` +
         `(sample #${result.sampleCount}, judge=${observedScore.toFixed(2)})`,
       );
-      return;
+      return { applied: true, reason: "applied" };
     }
 
     // Legacy path (mock DBs / pre-v4 databases): EMA + clamp only.
@@ -570,6 +570,7 @@ export class ModelRegistry {
       `Capability evolved: ${key} [${intent}] ${current.toFixed(3)} → ${updated.toFixed(3)} ` +
       `(sample #${newCount}, judge=${observedScore.toFixed(2)})`,
     );
+    return { applied: true, reason: "applied" };
   }
 
   /** Load judge-adjusted scores from the database on startup. */
@@ -712,10 +713,16 @@ export class ModelRegistry {
     }
 
     // Live apply through the guarded path (pin re-check + RoC inside txn).
-    this.updateCapability(provider, model, intent, normalizedScore);
-    logEval(false, "applied", "C");
-    logShadow(null, "C", preClamp, wouldBe, n + 1);
-    return { applied: true, arm: "C", reason: "applied", quarantined: false, wouldBe };
+    const appliedResult = this.updateCapability(provider, model, intent, normalizedScore);
+    logEval(!appliedResult.applied, appliedResult.applied ? "applied" : appliedResult.reason, "C");
+    logShadow(appliedResult.applied ? null : appliedResult.reason, "C", preClamp, wouldBe, n + 1);
+    return {
+      applied: appliedResult.applied,
+      arm: "C",
+      reason: appliedResult.reason,
+      quarantined: false,
+      wouldBe,
+    };
   }
 
   /** Infer capability scores for an unseeded Ollama model based on name and size.

@@ -753,7 +753,7 @@ export class DBService {
       data.noApply ? 1 : 0,
       data.gateArm,
       data.gateReason,
-      data.noteHash ?? null,
+      data.noteHash ?? (data.judgeNote ? noteHashOf(data.judgeNote) : null),
     );
   }
 
