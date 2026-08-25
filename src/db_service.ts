@@ -3,6 +3,11 @@
 
 import Database from "better-sqlite3";
 import { logger } from "./logger.js";
+import { normalizeNote, noteHash } from "./learning_guards.js";
+
+function noteHashOf(note: string): string {
+  return noteHash(normalizeNote(note));
+}
 
 export interface DecisionRecord {
   timestamp: string;
@@ -64,6 +69,7 @@ export class DBService {
     this.addColumnIfMissing("routing_decisions", "modality_filter_json", "TEXT");
     this.db.exec(INDEX_SCHEMA_SQL);
     this.migrate_v3();
+    this.migrate_v4();
     logger.info("Database schema verified.");
   }
 
@@ -113,6 +119,177 @@ export class DBService {
     });
     rollback();
     logger.info(`Database rolled back to user_version = 2 successfully.`);
+  }
+
+  /** Phase-1 learning-loop hardening (LEARNING_LOOP_DESIGN.md §4.2/§4.5).
+   *  Additive only: new tables + new columns; never destructive. */
+  migrate_v4(): void {
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version >= 4) return;
+    logger.info(`Migrating database to user_version = 4 (learning-loop hardening)...`);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS capability_overrides_archive (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider    TEXT NOT NULL,
+        model       TEXT NOT NULL,
+        intent      TEXT NOT NULL,
+        score       REAL NOT NULL,
+        sample_count INTEGER NOT NULL DEFAULT 1,
+        last_judged TEXT NOT NULL,
+        pinned      INTEGER NOT NULL DEFAULT 0,
+        archived_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS capability_movement (
+        provider         TEXT NOT NULL,
+        model            TEXT NOT NULL,
+        intent           TEXT NOT NULL,
+        window_start_ts  TEXT NOT NULL,
+        cumulative_delta REAL NOT NULL DEFAULT 0,
+        last_updated     TEXT NOT NULL,
+        PRIMARY KEY (provider, model, intent, window_start_ts)
+      );
+
+      CREATE TABLE IF NOT EXISTS shadow_decisions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp        TEXT NOT NULL,
+        provider         TEXT NOT NULL,
+        model            TEXT NOT NULL,
+        intent           TEXT NOT NULL,
+        confidence       REAL,
+        gate_arm         TEXT,
+        rejection_reason TEXT,
+        pre_clamp        REAL,
+        would_be_value   REAL,
+        sample_n         INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS quarantined_pairs (
+        provider    TEXT NOT NULL,
+        model       TEXT NOT NULL,
+        intent      TEXT NOT NULL,
+        note_hash   TEXT NOT NULL,
+        note_text   TEXT,
+        occurrences INTEGER NOT NULL,
+        quarantined_at TEXT NOT NULL,
+        PRIMARY KEY (provider, model, intent, note_hash)
+      );
+    `);
+
+    this.addColumnIfMissing("capability_overrides", "pinned", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("judge_history", "no_apply", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("judge_history", "gate_arm", "TEXT");
+    this.addColumnIfMissing("judge_history", "gate_reason", "TEXT");
+    this.addColumnIfMissing("judge_history", "note_hash", "TEXT");
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cap_archive_batch ON capability_overrides_archive(archived_at);
+      CREATE INDEX IF NOT EXISTS idx_cap_movement_window ON capability_movement(provider, model, intent, window_start_ts);
+      CREATE INDEX IF NOT EXISTS idx_shadow_timestamp ON shadow_decisions(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_shadow_pair ON shadow_decisions(provider, model, intent);
+      CREATE INDEX IF NOT EXISTS idx_judge_note_hash ON judge_history(note_hash);
+      CREATE INDEX IF NOT EXISTS idx_judge_no_apply ON judge_history(no_apply);
+    `);
+
+    // Backfill note hashes for existing judge history (needed by the canary).
+    this.backfillJudgeNoteHashes();
+    // Backfill 7d capability movement from judge_history (reverse-EMA estimate).
+    this.backfillCapabilityMovement7d();
+
+    this.db.prepare("PRAGMA user_version = 4").run();
+    logger.info(`Database migrated to user_version = 4 successfully.`);
+  }
+
+  /** Reverse migration for v4 (drops only the v4-added tables). */
+  rollback_v4(): void {
+    logger.info(`Rolling back database user_version to 3...`);
+    const rollback = this.db.transaction(() => {
+      this.db.prepare(`DROP TABLE IF EXISTS quarantined_pairs`).run();
+      this.db.prepare(`DROP TABLE IF EXISTS shadow_decisions`).run();
+      this.db.prepare(`DROP TABLE IF EXISTS capability_movement`).run();
+      this.db.prepare(`DROP TABLE IF EXISTS capability_overrides_archive`).run();
+      this.db.prepare("PRAGMA user_version = 3").run();
+    });
+    rollback();
+    logger.info(`Database rolled back to user_version = 3 successfully.`);
+  }
+
+  private backfillJudgeNoteHashes(): void {
+    const rows = this.db.prepare(
+      `SELECT id, judge_note FROM judge_history WHERE note_hash IS NULL AND judge_note IS NOT NULL`,
+    ).all() as Array<{ id: number; judge_note: string }>;
+    if (rows.length === 0) return;
+    const update = this.db.prepare(`UPDATE judge_history SET note_hash = ? WHERE id = ?`);
+    const tx = this.db.transaction(() => {
+      for (const r of rows) {
+        update.run(noteHashOf(r.judge_note), r.id);
+      }
+    });
+    tx();
+    logger.info(`Backfilled note_hash for ${rows.length} judge_history rows.`);
+  }
+
+  /** Estimate per-day capability movement over the last 7 days by un-applying
+   *  the EMA (alpha=0.25) from the current stored value, day by day. Movement
+   *  is attributed to the UTC day bucket in which the evals occurred. */
+  private backfillCapabilityMovement7d(alpha = 0.25): void {
+    const now = Date.now();
+    const windowStart = new Date(now - 7 * 86_400_000).toISOString();
+    const pairs = this.db.prepare(
+      `SELECT DISTINCT provider, model, intent FROM judge_history WHERE timestamp >= ?`,
+    ).all(windowStart) as Array<{ provider: string; model: string; intent: string }>;
+    if (pairs.length === 0) return;
+
+    const getOverride = this.db.prepare(
+      `SELECT score FROM capability_overrides WHERE provider = ? AND model = ? AND intent = ?`,
+    );
+    const getEvals = this.db.prepare(
+      `SELECT timestamp, judge_score FROM judge_history
+       WHERE provider = ? AND model = ? AND intent = ? AND timestamp >= ? AND no_apply = 0
+       ORDER BY timestamp ASC`,
+    );
+    const upsertMovement = this.db.prepare(
+      `INSERT INTO capability_movement (provider, model, intent, window_start_ts, cumulative_delta, last_updated)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(provider, model, intent, window_start_ts) DO UPDATE SET
+         cumulative_delta = cumulative_delta + excluded.cumulative_delta,
+         last_updated = excluded.last_updated`,
+    );
+
+    let touched = 0;
+    const tx = this.db.transaction(() => {
+      for (const p of pairs) {
+        const cur = getOverride.get(p.provider, p.model, p.intent) as { score: number } | undefined;
+        if (!cur) continue;
+        const evals = getEvals.all(p.provider, p.model, p.intent, windowStart) as Array<{ timestamp: string; judge_score: number }>;
+        if (evals.length === 0) continue;
+
+        // Walk the value forward from the current score by re-deriving the
+        // daily trajectory: start from value-before-window estimated by
+        // un-applying every eval in the window.
+        let value = cur.score;
+        for (let i = evals.length - 1; i >= 0; i--) {
+          value = (value - alpha * (evals[i].judge_score / 10)) / (1 - alpha);
+          value = Math.min(1, Math.max(0, value));
+        }
+        // Now replay forward, bucketing movement per UTC day.
+        let dayBucket = "";
+        for (const e of evals) {
+          const next = value * (1 - alpha) + (e.judge_score / 10) * alpha;
+          const day = e.timestamp.slice(0, 10);
+          if (day !== dayBucket) dayBucket = day;
+          const delta = Math.abs(next - value);
+          if (delta > 0) {
+            upsertMovement.run(p.provider, p.model, p.intent, day, delta, e.timestamp);
+          }
+          value = next;
+        }
+        touched++;
+      }
+    });
+    tx();
+    logger.info(`Backfilled capability_movement for ${touched} pair(s) over the 7d window.`);
   }
 
   recordAbortEvent(data: {
@@ -207,9 +384,9 @@ export class DBService {
     );
   }
 
-  loadCircuitState(providerName: string): { status: string; consecutiveFailures: number; backoffTier: number } | null {
+  loadCircuitState(providerName: string): { status: string; consecutiveFailures: number; backoffTier: number; lastCheck?: string | null } | null {
     const row = this.db.prepare(
-      `SELECT status, metadata FROM provider_health WHERE provider_name = ?`
+      `SELECT status, metadata, last_check FROM provider_health WHERE provider_name = ?`
     ).get(providerName) as any;
     if (!row || row.status === 'HEALTHY') return null;
     try {
@@ -218,6 +395,7 @@ export class DBService {
         status: row.status.toLowerCase(),
         consecutiveFailures: meta.consecutiveFailures || 0,
         backoffTier: meta.backoffTier || 0,
+        lastCheck: row.last_check ?? null,
       };
     } catch {
       return null;
@@ -371,6 +549,132 @@ export class DBService {
 
   // ─── Capability Overrides (LLM-as-judge feedback) ───
 
+  /** Insert a shadow-window decision row (METADATA ONLY — never prompt/response content). */
+  recordShadowDecision(data: {
+    provider: string;
+    model: string;
+    intent: string;
+    confidence: number | null;
+    gateArm: string;
+    rejectionReason: string | null;
+    preClamp: number | null;
+    wouldBeValue: number | null;
+    sampleN: number | null;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO shadow_decisions
+        (timestamp, provider, model, intent, confidence, gate_arm, rejection_reason, pre_clamp, would_be_value, sample_n)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      new Date().toISOString(),
+      data.provider,
+      data.model,
+      data.intent,
+      data.confidence,
+      data.gateArm,
+      data.rejectionReason,
+      data.preClamp,
+      data.wouldBeValue,
+      data.sampleN,
+    );
+  }
+
+  getShadowDecisionCount(): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS c FROM shadow_decisions`).get() as { c: number }).c;
+  }
+
+  /** Set/unset the manual pin on a capability cell. Pinned cells refuse learner updates. */
+  setCapabilityPin(provider: string, model: string, intent: string, pinned: boolean): void {
+    this.db.prepare(
+      `UPDATE capability_overrides SET pinned = ? WHERE provider = ? AND model = ? AND intent = ?`,
+    ).run(pinned ? 1 : 0, provider, model, intent);
+  }
+
+  /** Is this capability cell pinned (either pinned=1 row exists)? */
+  isCapabilityPinned(provider: string, model: string, intent: string): boolean {
+    const row = this.db.prepare(
+      `SELECT pinned FROM capability_overrides WHERE provider = ? AND model = ? AND intent = ?`,
+    ).get(provider, model, intent) as { pinned: number } | undefined;
+    return (row?.pinned ?? 0) === 1;
+  }
+
+  /** Count occurrences of a normalized judge note for a pair (canary input). */
+  countJudgeNoteHash(provider: string, model: string, intent: string, hash: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS c FROM judge_history
+      WHERE provider = ? AND model = ? AND intent = ? AND note_hash = ?
+    `).get(provider, model, intent, hash) as { c: number };
+    return row.c;
+  }
+
+  /** Quarantine a model/intent pair (post-application canary fired). */
+  quarantinePair(provider: string, model: string, intent: string, hash: string, noteText: string, occurrences: number): void {
+    this.db.prepare(`
+      INSERT INTO quarantined_pairs (provider, model, intent, note_hash, note_text, occurrences, quarantined_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(provider, model, intent, note_hash) DO UPDATE SET
+        occurrences = MAX(occurrences, excluded.occurrences),
+        quarantined_at = excluded.quarantined_at
+    `).run(provider, model, intent, hash, noteText.slice(0, 255), occurrences, new Date().toISOString());
+  }
+
+  /** Is this pair quarantined (any note hash)? */
+  isPairQuarantined(provider: string, model: string, intent: string): boolean {
+    const row = this.db.prepare(
+      `SELECT 1 AS x FROM quarantined_pairs WHERE provider = ? AND model = ? AND intent = ? LIMIT 1`,
+    ).get(provider, model, intent);
+    return row !== undefined;
+  }
+
+  getQuarantinedPairs(): Array<{ provider: string; model: string; intent: string; note_hash: string; note_text: string | null; occurrences: number; quarantined_at: string }> {
+    return this.db.prepare(`
+      SELECT provider, model, intent, note_hash, note_text, occurrences, quarantined_at
+      FROM quarantined_pairs
+    `).all() as any[];
+  }
+
+  /** Sum absolute capability movement inside a time window for a pair (RoC check). */
+  sumCapabilityMovement(provider: string, model: string, intent: string, sinceIso: string): number {
+    const row = this.db.prepare(`
+      SELECT COALESCE(SUM(cumulative_delta), 0) AS s
+      FROM capability_movement
+      WHERE provider = ? AND model = ? AND intent = ? AND window_start_ts >= ?
+    `).get(provider, model, intent, sinceIso) as { s: number };
+    return row.s;
+  }
+
+  /** Record a capability movement increment for a pair inside a window bucket. */
+  recordCapabilityMovement(provider: string, model: string, intent: string, delta: number, timestamp: string): void {
+    const windowStart = timestamp.slice(0, 10);
+    this.db.prepare(`
+      INSERT INTO capability_movement (provider, model, intent, window_start_ts, cumulative_delta, last_updated)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(provider, model, intent, window_start_ts) DO UPDATE SET
+        cumulative_delta = cumulative_delta + excluded.cumulative_delta,
+        last_updated = excluded.last_updated
+    `).run(provider, model, intent, windowStart, delta, timestamp);
+  }
+
+  /** Archive every capability_overrides row with a batch timestamp. Returns rows archived. */
+  archiveAllCapabilityOverrides(batchTs: string): number {
+    const tx = this.db.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT provider, model, intent, score, sample_count, last_judged, pinned
+        FROM capability_overrides
+      `).all() as Array<{ provider: string; model: string; intent: string; score: number; sample_count: number; last_judged: string; pinned: number }>;
+      const ins = this.db.prepare(`
+        INSERT INTO capability_overrides_archive
+          (provider, model, intent, score, sample_count, last_judged, pinned, archived_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const r of rows) {
+        ins.run(r.provider, r.model, r.intent, r.score, r.sample_count, r.last_judged, r.pinned ?? 0, batchTs);
+      }
+      return rows.length;
+    });
+    return tx();
+  }
+
   upsertCapabilityOverride(
     provider: string,
     model: string,
@@ -395,6 +699,16 @@ export class DBService {
     `).all() as Array<{ provider: string; model: string; intent: string; score: number; sampleCount: number }>;
   }
 
+  /** Full override rows incl. pin state + last_judged (decay + guardrail reads). */
+  loadCapabilityOverrideRows(): Array<{ provider: string; model: string; intent: string; score: number; sampleCount: number; lastJudged: string; pinned: boolean }> {
+    return this.db.prepare(`
+      SELECT provider, model, intent, score,
+             sample_count AS sampleCount, last_judged AS lastJudged,
+             pinned
+      FROM capability_overrides
+    `).all() as any[];
+  }
+
   recordJudgeEvaluation(
     provider: string,
     model: string,
@@ -409,13 +723,96 @@ export class DBService {
     `).run(new Date().toISOString(), provider, model, intent, judgeScore, judgeNote, judgeModel);
   }
 
-  getCapabilityOverride(provider: string, model: string, intent: string): { score: number; sampleCount: number } | null {
+  /** Judge evaluation with attribution-gate metadata (§4.1). */
+  recordJudgeEvaluationEx(data: {
+    provider: string;
+    model: string;
+    intent: string;
+    judgeScore: number;
+    judgeNote: string;
+    judgeModel: string;
+    noApply: boolean;
+    gateArm: string | null;
+    gateReason: string | null;
+    noteHash?: string | null;
+    timestamp?: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO judge_history
+        (timestamp, provider, model, intent, judge_score, judge_note, judge_model,
+         no_apply, gate_arm, gate_reason, note_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      data.timestamp ?? new Date().toISOString(),
+      data.provider,
+      data.model,
+      data.intent,
+      data.judgeScore,
+      data.judgeNote,
+      data.judgeModel,
+      data.noApply ? 1 : 0,
+      data.gateArm,
+      data.gateReason,
+      data.noteHash ?? null,
+    );
+  }
+
+  getCapabilityOverride(provider: string, model: string, intent: string): { score: number; sampleCount: number; pinned: boolean } | null {
     const row = this.db.prepare(`
-      SELECT score, sample_count AS sampleCount
+      SELECT score, sample_count AS sampleCount, pinned
       FROM capability_overrides
       WHERE provider = ? AND model = ? AND intent = ?
-    `).get(provider, model, intent) as { score: number; sampleCount: number } | null;
-    return row;
+    `).get(provider, model, intent) as { score: number; sampleCount: number; pinned: number } | null;
+    if (!row) return null;
+    return { score: row.score, sampleCount: row.sampleCount, pinned: row.pinned === 1 };
+  }
+
+  /** Persist a decayed score WITHOUT touching sample_count/last_judged (decay is not a judgment). */
+  updateCapabilityScoreOnly(provider: string, model: string, intent: string, score: number): void {
+    this.db.prepare(
+      `UPDATE capability_overrides SET score = ? WHERE provider = ? AND model = ? AND intent = ?`,
+    ).run(score, provider, model, intent);
+  }
+
+  /** Atomic guarded capability apply (§4.2): BEGIN IMMEDIATE; re-check pin;
+   *  sum RoC windows inside the transaction; reject-and-log over Δmax;
+   *  else record movement + update override. */
+  applyGuardedCapabilityUpdate(
+    provider: string,
+    model: string,
+    intent: string,
+    newScore: number,
+    deltaAbs: number,
+    nowIso: string,
+    rocMax24h: number,
+    rocMax7d: number,
+  ): { applied: boolean; reason: string; sampleCount: number } {
+    const run = this.db.transaction((): { applied: boolean; reason: string; sampleCount: number } => {
+      const row = this.db.prepare(
+        `SELECT score, sample_count, pinned FROM capability_overrides
+         WHERE provider = ? AND model = ? AND intent = ?`,
+      ).get(provider, model, intent) as { score: number; sample_count: number; pinned: number } | undefined;
+      if (row && row.pinned === 1) {
+        return { applied: false, reason: "pinned", sampleCount: row.sample_count };
+      }
+      const sampleCount = (row?.sample_count ?? 0);
+
+      const since24 = new Date(new Date(nowIso).getTime() - 86_400_000).toISOString();
+      const since7d = new Date(new Date(nowIso).getTime() - 7 * 86_400_000).toISOString();
+      const sum24 = this.sumCapabilityMovement(provider, model, intent, since24);
+      const sum7d = this.sumCapabilityMovement(provider, model, intent, since7d);
+      if (sum24 + deltaAbs > rocMax24h) {
+        return { applied: false, reason: "roc_24h", sampleCount };
+      }
+      if (sum7d + deltaAbs > rocMax7d) {
+        return { applied: false, reason: "roc_7d", sampleCount };
+      }
+
+      this.recordCapabilityMovement(provider, model, intent, deltaAbs, nowIso);
+      this.upsertCapabilityOverride(provider, model, intent, newScore, sampleCount + 1);
+      return { applied: true, reason: "applied", sampleCount: sampleCount + 1 };
+    });
+    return run.immediate();
   }
 
   // ─── Provider Spend Tracking ───
