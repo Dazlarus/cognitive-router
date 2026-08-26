@@ -27,6 +27,11 @@ import { raceHedgedRequests, hedgeRetryDelayMs, type HedgeCandidate } from "./he
 import { classifyFailure, computeFallbackDecision, providerBackoff } from "./failure_classifier.js";
 import { registryReadiness } from "./readiness.js";
 import { detectModalities, type Modality } from "./modality.js";
+import {
+  computeProxyDecisionSource,
+  decisionSourceCounters,
+  SELECTED_MODEL_HEADER,
+} from "./decision_source.js";
 
 const CHAT_ALIAS_MODEL = "CognitiveRouter:latest";
 const LEGACY_CHAT_ALIAS_MODEL = "CogRouter:latest";
@@ -795,16 +800,13 @@ export class ProxyServerStreaming {
     if (!this.initialized) throw new Error("Proxy not initialized");
     const isStreaming = request.stream === true;
 
-    // For streaming, open SSE immediately but do not send an empty assistant
-    // chunk. OpenClaw treats an empty assistant delta as an empty model answer.
-    if (isStreaming) {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-    }
+    // For streaming, SSE response headers are DEFERRED until the first write.
+    // Buffered streaming flushes nothing to the client before the checkpoint
+    // anyway, so this is not observable — and it lets the
+    // x-model-router-selected-model header name the model that actually served
+    // the request. OpenClaw still never sees an empty assistant delta: the
+    // first flushed chunk always carries real content. (This also fixes a
+    // latent ERR_HTTP_HEADERS_SENT on streaming MODALITY_UNSUPPORTED rejects.)
 
     // Classify intent
     const lastMessage = request.messages[request.messages.length - 1];
@@ -848,7 +850,11 @@ export class ProxyServerStreaming {
       estimatedTokens,
       requiredModalities: modalityResult.modalities,
     }, req?.headers?.["x-routing-profile"] as string | undefined);
-    const candidates = this.buildCandidateList(decision, request);
+    const builtCandidates = this.buildCandidateList(decision, request);
+    const candidates = builtCandidates.list;
+    const lastResortCandidate = builtCandidates.lastResortAppended
+      ? candidates[candidates.length - 1]
+      : null;
     const requestId = this.extractRequestId(request);
 
     if (decision) {
@@ -918,6 +924,38 @@ export class ProxyServerStreaming {
     const requestDeadlineMs = Date.now() + routerRequestTimeoutMs();
     let hedgeAttempted = false;
 
+    // ─── Decision-source observability (Switchyard §4) ───
+    // Runtime facts that determine how the serving model was chosen. The
+    // final source is classified exactly once per request, at its terminal
+    // outcome, and counted in /stats (stats.decisionSources).
+    const usesTools = requestUsesTools(request);
+    let circuitOrBackoffSkipped = false;
+    let contextGuardSkipped = false;
+    let attemptFailed = false;
+    const recordSource = (
+      served: boolean,
+      servedCandidate?: { provider: string; model: string } | null,
+    ): void => {
+      const source = computeProxyDecisionSource({
+        served,
+        routerSource: decision?.decisionSource ?? null,
+        usesTools,
+        contextGuardSkipped,
+        circuitOrBackoffSkipped,
+        attemptFailed,
+        servedByAppendedLastResort: Boolean(
+          servedCandidate &&
+          lastResortCandidate &&
+          servedCandidate.provider === lastResortCandidate.provider &&
+          servedCandidate.model === lastResortCandidate.model,
+        ),
+      });
+      decisionSourceCounters.increment(source);
+      logger.debug(
+        `decision_source=${source} served_by=${servedCandidate ? `${servedCandidate.provider}/${servedCandidate.model}` : "none"}`,
+      );
+    };
+
     for (let ci = 0; ci < candidates.length; ci++) {
       const candidate = candidates[ci];
       if (Date.now() >= requestDeadlineMs) {
@@ -940,6 +978,7 @@ export class ProxyServerStreaming {
       // Check circuit breaker
       if (!this.costTracker.isAvailable(candidate.provider)) {
         logger.debug(`Skipping ${candidate.provider} - circuit open`);
+        circuitOrBackoffSkipped = true;
         modelStrikes.set(candidateKey, providerAttemptLimit);
         continue;
       }
@@ -949,12 +988,14 @@ export class ProxyServerStreaming {
         const reason = providerBackoff.backoffReason(candidate.provider);
         const remaining = Math.round(providerBackoff.remainingMs(candidate.provider) / 1000);
         logger.debug(`Skipping ${candidate.provider} - backoff active (${remaining}s remaining: ${reason})`);
+        circuitOrBackoffSkipped = true;
         modelStrikes.set(candidateKey, providerAttemptLimit);
         continue;
       }
 
       if (!this.costTracker.isAvailable(candidate.provider, candidate.model)) {
         logger.debug(`Skipping ${candidateKey} - model circuit open`);
+        circuitOrBackoffSkipped = true;
         modelStrikes.set(candidateKey, strikes + 1);
         continue;
       }
@@ -966,6 +1007,7 @@ export class ProxyServerStreaming {
         logger.info(
           `Skipping ${candidate.provider}/${candidate.model} - request ~${estimatedTokens} tokens exceeds limit ${effectiveLimit}`,
         );
+        contextGuardSkipped = true;
         modelStrikes.set(candidate.provider, strikes + 1);
         continue;
       }
@@ -1045,6 +1087,10 @@ export class ProxyServerStreaming {
 
           // ── Checkpoint reached: flush all buffered chunks to client ──
           const durationMs = Date.now() - startTime;
+          recordSource(true, candidate);
+          // Open SSE headers now (deferred from request start) so the
+          // selected-model header names the model that actually served.
+          this.openSSE(res, candidate.model);
           for (const bufferedChunk of bufferedChunks) {
             this.writeSSE(res, bufferedChunk);
           }
@@ -1152,7 +1198,8 @@ export class ProxyServerStreaming {
         providerBackoff.clear(candidate.provider);
 
         response.model = CHAT_RESPONSE_MODEL;
-        res.writeHead(200, { "Content-Type": "application/json" });
+        recordSource(true, candidate);
+        res.writeHead(200, { "Content-Type": "application/json", [SELECTED_MODEL_HEADER]: candidate.model });
         res.end(JSON.stringify(response));
 
         // ─── Async LLM-as-judge feedback ───
@@ -1206,6 +1253,7 @@ export class ProxyServerStreaming {
         const outcome = isRateLimit || isQuota ? "rate_limit" : isTimeout ? "timeout" : isEmpty ? "empty" : "error";
 
         lastError = error;
+        attemptFailed = true;
         const newStrikes = strikes + 1;
         modelStrikes.set(candidateKey, newStrikes);
 
@@ -1356,7 +1404,8 @@ export class ProxyServerStreaming {
 
               // Send the winning response to client
               winResponse.model = CHAT_RESPONSE_MODEL;
-              res.writeHead(200, { "Content-Type": "application/json" });
+              recordSource(true, { provider: hedgeOutcome.winnerProvider, model: hedgeOutcome.winnerModel });
+              res.writeHead(200, { "Content-Type": "application/json", [SELECTED_MODEL_HEADER]: hedgeOutcome.winnerModel });
               res.end(JSON.stringify(winResponse));
               return;
             } catch (hedgeErr) {
@@ -1379,6 +1428,7 @@ export class ProxyServerStreaming {
     }
 
     // All providers exhausted
+    recordSource(false, null);
     const errMsg = sanitizeErrorForClient(lastError?.message ?? "unknown");
     if (isStreaming) {
       this.writeSSE(res, {
@@ -1636,7 +1686,22 @@ export class ProxyServerStreaming {
 
   // ─── Helpers ───
 
+  /** Open SSE response headers. Deferred until the first write so the
+   *  x-model-router-selected-model header can name the upstream model that
+   *  actually served the request (set before any stream data is flushed). */
+  private openSSE(res: http.ServerResponse, selectedModel?: string): void {
+    if (res.headersSent || res.writableEnded) return;
+    if (selectedModel) res.setHeader(SELECTED_MODEL_HEADER, selectedModel);
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+  }
+
   private writeSSE(res: http.ServerResponse, data: any): void {
+    this.openSSE(res);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   }
 
@@ -1671,8 +1736,9 @@ export class ProxyServerStreaming {
   private buildCandidateList(
     decision: Awaited<ReturnType<RoutingEngine["decide"]>>,
     request: ChatCompletionRequest,
-  ): Array<{ provider: string; model: string }> {
+  ): { list: Array<{ provider: string; model: string }>; lastResortAppended: boolean } {
     const candidates: Array<{ provider: string; model: string }> = [];
+    let lastResortAppended = false;
     const usesTools = requestUsesTools(request);
     const estimatedTokens = estimateTokenCount(request);
 
@@ -1825,9 +1891,10 @@ export class ProxyServerStreaming {
     const hasOllama = candidates.some((c) => c.provider === "ollama");
     if (!usesTools && !hasOllama) {
       candidates.push({ provider: "ollama", model: "gemma4:latest" });
+      lastResortAppended = true;
     }
 
-    return candidates;
+    return { list: candidates, lastResortAppended };
   }
 
   private readBody(req: http.IncomingMessage): Promise<string> {

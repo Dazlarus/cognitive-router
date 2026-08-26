@@ -2,6 +2,7 @@ import type { CognitiveRouterConfig } from "./config.js";
 import type { CostTracker } from "./cost_tracker.js";
 import type { ModelRegistry, ModelCapability } from "./model_registry.js";
 import { PrefixCache } from "./prefix_cache.js";
+import { DECISION_SOURCES, decisionSourceCounters } from "./decision_source.js";
 import {
   generationRoutingExclusionReason,
   isGenerationModel,
@@ -199,6 +200,11 @@ export function buildStatsPayload(
       weights,
       localVramLimitGb,
       intents: ROUTING_INTENTS,
+      decisionSources: {
+        taxonomy: [...DECISION_SOURCES],
+        sinceIso: decisionSourceCounters.sinceIso(),
+        counts: decisionSourceCounters.snapshot(),
+      },
       scoreFormula: "overall = capability*0.50 + reliability*0.25 + cost*0.15 + latency*0.10",
       fallbackModels: {
         openrouter: {

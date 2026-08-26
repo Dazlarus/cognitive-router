@@ -13,6 +13,7 @@ import { bucketForTokenCount, type SizeBucket } from "./cost_tracker.js";
 import type { BudgetTracker, CostEfficiency } from "./budget_tracker.js";
 import { OllamaWarmthChecker, type WarmthInfo } from "./ollama_warmth.js";
 import type { Modality } from "./modality.js";
+import { type DecisionSource } from "./decision_source.js";
 
 /** Machine-readable reason a candidate was excluded from scoring before
  *  the ranking stage. Clean, reusable vocabulary for decision logs — the
@@ -96,6 +97,11 @@ export interface RoutingDecision {
     requiredModalities?: Modality[];
     availableModalityModels?: string[];
   };
+  /** How this pick was made (fixed taxonomy, Switchyard §4). Set by the
+   *  router for paths it knows (scored winner, degraded context pick,
+   *  no-models fallback); the proxy computes the FINAL source once the
+   *  request completes and persists it in routing_decisions.decision_source. */
+  decisionSource?: DecisionSource;
 }
 
 /** Context window safety factor — models must have contextWindow * this >= estimatedTokens. */
@@ -190,6 +196,7 @@ export class RoutingEngine {
         scores: { capability: 1, reliability: 1, cost: 1, latency: 1 },
         overallScore: 1,
         rationale: `Manual override: ${override.reason ?? "user-configured"}`,
+        decisionSource: "scored_pick",
       };
     }
 
@@ -283,6 +290,7 @@ export class RoutingEngine {
         scores: { capability: 0, reliability: 0, cost: 1, latency: 0.5 },
         overallScore: 0,
         rationale: "Fallback — no models available",
+        decisionSource: "last_resort_local",
       };
     }
 
@@ -370,6 +378,7 @@ export class RoutingEngine {
             requiredModalities,
             availableModalityModels,
           },
+        decisionSource: "all_exhausted",
         };
       }
 
@@ -712,14 +721,26 @@ export class RoutingEngine {
         logger.debug(
           `Close call — picking cheaper: ${runnerUp.provider}/${runnerUp.model} over ${best.provider}/${best.model}`,
         );
-        if (contextFilter) runnerUp.contextFilter = contextFilter;
+        if (contextFilter) {
+          runnerUp.contextFilter = contextFilter;
+          if (contextFilter.allFilteredDegraded) {
+            runnerUp.decisionSource = "context_window_skip";
+          }
+        }
         if (modalityFilter) runnerUp.modalityFilter = modalityFilter;
+        runnerUp.decisionSource ??= best.decisionSource ?? "scored_pick";
         return runnerUp;
       }
     }
 
-    if (contextFilter) best.contextFilter = contextFilter;
+    if (contextFilter) {
+      best.contextFilter = contextFilter;
+      if (contextFilter.allFilteredDegraded) {
+        best.decisionSource = "context_window_skip";
+      }
+    }
     if (modalityFilter) best.modalityFilter = modalityFilter;
+    best.decisionSource ??= "scored_pick";
     logger.debug(
       `Winner: ${best.provider}/${best.model} (${best.overallScore.toFixed(3)}) — ${best.rationale}`,
     );
