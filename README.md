@@ -55,7 +55,7 @@ Cognitive Router fixes all of this by making routing decisions **per request**, 
 ### Build
 
 ```bash
-git clone https://github.com/dazwritescode/cognitive-router.git
+git clone https://github.com/Dazlarus/cognitive-router.git
 cd cognitive-router
 npm install
 npm run build
