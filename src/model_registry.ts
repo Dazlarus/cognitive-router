@@ -575,6 +575,29 @@ export class ModelRegistry {
 
   /** Load judge-adjusted scores from the database on startup. */
 
+  /** Counterfactual capability blend — what the cell WOULD become if this
+   *  judged score were applied (α-blend + clamp), without touching any state.
+   *  Null when the model/intent cell is unknown (no baseline → no counterfactual). */
+  private computeWouldBe(
+    provider: string,
+    model: string,
+    intent: string,
+    normalizedScore: number,
+  ): { baseline: number; n: number; preClamp: number; wouldBe: number } | null {
+    const cap = this.models.get(`${provider}/${model}`);
+    const dim = ModelRegistry.INTENT_MAP[intent];
+    if (!cap || !dim) return null;
+    const existing = typeof this.db.getCapabilityOverride === "function"
+      ? this.db.getCapabilityOverride(provider, model, intent)
+      : null;
+    const baseline = existing?.score ?? cap.capabilities[dim];
+    const n = existing?.sampleCount ?? this.sampleCounts.get(`${provider}/${model}/${intent}`) ?? 0;
+    const alpha = 0.25;
+    const preClamp = baseline * (1 - alpha) + normalizedScore * alpha;
+    const wouldBe = clampCapability(preClamp);
+    return { baseline, n, preClamp, wouldBe };
+  }
+
   /**
    * Full Phase-1 judged-score pipeline (§4.1): attribution gate → quarantine
    * → guardrails → apply, with shadow-mode logging. Returns the outcome.
@@ -631,6 +654,12 @@ export class ModelRegistry {
       }
     };
 
+    // Would-be counterfactual, computed up front so EVERY shadow row —
+    // including no-apply paths (canary, Arm A, Arm B) — records the value
+    // delta the gate-arming decision needs. Null only when the cell is
+    // unknown (no baseline → no counterfactual exists).
+    const cf = this.computeWouldBe(provider, model, intent, normalizedScore);
+
     // Post-application canary (§4.1): ≥5 identical normalized notes historically
     // (every event is logged with its hash, regardless of arm) → quarantine the
     // pair + alert. Repeated identical verdicts mean the task mix is broken,
@@ -648,14 +677,14 @@ export class ModelRegistry {
         `(task mix suspect, not model). Pair quarantined.`
       );
       logEval(true, "quarantine_canary", v.arm);
-      logShadow("quarantine_canary", v.arm, null, null, priorCount);
+      logShadow("quarantine_canary", v.arm, cf?.preClamp ?? null, cf?.wouldBe ?? null, cf?.n ?? priorCount);
       return { applied: false, arm: v.arm, reason: "quarantine_canary", quarantined: true, wouldBe: null };
     }
 
     // Arm A — provider-attributable fault: reliability trackers only, never capability.
     if (v.arm === "A") {
       logEval(true, v.reason, "A");
-      logShadow(v.reason, "A", null, null, null);
+      logShadow(v.reason, "A", cf?.preClamp ?? null, cf?.wouldBe ?? null, cf?.n ?? null);
       logger.info(`Judge gate Arm A (${v.reason}): ${provider}/${model} [${intent}] — reliability only, no capability write.`);
       return { applied: false, arm: "A", reason: v.reason, quarantined: false, wouldBe: null };
     }
@@ -663,28 +692,18 @@ export class ModelRegistry {
     // Arm B — low/missing classifier confidence or malformed verdict: no_apply.
     if (v.arm === "B") {
       logEval(true, v.reason, "B");
-      logShadow(v.reason, "B", null, null, null);
+      logShadow(v.reason, "B", cf?.preClamp ?? null, cf?.wouldBe ?? null, cf?.n ?? null);
       logger.info(`Judge gate Arm B (${v.reason}): ${provider}/${model} [${intent}] — no_apply.`);
       return { applied: false, arm: "B", reason: v.reason, quarantined: false, wouldBe: null };
     }
 
     // Arm C — model-attributable: quarantine checks, then guardrails.
-    const cap = this.models.get(`${provider}/${model}`);
-    const dim = ModelRegistry.INTENT_MAP[intent];
-    if (!cap || !dim) {
+    if (!cf) {
       logEval(true, "unknown_model_or_intent", "C");
       logShadow("unknown_model_or_intent", "C", null, null, null);
       return { applied: false, arm: "C", reason: "unknown_model_or_intent", quarantined: false, wouldBe: null };
     }
-
-    const existing = typeof this.db.getCapabilityOverride === "function"
-      ? this.db.getCapabilityOverride(provider, model, intent)
-      : null;
-    const baseline = existing?.score ?? cap.capabilities[dim];
-    const n = existing?.sampleCount ?? this.sampleCounts.get(`${provider}/${model}/${intent}`) ?? 0;
-    const alpha = 0.25;
-    const preClamp = baseline * (1 - alpha) + normalizedScore * alpha;
-    const wouldBe = clampCapability(preClamp);
+    const { baseline, n, preClamp, wouldBe } = cf;
 
     // Quarantined pair already? Never apply.
     if (typeof this.db.isPairQuarantined === "function" && this.db.isPairQuarantined(provider, model, intent)) {

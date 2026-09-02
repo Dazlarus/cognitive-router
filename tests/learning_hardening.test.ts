@@ -208,6 +208,66 @@ describe("learning hardening — attribution gate arms", () => {
     assert.equal(ov, null);
   });
 
+  it("shadow rows: no-apply paths (Arm B, Arm A, canary) still log would-be counterfactual", () => {
+    setEnv("ROUTER_LEARNING_SHADOW_MODE", "true");
+    const latest = () => db.getDb().prepare(
+      `SELECT rejection_reason, pre_clamp, would_be_value, sample_n FROM shadow_decisions ORDER BY id DESC LIMIT 1`,
+    ).get() as any;
+    const expected = (baseline: number, normalized: number) =>
+      Math.min(0.98, Math.max(0.05, baseline * 0.75 + normalized * 0.25));
+
+    // Arm B — low confidence: rejected, but the counterfactual must be recorded.
+    const baseB = registry.getCapabilityScore("zai", "glm-5.2", "coding");
+    registry.applyJudgedScore("zai", "glm-5.2", "coding", 0.2, {
+      rawScore: 2, judgeNote: "irrelevant to the math task", judgeModelId: "t/j", confidence: 0.62,
+    });
+    let row = latest();
+    assert.equal(row.rejection_reason, "low_confidence");
+    assert.ok(row.pre_clamp !== null, "Arm B shadow row must carry pre_clamp");
+    assert.ok(row.would_be_value !== null, "Arm B shadow row must carry would_be_value");
+    assert.ok(Math.abs(row.would_be_value - expected(baseB, 0.2)) < 1e-9);
+    assert.equal(row.sample_n, 0, "sample_n = capability-cell sample count at decision time");
+
+    // Arm A — provider-attributable truncation: same counterfactual requirement.
+    const baseA = registry.getCapabilityScore("zai", "glm-5.2", "coding");
+    registry.applyJudgedScore("zai", "glm-5.2", "coding", 0.2, {
+      rawScore: 2, judgeNote: "truncated output here", judgeModelId: "t/j", confidence: 0.95, truncated: true,
+    });
+    row = latest();
+    const expectedA = guards.classifyAttribution({ truncated: true, malformed: false, confidence: 0.95 }).reason;
+    assert.equal(row.rejection_reason, expectedA);
+    assert.ok(row.would_be_value !== null, "Arm A shadow row must carry would_be_value");
+    assert.ok(Math.abs(row.would_be_value - expected(baseA, 0.2)) < 1e-9);
+
+    // Quarantine canary — fires before arm dispatch; row must still carry values.
+    const note = "The response is completely irrelevant to the math task and appears to be a system status log.";
+    for (let i = 0; i < 5; i++) {
+      db.recordJudgeEvaluationEx({
+        provider: "zai", model: "glm-5.2", intent: "coding",
+        judgeScore: 0, judgeNote: note, judgeModel: "hist/judge",
+        noApply: false, gateArm: null, gateReason: null,
+      });
+    }
+    const baseQ = registry.getCapabilityScore("zai", "glm-5.2", "coding");
+    const q = registry.applyJudgedScore("zai", "glm-5.2", "coding", 0.0, {
+      rawScore: 0, judgeNote: note.toUpperCase() + "!!", judgeModelId: "t/j", confidence: 0.9,
+    });
+    assert.equal(q.reason, "quarantine_canary");
+    row = latest();
+    assert.equal(row.rejection_reason, "quarantine_canary");
+    assert.ok(row.pre_clamp !== null, "canary shadow row must carry pre_clamp");
+    assert.ok(row.would_be_value !== null, "canary shadow row must carry would_be_value");
+    assert.ok(Math.abs(row.would_be_value - expected(baseQ, 0.0)) < 1e-9);
+
+    // Unknown cell — no baseline exists: NULL is correct, not an instrumentation gap.
+    const u = registry.applyJudgedScore("zai", "nonexistent-model", "coding", 0.5, {
+      rawScore: 5, judgeNote: "ok", judgeModelId: "t/j", confidence: 0.95,
+    });
+    assert.equal(u.reason, "unknown_model_or_intent");
+    row = latest();
+    assert.equal(row.would_be_value, null, "unknown cell has no counterfactual");
+  });
+
   it("Arm C live (shadow off): applies through guardrails", () => {
     setEnv("ROUTER_LEARNING_SHADOW_MODE", "false");
     const before = registry.getCapabilityScore("zai", "glm-5.2", "coding");
