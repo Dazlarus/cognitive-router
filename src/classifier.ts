@@ -80,6 +80,33 @@ const INTENT_PROTOTYPES: Record<string, string[]> = {
   ],
 };
 
+/** Coerce arbitrary LLM message content into a safe classification string.
+ *  Handles OpenAI content-parts arrays, plain objects, null/undefined.
+ *  Truncates so embedding/keyword paths never see oversized inputs
+ *  (provider 400s) or non-strings (charCodeAt crash class).
+ *  Added 2026-09-03 hardening — TWI giant-request incidents. */
+function toClassifiableText(input: unknown, maxChars = 8_000): string {
+  let text: string;
+  if (typeof input === "string") {
+    text = input;
+  } else if (Array.isArray(input)) {
+    text = input
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+          return (part as { text: string }).text;
+        }
+        return "";
+      })
+      .join(" ");
+  } else if (input !== null && input !== undefined && typeof input === "object") {
+    text = JSON.stringify(input);
+  } else {
+    text = input == null ? "" : String(input);
+  }
+  return text.length > maxChars ? text.slice(0, maxChars) : text;
+}
+
 export class IntentClassifier {
   private prototypes: Map<string, number[][]> = new Map();
   private initialized = false;
@@ -120,14 +147,19 @@ export class IntentClassifier {
       await this.initialize(embedFn);
     }
 
+    // Hardening 2026-09-03: giant/structured prompts are coerced + truncated
+    // before embedding — prevents provider 400-spam and the fallback crash
+    // class on oversized inputs.
+    const safePrompt = toClassifiableText(prompt);
+
     // Phase 1: Embedding similarity against prototypes
     // If the embedding call fails or times out, fall back to keyword matching
     let promptEmbedding: number[];
     try {
-      promptEmbedding = await embedFn(prompt);
+      promptEmbedding = await embedFn(safePrompt);
     } catch (err) {
       logger.warn(`Embedding failed — using keyword fallback: ${err instanceof Error ? err.message : err}`);
-      return this.classifyByKeyword(prompt);
+      return this.classifyByKeyword(safePrompt);
     }
 
     const scores = this.scoreAllIntents(promptEmbedding);
@@ -162,7 +194,7 @@ export class IntentClassifier {
   /** Keyword-based fallback when embeddings are unavailable.
    *  Not as accurate but fast and never blocks. */
   classifyByKeyword(prompt: string): Classification {
-    const lower = prompt.toLowerCase();
+    const lower = toClassifiableText(prompt).toLowerCase();
     const keywords: Record<string, string[]> = {
       coding: ["function", "code", "bug", "refactor", "test", "api", "class", "import", "error", "compile"],
       research: ["research", "compare", "latest", "find", "investigate", "papers", "developments"],

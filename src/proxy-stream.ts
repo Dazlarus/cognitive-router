@@ -830,6 +830,31 @@ export class ProxyServerStreaming {
     // Estimate prompt token count for routing + context window guard
     const estimatedTokens = estimateTokenCount(request);
 
+    // Hardening 2026-09-03: requests that exceed EVERY provider's effective
+    // input limit get an immediate 413 instead of falling through the
+    // pipeline (previously: skip-cascade with hang/crash potential).
+    const maxAnyProviderLimit = Math.max(
+      ...Object.values(PROVIDER_EFFECTIVE_INPUT_LIMITS),
+    );
+    if (estimatedTokens > maxAnyProviderLimit) {
+      const message =
+        `request ~${estimatedTokens} tokens exceeds the largest provider input limit ` +
+        `(${maxAnyProviderLimit}); trim the conversation or reset the session`;
+      logger.warn(message);
+      if (!res.headersSent) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: {
+            message,
+            type: "request_too_large",
+            estimatedTokens,
+            maxProviderLimit: maxAnyProviderLimit,
+          },
+        }));
+      }
+      return;
+    }
+
     // ─── Anomaly detection: flag token spikes (>2x rolling average) ───
     const anomaly = this.budgetTracker.detectAnomaly(estimatedTokens);
     if (anomaly.isAnomalous) {
@@ -1937,9 +1962,13 @@ export class ProxyServerStreaming {
   }
 
   private hashPrompt(prompt: string): string {
+    // Defensive: OpenClaw 2026.8.x can deliver message content as structured
+    // blocks (arrays/objects), not always a plain string. Coerce before hashing
+    // - a 500 here kills the whole request (charCodeAt crash, Aug/Sep 2026 incident).
+    const text = typeof prompt === "string" ? prompt : JSON.stringify(prompt ?? "");
     let hash = 0;
-    for (let i = 0; i < prompt.length; i++) {
-      hash = Math.imul(31, hash) + prompt.charCodeAt(i) | 0;
+    for (let i = 0; i < text.length; i++) {
+      hash = Math.imul(31, hash) + text.charCodeAt(i) | 0;
     }
     return hash.toString(16);
   }
