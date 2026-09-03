@@ -162,7 +162,7 @@ const CONTEXT_SAFETY_MARGIN = 1 - Number.parseFloat(
   process.env.ROUTER_CONTEXT_SAFETY_MARGIN ?? "0.20",
 );
 
-function getEffectiveInputLimit(provider: string, model: string): number {
+function getEffectiveInputLimit(provider: string, model: string, modelWindow?: number): number {
   const raw = (() => {
     if (provider === "openrouter") {
       const isFreeModel = model.endsWith(":free");
@@ -171,7 +171,12 @@ function getEffectiveInputLimit(provider: string, model: string): number {
       }
       return 256_000;
     }
-    return PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
+    const providerDefault = PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
+    // Context gate (2026-09-03): a registry-known per-model window LARGER than
+    // the provider default lifts this model's ceiling (glm-5.2 1M); smaller or
+    // unknown windows keep the provider default. Provider map stays the
+    // conservative baseline for every other model.
+    return Math.max(providerDefault, modelWindow ?? 0);
   })();
   return Math.floor(raw * CONTEXT_SAFETY_MARGIN);
 }
@@ -1027,7 +1032,10 @@ export class ProxyServerStreaming {
 
       // Context window guard: skip providers whose effective input limit
       // is too small for this request. This saves a wasted API call + timeout.
-      const effectiveLimit = getEffectiveInputLimit(candidate.provider, candidate.model);
+      const candidateWindow = this.modelRegistry
+        .getAvailableModels([candidate.provider])
+        .find((m) => m.model === candidate.model)?.contextWindow;
+      const effectiveLimit = getEffectiveInputLimit(candidate.provider, candidate.model, candidateWindow);
       if (estimatedTokens > effectiveLimit) {
         logger.info(
           `Skipping ${candidate.provider}/${candidate.model} - request ~${estimatedTokens} tokens exceeds limit ${effectiveLimit}`,
@@ -1791,11 +1799,18 @@ export class ProxyServerStreaming {
         continue;
       }
 
-      // Context guard: skip entire provider if its effective limit is too small
-      const providerLimit = PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
-      if (estimatedTokens > providerLimit) {
+      // Context gate (2026-09-03): skip entire provider only when NO model in
+      // it fits — a big-window model (glm-5.2 1M) keeps the provider alive
+      // for oversized requests instead of skipping it wholesale.
+      const providerDefault = PROVIDER_EFFECTIVE_INPUT_LIMITS[provider] ?? 128_000;
+      const providerModels = this.modelRegistry.getAvailableModels([provider]);
+      const bestWindow = Math.max(
+        providerDefault,
+        ...providerModels.map((m) => m.contextWindow ?? 0),
+      );
+      if (estimatedTokens > bestWindow) {
         logger.info(
-          `Skipping ${provider} - request ~${estimatedTokens} tokens exceeds provider limit ${providerLimit}`,
+          `Skipping ${provider} - request ~${estimatedTokens} tokens exceeds provider limit ${bestWindow}`,
         );
         continue;
       }
@@ -1806,6 +1821,13 @@ export class ProxyServerStreaming {
         .getAvailableModels([provider])
         .filter((m) => {
           if (m.isLocal && m.vramRequiredGb && m.vramRequiredGb > (this.config.localVramLimitGb ?? 11)) {
+            return false;
+          }
+          // Context gate (2026-09-03): only context-eligible models become
+          // candidates — oversized requests fall through to big-window models
+          // (glm-5.2 1M) instead of dying on the default pick.
+          const mWindow = m.contextWindow ?? 0;
+          if (mWindow > 0 && estimatedTokens > Math.floor(mWindow * CONTEXT_SAFETY_MARGIN)) {
             return false;
           }
           if (!isGenerationModel(m.provider, m.model)) {

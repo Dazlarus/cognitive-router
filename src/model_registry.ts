@@ -110,7 +110,9 @@ const SEED_MODELS: ModelCapability[] = [
 
   // GLM-5.x - top tier reasoning
   // ✅ Coding Plan eligible (Opus-tier, 3× peak / 2× off-peak quota, 1× promo through Sep 2026)
-  makeModel("zai", "glm-5.2", 202_800,
+  // Context-gate routing (Daz, 2026-09-03): glm-5.2 is the 1M-context class —
+  // oversized requests route to it instead of skipping zai wholesale.
+  makeModel("zai", "glm-5.2", 1_000_000,
     { coding: 0.88, reasoning: 0.92, creative: 0.84, math: 0.90, analysis: 0.91, conversation: 0.87, retrieval: 0.85, science: 0.93, business: 0.88, summary: 0.87 },
     { input: 0, output: 0, usageMultiplier: 1, planEligible: true },
   ),
