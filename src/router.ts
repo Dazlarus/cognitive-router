@@ -214,6 +214,24 @@ export class RoutingEngine {
       );
     }
 
+    // ─── Tier constraint: ":fast" alias requests constrain to speed-tier models ───
+    // (flash/mini/turbo/lite/gemma families + locals). Falls back to the full
+    // candidate set when the speed tier is empty so utility work never hard-fails.
+    const modelTier: string | undefined = context?.modelTier;
+    if (modelTier === "fast") {
+      const fastSet = candidates.filter(
+        (m) => /flash|mini|turbo|lite|gemma/i.test(m.model) || m.isLocal,
+      );
+      if (fastSet.length > 0) {
+        logger.info(
+          `Tier=fast: routing constrained to ${fastSet.length} speed-tier candidates.`,
+        );
+        candidates = fastSet;
+      } else {
+        logger.warn("Tier=fast: no speed-tier candidates available — using full candidate set.");
+      }
+    }
+
     const requiredMods: string[] = context?.requiredModalities ?? [];
     const nonTextMods = requiredMods.filter((r) => r !== "text");
 
@@ -523,6 +541,36 @@ export class RoutingEngine {
       w.capability = Math.max(0, w.capability - reliabilityIncrease);
     }
 
+    // ─── Effort lever (OpenClaw thinking / reasoning_effort request param) ───
+    // effort=high    → capability matters more; cost & latency matter less
+    // effort=low/none → cost & latency matter more; capability matters less
+    const effortLevel: string | undefined = context?.effortLevel;
+    const speedMode: string | undefined = context?.speedMode;
+    const leverTags: string[] = [];
+    if (effortLevel === "high") {
+      w.capability *= 1.45;
+      w.cost *= 0.60;
+      w.latency *= 0.75;
+      leverTags.push("effort=high");
+    } else if (effortLevel === "low" || effortLevel === "none") {
+      w.capability *= 0.70;
+      w.cost *= 1.50;
+      w.latency *= 1.40;
+      leverTags.push(`effort=${effortLevel}`);
+    }
+    // ─── Speed lever (OpenClaw "speed": "fast" request param) ───
+    // Latency starts mattering more — better for conversational turns.
+    if (speedMode === "fast") {
+      w.latency *= 2.0;
+      w.capability *= 0.85;
+      w.cost *= 1.20;
+      leverTags.push("speed=fast");
+    }
+    if (modelTier === "fast") leverTags.push("tier=fast");
+    if (leverTags.length > 0) {
+      logger.info(`Routing levers active: ${leverTags.join(" ")}`);
+    }
+
     const scored: RoutingDecision[] = candidates.map((modelEntry) => {
       // Phase-1: UCB exploration read path (learned + k/√n; §4.2). While the
       // learning shadow window is ON this returns the plain learned score —
@@ -640,6 +688,7 @@ export class RoutingEngine {
         warmthAdjust; // additive warmth adjustment
 
       const rationaleParts = [
+        ...leverTags,
         `cap=${capabilityScore.toFixed(2)}`,
         `rel=${reliabilityScore.toFixed(2)}`,
         `cost=${costScore.toFixed(2)}`,

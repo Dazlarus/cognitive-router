@@ -14,7 +14,7 @@ import { DBService } from "./db_service.js";
 import { CostTracker } from "./cost_tracker.js";
 import { ModelRegistry } from "./model_registry.js";
 import { loadConfig, type CognitiveRouterConfig } from "./config.js";
-import { getProvider } from "./providers.js";
+import { getProvider, extractThinkingLevel, extractSpeedMode } from "./providers.js";
 import { loadProjectEnv } from "./env.js";
 import { buildStatsPayload } from "./stats.js";
 import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
@@ -77,6 +77,7 @@ export interface ChatCompletionRequest {
   thinking?: any;
   reasoning?: any;
   reasoning_effort?: string;
+  speed?: string;
   [key: string]: any;
 }
 
@@ -92,18 +93,22 @@ export interface ChatCompletionRequest {
 let _tiktoken: { encode(text: string): number[] } | null = null;
 let _tiktokenLoadFailed = false;
 
+// ESM-safe loader: this package compiles to ESM ("type": "module"), so require()
+// is undefined in the bundle. Load via dynamic import at module init so
+// getTiktoken() stays synchronous for callers.
+void (async () => {
+  try {
+    const { getEncoding } = await import("js-tiktoken");
+    _tiktoken = getEncoding("cl100k_base");
+  } catch (e) {
+    _tiktokenLoadFailed = true;
+    logger.warn(`tiktoken load failed, falling back to char estimation: ${e instanceof Error ? e.message : e}`);
+  }
+})();
+
 function getTiktoken(): { encode(text: string): number[] } | null {
   if (_tiktokenLoadFailed) return null;
-  if (_tiktoken) return _tiktoken;
-  try {
-    const { Tiktoken } = require("js-tiktoken");
-    _tiktoken = new (Tiktoken as any)(undefined as any, [] as any);
-    return _tiktoken;
-  } catch (e) {
-    logger.warn(`tiktoken load failed, falling back to char estimation: ${e instanceof Error ? e.message : e}`);
-    _tiktokenLoadFailed = true;
-    return null;
-  }
+  return _tiktoken;
 }
 
 export function estimateTokenCount(request: ChatCompletionRequest): number {
@@ -876,9 +881,16 @@ export class ProxyServerStreaming {
     }
 
     // Build candidate list - pass estimated tokens and required modalities for routing
+    const requestTier =
+      typeof request.model === "string" && request.model.toLowerCase().endsWith(":fast")
+        ? "fast"
+        : undefined;
     const decision = await this.router.decide(classification, sessionKey, {
       estimatedTokens,
       requiredModalities: modalityResult.modalities,
+      effortLevel: extractThinkingLevel(request),
+      speedMode: extractSpeedMode(request),
+      modelTier: requestTier,
     }, req?.headers?.["x-routing-profile"] as string | undefined);
     const builtCandidates = this.buildCandidateList(decision, request);
     const candidates = builtCandidates.list;

@@ -22,12 +22,13 @@ export interface ChatCompletionRequest {
   thinking?: any;
   reasoning?: any;
   reasoning_effort?: string;
+  speed?: string;
   [key: string]: any;
 }
 
 // Thinking/Reasoning helpers — translate OpenClaw's thinking param to each provider's format
 
-function extractThinkingLevel(request: ChatCompletionRequest): "none" | "low" | "medium" | "high" {
+export function extractThinkingLevel(request: ChatCompletionRequest): "none" | "low" | "medium" | "high" {
   if (request.thinking) {
     if (typeof request.thinking === "string") {
       const v = request.thinking.toLowerCase();
@@ -60,6 +61,15 @@ function extractThinkingLevel(request: ChatCompletionRequest): "none" | "low" | 
     if (typeof request.reasoning === "object") return (request.reasoning.effort ?? "medium").toLowerCase() as any;
   }
   return "none";
+}
+
+export type SpeedMode = "normal" | "fast";
+
+/** Read OpenClaw's request-level speed hint (wire format: speed: "fast"). */
+export function extractSpeedMode(request: ChatCompletionRequest): SpeedMode {
+  const v = typeof request.speed === "string" ? request.speed.toLowerCase() : "";
+  if (v === "fast" || v === "priority" || v === "turbo") return "fast";
+  return "normal";
 }
 
 function envTimeoutMs(name: string, fallback: number): number {
@@ -130,7 +140,7 @@ function buildGeminiThinking(level: string): any {
 }
 
 function stripThinking(request: ChatCompletionRequest): ChatCompletionRequest {
-  const { thinking, reasoning, reasoning_effort, ...rest } = request;
+  const { thinking, reasoning, reasoning_effort, speed, ...rest } = request;
   return rest as ChatCompletionRequest;
 }
 
