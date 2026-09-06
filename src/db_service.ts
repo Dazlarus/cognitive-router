@@ -1573,6 +1573,23 @@ export class DBService {
     return rows;
   }
 
+  /** Delete all verdict rows for a pair (either stored direction).
+   *  Used by comparePair's failure path: a pair that died mid-comparison
+   *  must not leave partial rounds behind — a later retry would collapse
+   *  them into a majority computed over fewer, order-biased rounds. */
+  deleteBenchmarkVerdicts(
+    modelA: string,
+    modelB: string,
+    intent: string,
+    promptGeneration: string,
+  ): void {
+    this.db.prepare(`
+      DELETE FROM benchmark_verdicts
+      WHERE intent = ? AND prompt_generation = ?
+        AND ((model_a = ? AND model_b = ?) OR (model_a = ? AND model_b = ?))
+    `).run(intent, promptGeneration, modelA, modelB, modelB, modelA);
+  }
+
   /** Distinct model keys known to the ladder for an intent + generation. */
   getLadderKeys(intent: string, promptGeneration: string): string[] {
     const rows = this.db.prepare(`

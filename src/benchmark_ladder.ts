@@ -209,36 +209,46 @@ export async function comparePair(
   const bKey = encodeKey(b);
   const roundVerdicts: Verdict[] = [];
 
-  for (let r = 0; r < rounds; r++) {
-    const prompt = prompts[r % prompts.length];
-    const [ra, rb] = await Promise.all([
-      deps.callModel(a, prompt),
-      deps.callModel(b, prompt),
-    ]);
-    const { first, swapped, round } = await askRound(deps.judge, prompt, ra, rb, a, b);
-    deps.db.insertBenchmarkVerdict({
-      modelA: aKey,
-      modelB: bKey,
-      intent,
-      promptGeneration: PROMPT_GENERATION,
-      round: r,
-      swapOrder: 0,
-      verdict: first,
-    });
-    deps.db.insertBenchmarkVerdict({
-      modelA: aKey,
-      modelB: bKey,
-      intent,
-      promptGeneration: PROMPT_GENERATION,
-      round: r,
-      swapOrder: 1,
-      verdict: swapped, // stored from A's perspective, flag marks the swap
-    });
-    roundVerdicts.push(round);
-    logger.debug(
-      `bench ladder [${intent}] ${aKey} vs ${bKey} round ${r}: ${round} ` +
-        `(first=${first} swapped=${swapped})`,
-    );
+  // Failure path: a pair that dies mid-comparison (dead generator, judge
+  // outage) must leave NO partial rounds behind — a later retry would
+  // collapse them into a majority computed over fewer, order-biased rounds.
+  // Earlier completed rounds are deleted too: the retry re-spends them,
+  // the honest price of a clean verdict.
+  try {
+    for (let r = 0; r < rounds; r++) {
+      const prompt = prompts[r % prompts.length];
+      const [ra, rb] = await Promise.all([
+        deps.callModel(a, prompt),
+        deps.callModel(b, prompt),
+      ]);
+      const { first, swapped, round } = await askRound(deps.judge, prompt, ra, rb, a, b);
+      deps.db.insertBenchmarkVerdict({
+        modelA: aKey,
+        modelB: bKey,
+        intent,
+        promptGeneration: PROMPT_GENERATION,
+        round: r,
+        swapOrder: 0,
+        verdict: first,
+      });
+      deps.db.insertBenchmarkVerdict({
+        modelA: aKey,
+        modelB: bKey,
+        intent,
+        promptGeneration: PROMPT_GENERATION,
+        round: r,
+        swapOrder: 1,
+        verdict: swapped, // stored from A's perspective, flag marks the swap
+      });
+      roundVerdicts.push(round);
+      logger.debug(
+        `bench ladder [${intent}] ${aKey} vs ${bKey} round ${r}: ${round} ` +
+          `(first=${first} swapped=${swapped})`,
+      );
+    }
+  } catch (err) {
+    deps.db.deleteBenchmarkVerdicts?.(aKey, bKey, intent, PROMPT_GENERATION);
+    throw err;
   }
 
   const result = majority(roundVerdicts);

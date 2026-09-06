@@ -79,10 +79,11 @@ export function collectBenchable(registry: ModelRegistry): BenchableIdentity[] {
 
   for (const m of registry.getAllModels()) {
     if (isEmbeddingOnlyModel(m.provider, m.model)) continue;
-    // Meta-router slugs (openrouter/auto*) are not real identities: they
-    // delegate to whatever underlying model OpenRouter picks, so benching
-    // them measures a moving target at unknown cost.
-    if (m.provider === "openrouter" && /^auto/i.test(m.model)) continue;
+    // Meta-router slugs are not real identities: they delegate to whatever
+    // underlying model the router picks (moving target, unknown cost).
+    // OpenRouter lists some with the vendor prefix baked in
+    // ("openrouter/auto", "openrouter/auto-beta"), some bare ("auto-beta").
+    if (m.provider === "openrouter" && /(?:^|\/)auto(?=-|$)/i.test(m.model)) continue;
     const priced = m.costPer1kInput !== undefined && m.costPer1kOutput !== undefined;
     if (!m.isLocal && !priced) continue; // quarantined remote
 
@@ -200,47 +201,57 @@ export async function benchPass(
     1,
     parseInt(process.env.ROUTER_BENCH_MAX_PER_PASS ?? "1", 10) || 1,
   );
-  const chosen = pending[0];
-  const { makeModelCaller, makeJudgeCaller } = await import("./benchmark_wiring.js");
-  const deps = {
-    db,
-    callModel: makeModelCaller(identityResolver(chosen)),
-    judge: makeJudgeCaller(),
-    rounds: opts.rounds,
-  };
+  void maxPerPass; // admission cap is 1 per pass; attempts below may exceed it
 
-  try {
-    const ladder = db.getLadderKeys(BENCH_INTENT, PROMPT_GENERATION);
-    const { comparisons } = await insertIntoLadder(
-      deps,
-      ladder,
-      chosen.key,
-      BENCH_INTENT,
-    );
-    // extraKeys admits the newcomer even with zero comparisons (cold-start
-    // insert into an empty ladder compares against nothing).
-    const rebuilt = rebuildLadder(db, BENCH_INTENT, PROMPT_GENERATION, [
-      encodeKey(chosen.key),
-    ]);
-    db.replaceLadder(BENCH_INTENT, PROMPT_GENERATION, rebuilt);
-    logger.info(
-      `bench pass (${trigger}): inserted ${encodeKey(chosen.key)} at rank ` +
-        `${(rebuilt.find((e) => e.modelKey === encodeKey(chosen.key))?.rank) ?? "?"}, ` +
-        `ladder now ${rebuilt.length} identities`,
-    );
-    return {
-      ...base,
-      benched: encodeKey(chosen.key),
-      pendingAfter: pendingIdentities(db, registry).length,
-      ladderSize: rebuilt.length,
-      comparisons,
+  // A dead generator (free-tier corpse, observed live: cohere free tier)
+  // must not stall the cheapest-first queue forever: try up to 3 pending
+  // identities per pass, but admit at most one. Failed attempts leave no
+  // verdict rows (comparePair deletes partials), so they stay pending.
+  const MAX_ATTEMPTS = 3;
+  let lastError = "";
+  for (let attempt = 0; attempt < Math.min(MAX_ATTEMPTS, pending.length); attempt++) {
+    const chosen = pending[attempt];
+    const { makeModelCaller, makeJudgeCaller } = await import("./benchmark_wiring.js");
+    const deps = {
+      db,
+      callModel: makeModelCaller(identityResolver(chosen)),
+      judge: makeJudgeCaller(),
+      rounds: opts.rounds,
     };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.warn(`bench pass (${trigger}) failed for ${encodeKey(chosen.key)}: ${message}`);
-    return { ...base, error: message };
+
+    try {
+      const ladder = db.getLadderKeys(BENCH_INTENT, PROMPT_GENERATION);
+      const { comparisons } = await insertIntoLadder(
+        deps,
+        ladder,
+        chosen.key,
+        BENCH_INTENT,
+      );
+      // extraKeys admits the newcomer even with zero comparisons (cold-start
+      // insert into an empty ladder compares against nothing).
+      const rebuilt = rebuildLadder(db, BENCH_INTENT, PROMPT_GENERATION, [
+        encodeKey(chosen.key),
+      ]);
+      db.replaceLadder(BENCH_INTENT, PROMPT_GENERATION, rebuilt);
+      logger.info(
+        `bench pass (${trigger}): inserted ${encodeKey(chosen.key)} at rank ` +
+          `${(rebuilt.find((e) => e.modelKey === encodeKey(chosen.key))?.rank) ?? "?"}, ` +
+          `ladder now ${rebuilt.length} identities`,
+      );
+      return {
+        ...base,
+        benched: encodeKey(chosen.key),
+        pendingAfter: pendingIdentities(db, registry).length,
+        ladderSize: rebuilt.length,
+        comparisons,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      lastError = message;
+      logger.warn(`bench pass (${trigger}) failed for ${encodeKey(chosen.key)}: ${message}`);
+    }
   }
-  void maxPerPass;
+  return { ...base, error: lastError || "all attempts failed" };
 }
 
 // ---------- canary (Layer 3) ----------
