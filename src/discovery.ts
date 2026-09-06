@@ -41,12 +41,20 @@ export interface DiscoverySummary {
 /** Gemini listing excludes non-chat experiment families. */
 const GEMINI_EXCLUDE = /embedding|aqa|imagen|tts|veo|native-audio/i;
 
+/** OpenClaw's public model catalog — maintained multi-provider pricing
+ *  (13.7k+ entries, refreshed upstream ~daily). Read-only GET, no user data
+ *  leaves the machine. Override for mirrors/offline via env. */
+const PRICING_CATALOG_URL =
+  process.env.ROUTER_PRICING_CATALOG_URL ??
+  "https://catalog.openclaw.ai/models/v1/catalog.json";
+
 export class ModelDiscovery {
   private mode: DiscoveryMode;
   private manualSlugs: Array<{ provider: string; model: string }>;
   private intervalMin: number;
   private timer?: NodeJS.Timeout;
   private running = false;
+  private catalogMap?: Map<string, { inputPerM: number; outputPerM: number }>;
 
   constructor(
     private registry: ModelRegistry,
@@ -107,10 +115,16 @@ export class ModelDiscovery {
     this.running = true;
 
     try {
+      // Pricing catalog first (read-only GET; cached table survives failures).
+      await this.refreshCatalogPricing();
       if (this.mode === "manual") {
         for (const { provider, model } of this.manualSlugs) {
           try {
-            if (this.registry.registerExternalModel(provider, model)) {
+            const cat = this.lookupCatalogPricing(provider, model);
+            if (this.registry.registerExternalModel(provider, model, {
+              costPer1kInput: cat?.costPer1kInput,
+              costPer1kOutput: cat?.costPer1kOutput,
+            })) {
               summary.registered.push(`${provider}/${model}`);
             } else {
               summary.alreadyKnown++;
@@ -134,9 +148,10 @@ export class ModelDiscovery {
           try {
             const found = await fetcher.call(this);
             for (const f of found) {
+              const cat = this.lookupCatalogPricing(f.provider, f.model);
               if (this.registry.registerExternalModel(f.provider, f.model, {
-                costPer1kInput: f.costPer1kInput,
-                costPer1kOutput: f.costPer1kOutput,
+                costPer1kInput: f.costPer1kInput ?? cat?.costPer1kInput,
+                costPer1kOutput: f.costPer1kOutput ?? cat?.costPer1kOutput,
               })) {
                 summary.registered.push(`${f.provider}/${f.model}`);
               } else {
@@ -203,6 +218,98 @@ export class ModelDiscovery {
       clearInterval(this.timer);
       this.timer = undefined;
     }
+  }
+
+  // ---------- pricing catalog ----------
+
+  /** Fetch + persist the pricing catalog; keep the in-memory map fresh.
+   *  On failure, fall back to the cached sqlite table (survives restarts). */
+  private async refreshCatalogPricing(): Promise<void> {
+    try {
+      const resp = await fetch(PRICING_CATALOG_URL, {
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = (await resp.json()) as any;
+      const pricing = data?.pricing;
+      if (!pricing || typeof pricing !== "object") {
+        throw new Error("catalog has no pricing record");
+      }
+      const generatedAt = new Date(
+        typeof data.generatedAt === "number" ? data.generatedAt : Date.now(),
+      ).toISOString();
+      const entries: Array<{ key: string; inputPerM: number; outputPerM: number; cacheReadPerM?: number }> = [];
+      for (const [key, v] of Object.entries(pricing) as Array<[string, any]>) {
+        if (typeof v?.input !== "number" || typeof v?.output !== "number") continue;
+        entries.push({
+          key,
+          inputPerM: v.input,
+          outputPerM: v.output,
+          cacheReadPerM: typeof v?.cacheRead === "number" ? v.cacheRead : undefined,
+        });
+      }
+      this.db.replaceCatalogPricing(entries, generatedAt);
+      this.catalogMap = new Map(
+        entries.map((e) => [e.key, { inputPerM: e.inputPerM, outputPerM: e.outputPerM }]),
+      );
+      logger.info(
+        `Pricing catalog refreshed: ${entries.length} entries (upstream ${generatedAt})`,
+      );
+    } catch (err) {
+      logger.warn(
+        `Pricing catalog fetch failed (${err instanceof Error ? err.message : err}) - using cached table`,
+      );
+      if (!this.catalogMap) {
+        this.catalogMap = this.db.getCatalogPricingMap();
+        logger.info(`Using cached pricing catalog: ${this.catalogMap.size} entries`);
+      }
+    }
+  }
+
+  /** Catalog key candidates: provider/model, provider.model (anthropic dot
+   *  notation), vendor aliases (gemini -> google), bare model id. */
+  private catalogKeyCandidates(provider: string, model: string): string[] {
+    const aliases: Record<string, string[]> = { gemini: ["google"] };
+    const prefixes = [provider, ...(aliases[provider] ?? [])];
+    const out: string[] = [];
+    for (const p of prefixes) {
+      out.push(`${p}/${model}`, `${p}.${model}`);
+    }
+    out.push(model);
+    return out;
+  }
+
+  /** Price lookup with exact + variant-suffix matching (:0, :batch, :v2 …).
+   *  Shortest suffix wins (closest to base on-demand price). Returns per-1k
+   *  costs, or undefined when the catalog does not know the model. */
+  private lookupCatalogPricing(
+    provider: string,
+    model: string,
+  ): { costPer1kInput: number; costPer1kOutput: number } | undefined {
+    const map = this.catalogMap;
+    if (!map || map.size === 0) return undefined;
+    for (const k of this.catalogKeyCandidates(provider, model)) {
+      const hit = map.get(k);
+      if (hit) {
+        return { costPer1kInput: hit.inputPerM / 1000, costPer1kOutput: hit.outputPerM / 1000 };
+      }
+    }
+    let best: { key: string; v: { inputPerM: number; outputPerM: number } } | undefined;
+    for (const base of this.catalogKeyCandidates(provider, model)) {
+      const prefix = `${base}:`;
+      for (const [k, v] of map) {
+        if (k.startsWith(prefix) && (!best || k.length < best.key.length)) {
+          best = { key: k, v };
+        }
+      }
+    }
+    if (best) {
+      return {
+        costPer1kInput: best.v.inputPerM / 1000,
+        costPer1kOutput: best.v.outputPerM / 1000,
+      };
+    }
+    return undefined;
   }
 
   // ---------- extended providers ----------

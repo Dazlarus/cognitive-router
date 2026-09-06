@@ -1633,6 +1633,36 @@ export class DBService {
       FROM pricing_gaps ORDER BY provider, model
     `).all() as any[];
   }
+
+  /** Replace the cached pricing catalog (OpenClaw model catalog snapshot).
+   *  Transactional full swap; generatedAt records upstream freshness. */
+  replaceCatalogPricing(
+    entries: Array<{ key: string; inputPerM: number; outputPerM: number; cacheReadPerM?: number }>,
+    generatedAt: string,
+  ): void {
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM catalog_pricing`).run();
+      const ins = this.db.prepare(`
+        INSERT INTO catalog_pricing (key, input_per_m, output_per_m, cache_read_per_m, generated_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const e of entries) {
+        ins.run(e.key, e.inputPerM, e.outputPerM, e.cacheReadPerM ?? null, generatedAt);
+      }
+    });
+    tx();
+  }
+
+  /** Cached catalog pricing as a lookup map. */
+  getCatalogPricingMap(): Map<string, { inputPerM: number; outputPerM: number }> {
+    const rows = this.db.prepare(`
+      SELECT key, input_per_m AS inputPerM, output_per_m AS outputPerM
+      FROM catalog_pricing
+    `).all() as any[];
+    const map = new Map<string, { inputPerM: number; outputPerM: number }>();
+    for (const r of rows) map.set(r.key, { inputPerM: r.inputPerM, outputPerM: r.outputPerM });
+    return map;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1803,6 +1833,14 @@ CREATE TABLE IF NOT EXISTS pricing_gaps (
   first_seen TEXT NOT NULL,
   last_seen  TEXT NOT NULL,
   PRIMARY KEY (provider, model)
+);
+
+CREATE TABLE IF NOT EXISTS catalog_pricing (
+  key              TEXT PRIMARY KEY,
+  input_per_m      REAL NOT NULL,
+  output_per_m     REAL NOT NULL,
+  cache_read_per_m REAL,
+  generated_at     TEXT NOT NULL
 );
 `;
 

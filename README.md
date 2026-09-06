@@ -327,7 +327,8 @@ Where your data can go, honestly:
 
 - **Your configured providers.** Routing means forwarding: prompts go to whichever provider serves a request (Z.AI, OpenRouter, Gemini, …). Local Ollama traffic never leaves your machine.
 - **The quality judge (sampled).** A fraction of request/response pairs — prompt, response, and classified intent — go to the judge provider (`ROUTER_JUDGE_PROVIDER`, default OpenRouter) to score routing quality. Set `ROUTER_JUDGE_SAMPLE_RATE=0` to disable.
-- **Your provider's quota endpoint.** With a Z.AI key configured, the router polls Z.AI's usage-monitor endpoint using that key to steer around quota windows. That call goes to Z.AI, about your account — nowhere else.
+- **Your provider's quota endpoint.** With a Z.AI key configured, the router polls Z.AI's usage-moni
+- **The pricing catalog (no user data).** The router fetches OpenClaw's public model catalog (`catalog.openclaw.ai/models/v1/catalog.json`) — a read-only GET of provider pricing data. Nothing about your requests, keys, or models is sent. Disable/redirect via `ROUTER_PRICING_CATALOG_URL`; a cached table keeps prices after failures.tor endpoint using that key to steer around quota windows. That call goes to Z.AI, about your account — nowhere else.
 
 ### Central-server mode
 
