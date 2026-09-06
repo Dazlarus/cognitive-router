@@ -46,6 +46,14 @@ export interface CognitiveRouterConfig {
   /** Port for standalone proxy mode (default 3456) */
   proxyPort?: number;
 
+  /** Bind host for standalone proxy mode (default 127.0.0.1).
+   *  Non-loopback binds require apiKeys to be configured (startup guard enforces). */
+  bindHost?: string;
+
+  /** Optional inbound API keys. When non-empty, all endpoints except /health
+   *  require Authorization: Bearer <key> matching one of these. */
+  apiKeys?: string[];
+
   reliabilityAbortPenalty: number;
 }
 
@@ -94,6 +102,8 @@ export function loadConfig(pluginConfig: Record<string, any>): CognitiveRouterCo
     providers: { ...DEFAULT_PROVIDERS, ...(pluginConfig.providers ?? {}) },
     overrides: pluginConfig.overrides ?? [],
     proxyPort: pluginConfig.proxyPort ?? 3456,
+    bindHost: pluginConfig.bindHost ?? "127.0.0.1",
+    apiKeys: Array.isArray(pluginConfig.apiKeys) ? pluginConfig.apiKeys.map(String) : [],
     providerPriority: pluginConfig.providerPriority ?? DEFAULT_PROVIDER_PRIORITY,
     reliabilityAbortPenalty: pluginConfig.reliabilityAbortPenalty ?? 0.2,
   };

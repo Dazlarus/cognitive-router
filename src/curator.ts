@@ -7,10 +7,10 @@ import { logger } from "./logger.js";
 import type { DBService } from "./db_service.js";
 import type { ModelRegistry, ModelCapability } from "./model_registry.js";
 import type { CognitiveRouterConfig } from "./config.js";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ─── Types ───
 
@@ -421,7 +421,7 @@ export class ModelCurator {
   /** Pull an Ollama model via CLI. */
   private async pullOllamaModel(modelName: string): Promise<void> {
     logger.info(`ollama pull ${modelName}...`);
-    const { stdout, stderr } = await execAsync(`ollama pull ${modelName}`, {
+    const { stdout, stderr } = await execFileAsync("ollama", ["pull", modelName], {
       timeout: 300_000, // 5 minute timeout for large pulls
       maxBuffer: 10 * 1024 * 1024,
     });

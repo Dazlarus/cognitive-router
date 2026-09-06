@@ -1,6 +1,7 @@
 // src/proxy-stream.ts - Streaming + self-healing proxy for Cognitive Router
 
 import http from "node:http";
+import crypto from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { logger } from "./logger.js";
@@ -8,6 +9,14 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
+
+/** Constant-time string compare for secrets (keys/tokens). */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
 import { IntentClassifier } from "./classifier.js";
 import { RoutingEngine } from "./router.js";
 import { DBService } from "./db_service.js";
@@ -362,8 +371,22 @@ export class ProxyServerStreaming {
     await this.modelRegistry.loadCachedState();
     await this.costTracker.refreshProviderStatus();
 
-    this.server.listen(this.config.proxyPort, "127.0.0.1", () => {
-      logger.info(`Cognitive Router proxy listening on http://127.0.0.1:${this.config.proxyPort}`);
+    const host = this.config.bindHost ?? "127.0.0.1";
+    const loopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
+    const apiKeys = this.config.apiKeys ?? [];
+    if (!loopback && apiKeys.length === 0) {
+      logger.error(
+        `FATAL: bind host ${host} is non-loopback but no API keys are configured. ` +
+          `Central-server mode requires ROUTER_API_KEYS (comma-separated Bearer keys). ` +
+          `Refusing to start. Bind 127.0.0.1 for open loopback-only mode.`
+      );
+      process.exit(1);
+    }
+    this.server.listen(this.config.proxyPort, host, () => {
+      logger.info(
+        `Cognitive Router proxy listening on http://${host}:${this.config.proxyPort}` +
+          ` (auth: ${apiKeys.length > 0 ? `${apiKeys.length} key(s) required` : "open, loopback-only"})`
+      );
       logger.info(`   POST /v1/chat/completions    - Chat (streaming + non-streaming)`);
       logger.info(`   POST /v1/embeddings           - Embeddings (caller-specified model or default)`);
       logger.info(`   GET  /v1/embeddings/models    - List all available embedding models`);
@@ -454,6 +477,20 @@ export class ProxyServerStreaming {
       }
 
       // GET /v1/budget — detailed budget status with burn rate projection
+      // Inbound auth (central-server mode): active only when apiKeys configured.
+      // /health stays open for load-balancer probes; /admin/restart carries its
+      // own admin token on top of this check.
+      if ((this.config.apiKeys?.length ?? 0) > 0) {
+        const auth = req.headers["authorization"];
+        const bearer = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
+        const ok = !!bearer && (this.config.apiKeys ?? []).some((k) => timingSafeEqualStr(bearer, k));
+        if (!ok) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "unauthorized", message: "Authorization: Bearer <key> required" }));
+          return;
+        }
+      }
+
       if (url === "/v1/budget" && req.method === "GET") {
         const status = this.budgetTracker.getBudgetStatus();
         // Enrich with cost efficiency data from model registry
@@ -652,7 +689,7 @@ export class ProxyServerStreaming {
         const provided =
           (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
           (req.headers["x-admin-token"] as string | undefined);
-        if (provided !== token) {
+        if (!provided || !timingSafeEqualStr(provided, token)) {
           logger.warn("Admin restart denied: bad or missing token");
           res.writeHead(403, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "forbidden" }));
@@ -2159,6 +2196,11 @@ export async function startProxyStreaming(): Promise<void> {
     probeRate: 0.05,
     tiebreakerThreshold: 0.70,
     proxyPort: parseInt(process.env.ROUTER_PORT ?? "3456", 10),
+    bindHost: process.env.ROUTER_BIND_HOST ?? "127.0.0.1",
+    apiKeys: (process.env.ROUTER_API_KEYS ?? "")
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean),
   };
 
   const config = loadConfig(pluginConfig);

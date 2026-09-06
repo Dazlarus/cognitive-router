@@ -331,8 +331,8 @@ export class PrefixCache {
 
     const geminiBase = process.env.GEMINI_BASE_URL?.replace(/\/+$/, "") ?? "https://generativelanguage.googleapis.com/v1beta";
     try {
-      const delUrl = geminiBase + "/" + cacheName + "?key=" + apiKey;
-      await fetch(delUrl, { method: "DELETE" });
+      const delUrl = geminiBase + "/" + cacheName;
+      await fetch(delUrl, { method: "DELETE", headers: { "x-goog-api-key": apiKey } });
       logger.debug(`PrefixCache: invalidated Gemini cache ${cacheName}`);
     } catch {
       // Best-effort cleanup
@@ -370,10 +370,10 @@ export async function createGeminiCachedContent(
   };
 
   try {
-    const createUrl = geminiBase + "/cachedContents?key=" + apiKey;
+    const createUrl = geminiBase + "/cachedContents";
     const resp = await fetch(createUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(15_000),
     });
