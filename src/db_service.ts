@@ -1607,6 +1607,32 @@ export class DBService {
     });
     tx();
   }
+
+  /** Record a remote model with unknown pricing (the actionable gap list).
+   *  Upserted at discovery time; resolved (deleted) when pricing arrives. */
+  upsertPricingGap(provider: string, model: string): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO pricing_gaps (provider, model, first_seen, last_seen)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(provider, model) DO UPDATE SET last_seen = excluded.last_seen
+    `).run(provider, model, now, now);
+  }
+
+  /** Remove a gap once pricing is known. */
+  resolvePricingGap(provider: string, model: string): void {
+    this.db.prepare(`
+      DELETE FROM pricing_gaps WHERE provider = ? AND model = ?
+    `).run(provider, model);
+  }
+
+  /** All open pricing gaps (quarantined models). */
+  getPricingGaps(): Array<{ provider: string; model: string; firstSeen: string; lastSeen: string }> {
+    return this.db.prepare(`
+      SELECT provider, model, first_seen AS firstSeen, last_seen AS lastSeen
+      FROM pricing_gaps ORDER BY provider, model
+    `).all() as any[];
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1769,6 +1795,14 @@ CREATE TABLE IF NOT EXISTS benchmark_ladder (
   strength          REAL NOT NULL,
   updated_at        TEXT NOT NULL,
   PRIMARY KEY (intent, prompt_generation, model_key)
+);
+
+CREATE TABLE IF NOT EXISTS pricing_gaps (
+  provider   TEXT NOT NULL,
+  model      TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  last_seen  TEXT NOT NULL,
+  PRIMARY KEY (provider, model)
 );
 `;
 

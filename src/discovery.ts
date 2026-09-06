@@ -21,6 +21,7 @@
 
 import { logger } from "./logger.js";
 import type { ModelRegistry } from "./model_registry.js";
+import type { DBService } from "./db_service.js";
 
 export type DiscoveryMode = "auto" | "safe" | "manual";
 
@@ -29,6 +30,10 @@ export interface DiscoverySummary {
   triggeredBy: "startup" | "interval" | "admin";
   registered: string[];
   alreadyKnown: number;
+  /** Remote models currently quarantined for unknown pricing (open gaps). */
+  pricingGapsOpen: number;
+  /** Change in open gaps this pass (negative = gaps resolved). */
+  pricingGapsDelta: number;
   errors: string[];
   durationMs: number;
 }
@@ -43,7 +48,10 @@ export class ModelDiscovery {
   private timer?: NodeJS.Timeout;
   private running = false;
 
-  constructor(private registry: ModelRegistry) {
+  constructor(
+    private registry: ModelRegistry,
+    private db: DBService,
+  ) {
     const raw = (process.env.ROUTER_DISCOVERY_MODE ?? "safe").toLowerCase();
     this.mode = raw === "auto" || raw === "manual" ? raw : "safe";
     this.manualSlugs = (process.env.ROUTER_MANUAL_MODELS ?? "")
@@ -84,9 +92,12 @@ export class ModelDiscovery {
       triggeredBy,
       registered: [],
       alreadyKnown: 0,
+      pricingGapsOpen: 0,
+      pricingGapsDelta: 0,
       errors: [],
       durationMs: 0,
     };
+    const gapsBefore = this.db.getPricingGaps().length;
 
     if (this.running) {
       summary.errors.push("discovery already in progress");
@@ -138,16 +149,39 @@ export class ModelDiscovery {
         }
       }
 
+      // Pricing-gap sweep (uniform truth across all registration sources —
+      // extended providers, manual slugs, zai/ollama built-ins, seeds):
+      // remote models with undefined cost are quarantined by the router and
+      // recorded here as the actionable gap list; priced models clear gaps.
+      const openAfter = this.sweepPricingGaps();
+      summary.pricingGapsOpen = openAfter;
+      summary.pricingGapsDelta = openAfter - gapsBefore;
+
       summary.durationMs = Date.now() - started;
       logger.info(
         `Discovery pass (${triggeredBy}): +${summary.registered.length} new, ` +
-          `${summary.alreadyKnown} known${summary.errors.length ? `, ${summary.errors.length} errors` : ""} ` +
+          `${summary.alreadyKnown} known, ${openAfter} pricing gaps` +
+          `${summary.errors.length ? `, ${summary.errors.length} errors` : ""} ` +
           `in ${summary.durationMs}ms`,
       );
       return summary;
     } finally {
       this.running = false;
     }
+  }
+
+  /** Upsert/resolve pricing gaps from current registry state.
+   *  Returns the number of open gaps after the sweep. */
+  private sweepPricingGaps(): number {
+    for (const m of this.registry.getAllModels()) {
+      if (m.isLocal) continue;
+      if (m.costPer1kInput === undefined) {
+        this.db.upsertPricingGap(m.provider, m.model);
+      } else {
+        this.db.resolvePricingGap(m.provider, m.model);
+      }
+    }
+    return this.db.getPricingGaps().length;
   }
 
   startPeriodic(): void {

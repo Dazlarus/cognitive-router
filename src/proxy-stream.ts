@@ -359,7 +359,7 @@ export class ProxyServerStreaming {
     this.embedFn = this.createEmbedder();
     this.judge = new JudgeEvaluator();
     this.curator = new ModelCurator(this.db, this.modelRegistry, config);
-    this.discovery = new ModelDiscovery(this.modelRegistry);
+    this.discovery = new ModelDiscovery(this.modelRegistry, this.db);
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res).catch((err) => {
         logger.error(`Unhandled error: ${err}`);

@@ -5,6 +5,7 @@ import { registryReadiness } from "./readiness.js";
 import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig } from "./config.js";
 import { ChatBenchmark } from "./benchmark_chat.js";
+import { zaiBillingMode } from "./providers.js";
 import {
   clampCapability,
   classifyAttribution,
@@ -398,7 +399,10 @@ export class ModelRegistry {
               logger.info(`Discovered unseeded Z.AI model: zai/${id} - using neutral defaults`);
               this.models.set(`zai/${id}`, makeModel("zai", id, 128_000,
                 { coding: 0.65, reasoning: 0.65, creative: 0.60, math: 0.60, analysis: 0.65, conversation: 0.68, retrieval: 0.62, science: 0.62, business: 0.63, summary: 0.65 },
-                {},
+                // Pricing follows billing truth: coding-plan endpoint = sunk cost
+                // (explicit 0); platform endpoint = per-token, unknown until priced
+                // (quarantined + logged via pricing_gaps).
+                zaiBillingMode() === "coding_plan" ? { input: 0, output: 0 } : {},
               ));
             }
           }

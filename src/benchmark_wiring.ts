@@ -140,9 +140,17 @@ export function judgeRecused(
 // ---------- judge caller ----------
 
 function getJudgeCandidates(): BenchEndpoint[] {
-  const provider = process.env.ROUTER_JUDGE_PROVIDER ?? "openrouter";
+  // Bench judge is steerable independently of the live judge loop (Daz,
+  // 2026-09-06: benchmark on ZAI until the system is proven). Falls back to
+  // the live ROUTER_JUDGE_* values when bench-specific ones are unset.
+  const provider =
+    process.env.ROUTER_BENCH_JUDGE_PROVIDER ??
+    process.env.ROUTER_JUDGE_PROVIDER ??
+    "openrouter";
   const model =
-    process.env.ROUTER_JUDGE_MODEL ?? "qwen/qwen3-30b-a3b-instruct-2507";
+    process.env.ROUTER_BENCH_JUDGE_MODEL ??
+    process.env.ROUTER_JUDGE_MODEL ??
+    "qwen/qwen3-30b-a3b-instruct-2507";
   const fallbackModel = process.env.ROUTER_JUDGE_FALLBACK_MODEL ?? "gemma4:latest";
   // Fallback lives on a separate endpoint family by construction (ollama).
   return [

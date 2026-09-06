@@ -108,6 +108,15 @@ function withExternalSignal(timeoutMs: number, external?: AbortSignal): AbortSig
 
 // ─── Provider Base URLs (env-configurable) ───
 
+/** ZAI billing truth follows the effective base URL (2026-09-06, Daz):
+ *  coding-plan endpoints (…/api/coding/paas/v4, /api/anthropic, /api/v1)
+ *  are subscription (sunk cost); the platform endpoint (…/api/paas/v4)
+ *  is pay-per-token. Pricing decisions for discovered zai models use this. */
+export function zaiBillingMode(): "coding_plan" | "platform" {
+  const base = providerBaseUrl("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4");
+  return /\/coding\//.test(base) ? "coding_plan" : "platform";
+}
+
 function providerBaseUrl(envVar: string, fallback: string): string {
   const raw = process.env[envVar];
   if (!raw) return fallback;

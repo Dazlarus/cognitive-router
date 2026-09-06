@@ -156,6 +156,7 @@ function sizeScoreAdjust(
 export class RoutingEngine {
   private budgetTracker: BudgetTracker | null = null;
   private warmthChecker: OllamaWarmthChecker | null = null;
+  private lastPricingQuarantineCount = -1;
 
   constructor(
     private registry: ModelRegistry,
@@ -207,6 +208,31 @@ export class RoutingEngine {
 
     // Get all models from registry for these providers
     let candidates = this.registry.getAvailableModels(priorityProviders);
+
+    // Free-vs-unknown pricing (Daz, 2026-09-06): remote models with UNKNOWN
+    // pricing are quarantined — missing cost must never read as free (the
+    // ?? 0 + x2 free-boost path). Locals are free by nature; explicit 0 =
+    // genuinely free (sunk-cost subscription, ":free" tiers). Unknowns are
+    // logged into the pricing_gaps table at discovery — the actionable list.
+    const quarantined = candidates.filter(
+      (m) => !m.isLocal && m.costPer1kInput === undefined,
+    );
+    if (quarantined.length > 0) {
+      candidates = candidates.filter(
+        (m) => m.isLocal || m.costPer1kInput !== undefined,
+      );
+      if (quarantined.length !== this.lastPricingQuarantineCount) {
+        logger.warn(
+          `Pricing quarantine: ${quarantined.length} remote models excluded from routing ` +
+            `(unknown pricing) — see pricing_gaps via /admin/discover`,
+        );
+        this.lastPricingQuarantineCount = quarantined.length;
+      } else {
+        logger.debug(`Pricing quarantine: ${quarantined.length} models excluded (unchanged)`);
+      }
+    } else {
+      this.lastPricingQuarantineCount = 0;
+    }
 
     // Filter out the excluded provider/model if specified in context
     if (context?.excludeProvider && context?.excludeModel) {
