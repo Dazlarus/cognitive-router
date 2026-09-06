@@ -5,6 +5,7 @@
 export const DECISION_SOURCES = [
   "scored_pick",
   "provider_fallback",
+  "exploration_probe",
   "circuit_breaker_skip",
   "context_window_skip",
   "tool_policy",
@@ -35,6 +36,9 @@ export interface ProxyDecisionSourceFacts {
   attemptFailed: boolean;
   /** Serving candidate is the appended local emergency model (Ollama last resort at tail). */
   servedByAppendedLastResort: boolean;
+  /** Serving candidate is an exploration-probe target (under-sampled model
+   *  promoted ahead of the scored winner by the probe policy). */
+  exploredServed?: boolean;
 }
 
 /** Classify how the serving model was chosen, from proxy runtime facts.
@@ -42,10 +46,11 @@ export interface ProxyDecisionSourceFacts {
  *    1. all_exhausted        (served=false — nothing served the request)
  *    2. tool_policy          (tools reshaped the candidate list)
  *    3. context_window_skip  (router pre-filter degraded OR proxy guard skipped candidates)
- *    4. last_resort_local    (appended local emergency model served)
- *    5. circuit_breaker_skip (circuit/backoff skipped higher-priority candidates)
- *    6. provider_fallback    (earlier candidates were tried and failed)
- *    7. scored_pick          (default — first choice served)
+ *    4. exploration_probe    (probed under-sampled candidate served)
+ *    5. last_resort_local    (appended local emergency model served)
+ *    6. circuit_breaker_skip (circuit/backoff skipped higher-priority candidates)
+ *    7. provider_fallback    (earlier candidates were tried and failed)
+ *    8. scored_pick          (default - first choice served)
  */
 export function computeProxyDecisionSource(facts: ProxyDecisionSourceFacts): DecisionSource {
   if (!facts.served) return "all_exhausted";
@@ -53,6 +58,7 @@ export function computeProxyDecisionSource(facts: ProxyDecisionSourceFacts): Dec
   if (facts.routerSource === "context_window_skip" || facts.contextGuardSkipped) {
     return "context_window_skip";
   }
+  if (facts.exploredServed) return "exploration_probe";
   if (
     facts.servedByAppendedLastResort ||
     facts.routerSource === "last_resort_local"

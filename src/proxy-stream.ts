@@ -17,6 +17,12 @@ function timingSafeEqualStr(a: string, b: string): boolean {
   if (ab.length !== bb.length) return false;
   return crypto.timingSafeEqual(ab, bb);
 }
+
+// Exploration probe guardrails: never probe large requests (a bad pick on a
+// big context wastes real money) and stop probing a cell once it has enough
+// judge observations to be trusted.
+const PROBE_MAX_INPUT_TOKENS = 8_000;
+const PROBE_MIN_SAMPLES = 10;
 import { IntentClassifier } from "./classifier.js";
 import { RoutingEngine } from "./router.js";
 import { DBService } from "./db_service.js";
@@ -1072,6 +1078,40 @@ export class ProxyServerStreaming {
     // final source is classified exactly once per request, at its terminal
     // outcome, and counted in /stats (stats.decisionSources).
     const usesTools = requestUsesTools(request);
+
+    // Exploration probe (judge-loop cold start, 2026-09-06):
+    // probeRate of eligible requests promote an under-sampled candidate ahead
+    // of the scored winner, so the judge can start evolving capability cells
+    // that would otherwise never serve traffic. Graceful by construction: the
+    // scored winner remains the next candidate in the retry chain.
+    let exploredProbe: { provider: string; model: string } | null = null;
+    const probeRate = this.config.probeRate ?? 0.05;
+    if (
+      decision && !decision.error && probeRate > 0 &&
+      !usesTools &&
+      !requestTier && // fast-tier requests keep their tier promise
+      estimatedTokens <= PROBE_MAX_INPUT_TOKENS &&
+      candidates.length >= 2 &&
+      Math.random() < probeRate
+    ) {
+      // Probe targets: any candidate except the winner and the appended last resort.
+      const nonResort = lastResortCandidate
+        ? candidates.slice(0, candidates.length - 1)
+        : candidates;
+      const cold = nonResort.slice(1).filter((c) =>
+        this.modelRegistry.isUnderSampled(c.provider, c.model, classification.intent, PROBE_MIN_SAMPLES));
+      if (cold.length > 0) {
+        const pick = cold[Math.floor(Math.random() * cold.length)];
+        exploredProbe = pick;
+        candidates.splice(0, candidates.length, pick, ...candidates.filter((c) => c !== pick));
+        logger.info(
+          `Exploration probe: ${pick.provider}/${pick.model} promoted over winner ` +
+            `${decision.provider}/${decision.model} [${classification.intent}] ` +
+            `(p=${probeRate}, ~${estimatedTokens} tok, ${cold.length} cold candidate(s))`,
+        );
+      }
+    }
+
     let circuitOrBackoffSkipped = false;
     let contextGuardSkipped = false;
     let attemptFailed = false;
@@ -1091,6 +1131,12 @@ export class ProxyServerStreaming {
           lastResortCandidate &&
           servedCandidate.provider === lastResortCandidate.provider &&
           servedCandidate.model === lastResortCandidate.model,
+        ),
+        exploredServed: Boolean(
+          exploredProbe &&
+          servedCandidate &&
+          servedCandidate.provider === exploredProbe.provider &&
+          servedCandidate.model === exploredProbe.model,
         ),
       });
       decisionSourceCounters.increment(source);
@@ -1275,7 +1321,13 @@ export class ProxyServerStreaming {
 
           // ─── Async LLM-as-judge feedback ───
           if (
-            this.judge.shouldJudge() &&
+            // Probed requests are always judged - the whole point of the probe
+            // is the observation; the sample roll only governs normal traffic.
+            this.judge.shouldJudge(Boolean(
+              exploredProbe &&
+              candidate.provider === exploredProbe.provider &&
+              candidate.model === exploredProbe.model,
+            )) &&
             !this.judge.isSameModel(candidate.provider, candidate.model) &&
             accumulatedContent // Skip empty/tool-only responses
           ) {
@@ -2193,7 +2245,7 @@ export async function startProxyStreaming(): Promise<void> {
     },
     overrides: [],
     weights: { capability: 0.50, reliability: 0.25, cost: 0.15, latency: 0.10 },
-    probeRate: 0.05,
+    probeRate: parseFloat(process.env.ROUTER_PROBE_RATE ?? "0.05"),
     tiebreakerThreshold: 0.70,
     proxyPort: parseInt(process.env.ROUTER_PORT ?? "3456", 10),
     bindHost: process.env.ROUTER_BIND_HOST ?? "127.0.0.1",

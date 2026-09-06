@@ -611,6 +611,20 @@ export class ModelRegistry {
     return { baseline, n, preClamp, wouldBe };
   }
 
+  /** Exploration support: is this (provider, model, intent) capability cell still
+   *  cold (fewer than minSamples judge observations)? Cold cells are probe
+   *  candidates - they never win on score alone, so without deliberate traffic
+   *  the judge never starts evolving them. */
+  isUnderSampled(provider: string, model: string, intent: string, minSamples = 10): boolean {
+    const cellKey = `${provider}/${model}/${intent}`;
+    const n = this.sampleCounts.get(cellKey) ?? 0;
+    if (n >= minSamples) return false;
+    const existing = typeof this.db.getCapabilityOverride === "function"
+      ? this.db.getCapabilityOverride(provider, model, intent)
+      : null;
+    return (existing?.sampleCount ?? n) < minSamples;
+  }
+
   /** Effort-conditioned judge quality (backing GET /judge/effort). */
   getJudgeQualityByEffort(windowDays = 7) {
     if (typeof this.db.getJudgeQualityByEffort === "function") {

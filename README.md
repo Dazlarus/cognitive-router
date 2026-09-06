@@ -223,6 +223,7 @@ All configuration is via environment variables (`.env` file):
 | `ROUTER_API_KEYS` | — | Comma-separated inbound Bearer keys (central-server mode) |
 | `ROUTER_ADMIN_TOKEN` | — | Token gating `POST /admin/restart` (generate your own) |
 | `ROUTER_JUDGE_SAMPLE_RATE` | `0.10` | Fraction of responses quality-judged; `0` disables |
+| `ROUTER_PROBE_RATE` | `0.05` | Fraction of eligible requests routed to under-sampled models (exploration; probes are always judged) |
 | `ZAI_API_KEY` | — | Z.AI API key |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key |
 | `GEMINI_API_KEY` | — | Google Gemini API key |

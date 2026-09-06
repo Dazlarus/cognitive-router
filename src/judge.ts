@@ -112,8 +112,10 @@ export class JudgeEvaluator {
     return `${this.judgeProvider}/${this.judgeModel}`;
   }
 
-  /** Roll the dice — should we judge this response? */
-  shouldJudge(): boolean {
+  /** Roll the dice - should we judge this response? Forced probes (exploration)
+   *  always judge; the sample roll only governs normal traffic. */
+  shouldJudge(force = false): boolean {
+    if (force) return true;
     if (this.sampleRate <= 0) return false;
     return Math.random() < this.sampleRate;
   }
