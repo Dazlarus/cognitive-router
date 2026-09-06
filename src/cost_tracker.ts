@@ -567,8 +567,45 @@ export class CostTracker {
 
   }
 
-  /** Compute latency score from rolling average */
-  getLatencyScore(providerName: string): number {
+  // ─── Per-model speed telemetry (TTFT + tokens/sec) ───
+  // In-memory EWMA per provider/model; rebuilt from live traffic. Advisory
+  // scoring only — losing it on restart just means a few minutes of fallback.
+  private modelSpeed = new Map<string, { ttftEwma: number; tpsEwma: number; samples: number }>();
+
+  /** Record one observed speed sample for a model (streamed requests). */
+  recordSpeedSample(provider: string, model: string, ttftMs: number, tokensPerSec: number): void {
+    const key = `${provider}/${model}`;
+    let s = this.modelSpeed.get(key);
+    if (!s) {
+      this.modelSpeed.set(key, { ttftEwma: ttftMs, tpsEwma: tokensPerSec, samples: 1 });
+      return;
+    }
+    const a = 0.25; // EWMA smoothing
+    s.ttftEwma += a * (ttftMs - s.ttftEwma);
+    s.tpsEwma += a * (tokensPerSec - s.tpsEwma);
+    s.samples++;
+  }
+
+  /** Per-model speed score (0–1) from TTFT + throughput. null = not enough samples yet. */
+  getModelSpeedScore(provider: string, model: string): number | null {
+    const s = this.modelSpeed.get(`${provider}/${model}`);
+    if (!s || s.samples < 3) return null;
+    // TTFT: ≤400ms = 1.0, ≥4s = 0.0, linear between
+    const ttftScore =
+      s.ttftEwma <= 400 ? 1 : s.ttftEwma >= 4000 ? 0 : 1 - (s.ttftEwma - 400) / 3600;
+    // Throughput: ≥80 tok/s = 1.0, ≤10 tok/s = 0.0, linear between
+    const tpsScore =
+      s.tpsEwma >= 80 ? 1 : s.tpsEwma <= 10 ? 0 : (s.tpsEwma - 10) / 70;
+    return 0.6 * ttftScore + 0.4 * tpsScore;
+  }
+
+  /** Compute latency score — per-model measured speed (TTFT/TPS) when
+   *  available, otherwise the provider-level rolling average. */
+  getLatencyScore(providerName: string, modelName?: string): number {
+    if (modelName) {
+      const measured = this.getModelSpeedScore(providerName, modelName);
+      if (measured !== null) return measured;
+    }
     const state = this.getProviderState(providerName);
     if (!state || state.recentLatencies.length === 0) return 0.5; // unknown
 

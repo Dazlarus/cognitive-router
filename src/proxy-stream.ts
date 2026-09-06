@@ -1074,6 +1074,8 @@ export class ProxyServerStreaming {
           let hasPayload = false;
           const bufferedChunks: any[] = [];
           let reachedCheckpoint = false;
+          let firstChunkAt: number | undefined;
+          let firstContentAt: number | undefined;
 
           try {
             const stallTimeout = streamStallTimeoutMs();
@@ -1081,6 +1083,7 @@ export class ProxyServerStreaming {
 
             for await (const chunk of adapter.chatCompletionStream(candidate.model, providerRequest, apiKey)) {
               const now = Date.now();
+              if (firstChunkAt === undefined) firstChunkAt = now;
               if (now - lastChunkTime > stallTimeout) {
                 this.costTracker.applyAbortPenalty(candidate.provider, candidate.model, "stall");
                 throw new Error(`stream_stall: no data for ${stallTimeout}ms from ${candidate.provider}/${candidate.model}`);
@@ -1093,6 +1096,7 @@ export class ProxyServerStreaming {
               // Track content for judge evaluation + empty-response detection
               const delta = chunk.choices?.[0]?.delta;
               if (delta?.content) {
+                if (firstContentAt === undefined) firstContentAt = now;
                 accumulatedContent += delta.content;
                 hasPayload = true;
               }
@@ -1132,6 +1136,14 @@ export class ProxyServerStreaming {
 
           // ── Checkpoint reached: flush all buffered chunks to client ──
           const durationMs = Date.now() - startTime;
+          // Speed telemetry: TTFT + throughput sample (content-bearing streams only)
+          const ttftMs = (firstContentAt ?? firstChunkAt ?? startTime) - startTime;
+          if (accumulatedContent.length > 0) {
+            const genMs = Math.max(1, durationMs - ttftMs);
+            const estTokensOut = Math.max(1, Math.round(accumulatedContent.length / 4));
+            const tokensPerSec = estTokensOut / (genMs / 1000);
+            this.costTracker.recordSpeedSample(candidate.provider, candidate.model, ttftMs, tokensPerSec);
+          }
           recordSource(true, candidate);
           // Open SSE headers now (deferred from request start) so the
           // selected-model header names the model that actually served.

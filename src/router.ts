@@ -219,16 +219,36 @@ export class RoutingEngine {
     // candidate set when the speed tier is empty so utility work never hard-fails.
     const modelTier: string | undefined = context?.modelTier;
     if (modelTier === "fast") {
-      const fastSet = candidates.filter(
-        (m) => /flash|mini|turbo|lite|gemma/i.test(m.model) || m.isLocal,
-      );
-      if (fastSet.length > 0) {
+      // Speed tier BY MEASUREMENT: rank by observed per-model speed
+      // (TTFT + tokens/sec EWMA) and keep the fastest quartile (min 4).
+      // Name heuristic (flash/mini/...) is only the cold-start fallback
+      // while telemetry accumulates.
+      const measured = candidates
+        .map((m) => ({ m, s: this.costTracker.getModelSpeedScore(m.provider, m.model) }))
+        .filter((x): x is { m: (typeof candidates)[number]; s: number } => x.s !== null);
+      let fastSet: typeof candidates = [];
+      if (measured.length >= 4) {
+        measured.sort((a, b) => b.s - a.s);
+        const keep = Math.max(4, Math.ceil(measured.length * 0.25));
+        fastSet = measured.slice(0, keep).map((x) => x.m);
         logger.info(
-          `Tier=fast: routing constrained to ${fastSet.length} speed-tier candidates.`,
+          `Tier=fast: top ${keep} of ${measured.length} measured candidates by TTFT/TPS speed score.`,
         );
+      } else {
+        const regexSet = candidates.filter(
+          (m) => /flash|mini|turbo|lite|gemma/i.test(m.model) || m.isLocal,
+        );
+        if (regexSet.length > 0) {
+          fastSet = regexSet;
+          logger.info(
+            `Tier=fast: only ${measured.length} models have speed telemetry — name heuristic in effect (${regexSet.length} candidates) until metrics accumulate.`,
+          );
+        }
+      }
+      if (fastSet.length > 0) {
         candidates = fastSet;
       } else {
-        logger.warn("Tier=fast: no speed-tier candidates available — using full candidate set.");
+        logger.warn("Tier=fast: no candidates — using full candidate set.");
       }
     }
 
@@ -584,7 +604,7 @@ export class RoutingEngine {
       const reliabilityScore =
         this.costTracker.getReliabilityScore(modelEntry.provider, modelEntry.model);
       let costScore = this.costTracker.getCostScore(modelEntry.provider);
-      let latencyScore = this.costTracker.getLatencyScore(modelEntry.provider);
+      let latencyScore = this.costTracker.getLatencyScore(modelEntry.provider, modelEntry.model);
 
       // ─── Ollama warm/cold scoring adjustments ───
       let warmthAdjust = 0;
