@@ -637,6 +637,34 @@ export class ProxyServerStreaming {
         return;
       }
 
+      // Admin restart — Layer 1 of the no-elevation restart bridge (2026-09-06).
+      // Gated by ROUTER_ADMIN_TOKEN (Bearer or x-admin-token header). Clean exit;
+      // NSSM's default restart-on-exit respawns the process (~1.5s), loading any
+      // freshly compiled dist/. In-flight streams are cut — restart during idle.
+      if (url === "/admin/restart" && req.method === "POST") {
+        const token = process.env.ROUTER_ADMIN_TOKEN;
+        if (!token) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "admin restart disabled", message: "ROUTER_ADMIN_TOKEN not configured" }));
+          return;
+        }
+        const auth = req.headers["authorization"];
+        const provided =
+          (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
+          (req.headers["x-admin-token"] as string | undefined);
+        if (provided !== token) {
+          logger.warn("Admin restart denied: bad or missing token");
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "forbidden" }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "restarting", message: "clean exit; service manager will restart" }));
+        logger.info("ADMIN RESTART requested — exiting cleanly for service restart");
+        setTimeout(() => process.exit(0), 500);
+        return;
+      }
+
       if (url === "/v1/benchmark/embeddings" && req.method === "POST") {
         const benchmark = new EmbeddingBenchmark(this.db);
         try {
