@@ -1,6 +1,6 @@
 # Cognitive Router — Development Roadmap
 
-> Last updated: 2026-07-27 20:39 CDT
+> Last updated: 2026-09-05 22:25 CDT
 > Location: `C:\Users\hi100\.openclaw\workspace\cognitive-router\`
 
 ## Vision
@@ -153,6 +153,36 @@ The Cognitive Router makes model pluralism (Karlism Principle 11) work in practi
 - Warm model: remove GPU penalty, boost latency score
 - Cold model: add cold-start latency estimate (~5-10s for 7B)
 - Log warm/cold status in decisions
+
+---
+
+## Phase 3 — Provider Coverage & Universal Discovery (Product Foundation)
+
+> Added 2026-09-05 — this is the ticket to start building the product. The router sells model pluralism; it can only do that if it spans the actual model market. Current state: 5 providers (zai, openrouter, gemini, requesty, ollama), mostly hardcoded model lists.
+
+### P3-001: Direct adapters for all major providers
+- **Tier 1:** OpenAI, Anthropic, xAI, Mistral, DeepSeek (direct)
+- **Tier 2:** Cohere, Together, Groq, Fireworks, Cerebras, Perplexity
+- **Tier 3 (gated):** AWS Bedrock, Azure OpenAI — enterprise auth complexity, defer until paying users need them
+- Each adapter implements the `buildZaiThinkingFields` pattern: per-model reasoning-effort dialect translated from provider docs (OpenAI `reasoning_effort`, Anthropic `thinking.budget_tokens`, etc.), streaming + buffered paths, error classification into the existing failure taxonomy, circuit breaker, per-provider budget/credential config
+
+### P3-002: Universal model discovery — kill hardcoded lists
+- Poll every provider's list-models endpoint on a cadence; ingest into model_registry with capability metadata (context window, modalities, tool support, reasoning support, pricing)
+- Auto-prune dead/deprecated models (extend the openrouter-liveness pattern to all providers)
+- Name-regex capability heuristics die completely — discovery metadata + measurement take over cold-start
+
+### P3-003: Pricing intelligence, generalized
+- Generalize the zai docs-based price-table approach (quota-burn weights, off-peak factors) into a per-provider pricing module with review dates
+- OpenRouter `/api/v1/models` carries pricing natively — ingest it
+- Wire uniformly into cost scoring and quota-burn weights
+
+### P3-004: Scoring at market scale
+- Candidate pool grows from ~dozens to 1000+ models — prefilter by capability tier/modality/context before full scoring
+- Judge + EWMA latency + reliability learning loop stays provider-agnostic and measurement-based
+
+### P3-005: Product surface
+- Adding a provider = drop in a key, everything else automatic
+- `/stats` + dashboard show the full market view; OpenClaw plugin config maps onto the same provider set
 
 ---
 
