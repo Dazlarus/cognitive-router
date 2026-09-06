@@ -39,11 +39,25 @@ export interface DiscoverySummary {
 }
 
 /** Gemini listing excludes non-chat experiment families. */
-const GEMINI_EXCLUDE = /embedding|aqa|imagen|tts|veo|native-audio/i;
+const GEMINI_EXCLUDE = /embedding|aqa|imagen|tts|veo|native-audio|lyria/i;
 
 /** OpenClaw's public model catalog — maintained multi-provider pricing
  *  (13.7k+ entries, refreshed upstream ~daily). Read-only GET, no user data
  *  leaves the machine. Override for mirrors/offline via env. */
+/** Catalog key candidates: provider/model, provider.model (anthropic dot
+ *  notation), vendor aliases (gemini -> google), bare model id. Exported
+ *  standalone so tests + the dry-run harness exercise the real lookup. */
+export function catalogKeyCandidates(provider: string, model: string): string[] {
+  const aliases: Record<string, string[]> = { gemini: ["google"] };
+  const prefixes = [provider, ...(aliases[provider] ?? [])];
+  const out: string[] = [];
+  for (const p of prefixes) {
+    out.push(`${p}/${model}`, `${p}.${model}`);
+  }
+  out.push(model);
+  return out;
+}
+
 const PRICING_CATALOG_URL =
   process.env.ROUTER_PRICING_CATALOG_URL ??
   "https://catalog.openclaw.ai/models/v1/catalog.json";
@@ -266,17 +280,9 @@ export class ModelDiscovery {
     }
   }
 
-  /** Catalog key candidates: provider/model, provider.model (anthropic dot
-   *  notation), vendor aliases (gemini -> google), bare model id. */
+  /** Catalog key candidates (standalone, tested). */
   private catalogKeyCandidates(provider: string, model: string): string[] {
-    const aliases: Record<string, string[]> = { gemini: ["google"] };
-    const prefixes = [provider, ...(aliases[provider] ?? [])];
-    const out: string[] = [];
-    for (const p of prefixes) {
-      out.push(`${p}/${model}`, `${p}.${model}`);
-    }
-    out.push(model);
-    return out;
+    return catalogKeyCandidates(provider, model);
   }
 
   /** Price lookup with exact + variant-suffix matching (:0, :batch, :v2 …).
