@@ -216,7 +216,13 @@ export function makeJudgeCaller(): JudgeCaller {
             messages: [{ role: "user", content: filled }],
             stream: false,
             temperature: 0.1,
-            max_tokens: 100,
+            // Thinking models (e.g. gemma4 via Ollama's OpenAI-compat layer)
+            // emit reasoning tokens BEFORE content; a 100-token cap burns the
+            // whole budget on reasoning and returns empty content (found live
+            // by the 2026-09-06 canary: finish_reason=length, content="", 
+            // reasoning populated). Non-thinking judges still stop after one
+            // token, so the headroom is free for them.
+            max_tokens: 1024,
           } as any,
           apiKey,
         );

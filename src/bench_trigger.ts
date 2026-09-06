@@ -79,6 +79,10 @@ export function collectBenchable(registry: ModelRegistry): BenchableIdentity[] {
 
   for (const m of registry.getAllModels()) {
     if (isEmbeddingOnlyModel(m.provider, m.model)) continue;
+    // Meta-router slugs (openrouter/auto*) are not real identities: they
+    // delegate to whatever underlying model OpenRouter picks, so benching
+    // them measures a moving target at unknown cost.
+    if (m.provider === "openrouter" && /^auto/i.test(m.model)) continue;
     const priced = m.costPer1kInput !== undefined && m.costPer1kOutput !== undefined;
     if (!m.isLocal && !priced) continue; // quarantined remote
 
@@ -338,7 +342,9 @@ async function canaryPair(
           messages: [{ role: "user", content: filled }],
           stream: false,
           temperature: 0.1,
-          max_tokens: 100,
+          // 1024 not 100: thinking models burn the budget on reasoning
+          // before content (see makeJudgeCaller note; found by live canary).
+          max_tokens: 1024,
         } as any,
         apiKey,
       );
@@ -407,20 +413,29 @@ export async function runCanary(
     };
   }
 
-  // Mixed pair: prefer the two cheapest identities from distinct families
+  // Mixed pair: cheapest representatives of distinct non-judge families;
+  // try up to 3 pairings so one dead free-tier generator (observed live:
+  // cohere/north-mini-code:free empty response) can't sink the canary.
   const byFamily = new Map<string, BenchableIdentity>();
   for (const i of nonJudgeFamilies) {
     if (!byFamily.has(identityFamily(i))) byFamily.set(identityFamily(i), i);
   }
-  const mixedCandidates = [...byFamily.values()].slice(0, 2);
-  if (mixedCandidates.length === 2) {
-    result.mixed = await canaryPair(
-      "mixed",
-      mixedCandidates[0],
-      mixedCandidates[1],
-      judges,
-    );
-  } else {
+  const reps = [...byFamily.values()];
+  const pairings: Array<[BenchableIdentity, BenchableIdentity]> = [
+    [reps[0], reps[1]], [reps[0], reps[2]], [reps[1], reps[2]],
+  ].filter((p): p is [BenchableIdentity, BenchableIdentity] =>
+    p[0] !== undefined && p[1] !== undefined);
+
+  result.mixed = undefined;
+  for (const [x, y] of pairings) {
+    const attempt = await canaryPair("mixed", x, y, judges);
+    if (!attempt.error) {
+      result.mixed = attempt;
+      break;
+    }
+    result.mixed = attempt; // keep last error for reporting
+  }
+  if (!result.mixed) {
     result.mixed = {
       label: "mixed",
       a: "",
@@ -430,7 +445,7 @@ export async function runCanary(
       judgeUsed: "",
       verdict: "tie",
       roundTripMs: 0,
-      error: `need 2 distinct non-${primaryFamily} families, have ${mixedCandidates.length}`,
+      error: `need 2 distinct non-${primaryFamily} families, have ${reps.length}`,
     };
   }
   void db;
