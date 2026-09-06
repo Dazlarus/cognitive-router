@@ -81,6 +81,10 @@ function makeCap(provider: string, model: string, contextWindow: number): ModelC
     modalities: ["text"],
     capabilities: { ...NO_CAPS },
     isLocal: false,
+    // Remotes must carry explicit pricing (free-vs-unknown rule) or the
+    // quarantine filter correctly drops them (test would hit last-resort).
+    costPer1kInput: 0.001,
+    costPer1kOutput: 0.002,
     source: "benchmark",
     planEligible: true,
   };
@@ -279,8 +283,12 @@ describe("Context window pre-filter — token estimator", () => {
     const empty = estimateTokenCount({ messages: [] } as any);
     assert.ok(empty >= 0 && empty < 10, `empty request should estimate ~0, got ${empty}`);
 
-    const short = estimateTokenCount({ messages: [{ role: "user", content: "x".repeat(400) }] } as any);
-    const long = estimateTokenCount({ messages: [{ role: "user", content: "x".repeat(4_000) }] } as any);
+    // Realistic filler: repeated single chars get BPE-merged aggressively
+    // (~8 chars/token), which is correct tokenizer behavior - the ~4
+    // chars/token heuristic only holds for word-like text.
+    const filler = (n: number) => "the quick brown fox jumps over the lazy dog ".repeat(Math.ceil(n / 45)).slice(0, n);
+    const short = estimateTokenCount({ messages: [{ role: "user", content: filler(400) }] } as any);
+    const long = estimateTokenCount({ messages: [{ role: "user", content: filler(4_000) }] } as any);
     assert.ok(long > short, "estimate must grow with content size");
 
     // Heuristic scale: 4,000 chars ≈ 800–1,400 tokens under both the

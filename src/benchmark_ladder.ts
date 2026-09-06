@@ -54,7 +54,7 @@ export function decodeKey(s: string): BenchModelKey {
 /** Extract quant family from an Ollama tag.
  *  "qwen3:14b-instruct-q4_K_M" -> { model: "qwen3:14b-instruct", quant: "q4" } */
 export function parseOllamaQuant(tag: string): { model: string; quant: string } {
-  const m = tag.match(/[-:_]q(\d)(?:_[A-Za-z0-9]+)?$/i);
+  const m = tag.match(/[-:_]q(\d)(?:_[A-Za-z0-9]+)*$/i);
   if (!m) return { model: tag, quant: AS_SERVED };
   return { model: tag.slice(0, m.index), quant: `q${m[1].toLowerCase()}` };
 }
@@ -306,7 +306,11 @@ export interface PairRecord {
 
 /** Bradley-Terry strength via MM iteration over collapsed pair verdicts.
  *  Ties split 0.5/0.5 (simple Davidson approximation — documented
- *  convention). Strengths are anchored to geometric mean 1. */
+ *  convention). Every model carries a weak prior: half a win against a
+ *  virtual strength-1 opponent. Without it a winless model collapses to
+ *  zero, MM stops converging, and the geometric-mean anchor breaks
+ *  (found by tests/benchmark.test.ts). Strengths are anchored to
+ *  geometric mean 1. */
 export function computeBradleyTerry(
   pairs: PairRecord[],
   iterations = 64,
@@ -331,14 +335,14 @@ export function computeBradleyTerry(
   for (let it = 0; it < iterations; it++) {
     const next = new Map<string, number>();
     for (const i of keys) {
-      let denom = 0;
+      let denom = 1 / ((s.get(i) ?? 1) + 1); // virtual tie vs strength-1
       for (const j of keys) {
         if (i === j) continue;
         const pk = [i, j].sort().join("\u0000");
         const nij = n.get(pk) ?? 0;
         if (nij > 0) denom += nij / ((s.get(i) ?? 1) + (s.get(j) ?? 1));
       }
-      const w = wins.get(i) ?? 0;
+      const w = (wins.get(i) ?? 0) + 0.5; // prior half-win
       next.set(i, denom > 0 ? w / denom : 1);
     }
     // anchor: geometric mean = 1

@@ -12,7 +12,8 @@
     "install-service": "tsx scripts/install-service.ts",
     "uninstall-service": "tsx scripts/install-service.ts --uninstall",
     "test": "tsx --test tests/*.test.ts",
-    "service-status": "tsx scripts/install-service.ts --status"
+    "service-status": "tsx scripts/install-service.ts --status",
+    "bench:dryrun": "tsx scripts/bench-dryrun.ts"
   },
   "keywords": [
     "llm",

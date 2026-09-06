@@ -159,7 +159,7 @@ function getJudgeCandidates(): BenchEndpoint[] {
   ];
 }
 
-const A_B_JUDGE_PROMPT = `You are an impartial judge comparing two responses (A and B) to the same prompt.
+export const A_B_JUDGE_PROMPT = `You are an impartial judge comparing two responses (A and B) to the same prompt.
 
 [PROMPT]
 {prompt}
@@ -179,7 +179,7 @@ winner when they are equally good or equally flawed.
 
 Answer with EXACTLY one token on the first line: A, B, or TIE.`;
 
-function parseAbVerdict(content: string): Verdict | null {
+export function parseAbVerdict(content: string): Verdict | null {
   const head = content.trim().slice(0, 200);
   const m = head.match(/\b(A|B|TIE)\b/i);
   if (!m) return null;
