@@ -1481,6 +1481,132 @@ export class DBService {
     this.db.close();
     logger.info("Database connection closed.");
   }
+
+  /** Store one raw benchmark ask (uncollapsed; 2 rows per round). */
+  insertBenchmarkVerdict(data: {
+    modelA: string;
+    modelB: string;
+    intent: string;
+    promptGeneration: string;
+    round: number;
+    swapOrder: 0 | 1;
+    verdict: "a" | "b" | "tie";
+    judgeProvider?: string;
+    judgeModel?: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO benchmark_verdicts
+        (timestamp, model_a, model_b, intent, prompt_generation,
+         round, swap_order, verdict, judge_provider, judge_model)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      new Date().toISOString(),
+      data.modelA,
+      data.modelB,
+      data.intent,
+      data.promptGeneration,
+      data.round,
+      data.swapOrder,
+      data.verdict,
+      data.judgeProvider ?? null,
+      data.judgeModel ?? null,
+    );
+  }
+
+  /** Raw ask rows for one pair (either stored direction), normalized to the
+   *  (modelA=modelA arg, modelB=modelB arg) perspective: rows stored reversed
+   *  come back with models swapped and the verdict flipped. */
+  getBenchmarkVerdicts(
+    modelA: string,
+    modelB: string,
+    intent: string,
+    promptGeneration: string,
+  ): Array<{
+    modelA: string;
+    modelB: string;
+    round: number;
+    swapOrder: 0 | 1;
+    verdict: "a" | "b" | "tie";
+  }> {
+    const rows = this.db.prepare(`
+      SELECT model_a, model_b, round, swap_order, verdict
+      FROM benchmark_verdicts
+      WHERE intent = ? AND prompt_generation = ?
+        AND ((model_a = ? AND model_b = ?) OR (model_a = ? AND model_b = ?))
+    `).all(intent, promptGeneration, modelA, modelB, modelB, modelA) as any[];
+    return rows.map((r) =>
+      r.model_a === modelA
+        ? {
+            modelA: r.model_a,
+            modelB: r.model_b,
+            round: r.round,
+            swapOrder: r.swap_order as 0 | 1,
+            verdict: r.verdict,
+          }
+ : {
+            modelA: r.model_b,
+            modelB: r.model_a,
+            round: r.round,
+            swapOrder: r.swap_order as 0 | 1,
+            verdict: r.verdict === "a" ? "b" : r.verdict === "b" ? "a" : "tie",
+          },
+    );
+  }
+
+  /** All raw ask rows for an intent + generation, NOT normalized. */
+  getAllBenchmarkVerdicts(
+    intent: string,
+    promptGeneration: string,
+  ): Array<{
+    modelA: string;
+    modelB: string;
+    round: number;
+    swapOrder: 0 | 1;
+    verdict: "a" | "b" | "tie";
+  }> {
+    const rows = this.db.prepare(`
+      SELECT model_a AS modelA, model_b AS modelB, round,
+             swap_order AS swapOrder, verdict
+      FROM benchmark_verdicts
+      WHERE intent = ? AND prompt_generation = ?
+    `).all(intent, promptGeneration) as any[];
+    return rows;
+  }
+
+  /** Distinct model keys known to the ladder for an intent + generation. */
+  getLadderKeys(intent: string, promptGeneration: string): string[] {
+    const rows = this.db.prepare(`
+      SELECT model_key AS modelKey
+      FROM benchmark_ladder
+      WHERE intent = ? AND prompt_generation = ?
+      ORDER BY rank ASC
+    `).all(intent, promptGeneration) as any[];
+    return rows.map((r) => r.modelKey);
+  }
+
+  /** Replace the stored ladder for an intent + generation (transactional). */
+  replaceLadder(
+    intent: string,
+    promptGeneration: string,
+    entries: Array<{ modelKey: string; rank: number; strength: number }>,
+  ): void {
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`
+        DELETE FROM benchmark_ladder
+        WHERE intent = ? AND prompt_generation = ?
+      `).run(intent, promptGeneration);
+      const ins = this.db.prepare(`
+        INSERT INTO benchmark_ladder
+          (intent, prompt_generation, model_key, rank, strength, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      const now = new Date().toISOString();
+      for (const e of entries) {
+        ins.run(intent, promptGeneration, e.modelKey, e.rank, e.strength, now);
+      }
+    });
+    tx();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1620,6 +1746,30 @@ CREATE TABLE IF NOT EXISTS chat_benchmark_results (
   model_version_hash TEXT NOT NULL,
   timestamp       TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS benchmark_verdicts (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp         TEXT NOT NULL,
+  model_a           TEXT NOT NULL,
+  model_b           TEXT NOT NULL,
+  intent            TEXT NOT NULL,
+  prompt_generation TEXT NOT NULL,
+  round             INTEGER NOT NULL,
+  swap_order        INTEGER NOT NULL,
+  verdict           TEXT NOT NULL,
+  judge_provider    TEXT,
+  judge_model       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS benchmark_ladder (
+  intent            TEXT NOT NULL,
+  prompt_generation TEXT NOT NULL,
+  model_key         TEXT NOT NULL,
+  rank              INTEGER NOT NULL,
+  strength          REAL NOT NULL,
+  updated_at        TEXT NOT NULL,
+  PRIMARY KEY (intent, prompt_generation, model_key)
+);
 `;
 
 const INDEX_SCHEMA_SQL = `
@@ -1639,4 +1789,5 @@ CREATE INDEX IF NOT EXISTS idx_curator_prune_provider ON curator_prune_tracking(
 CREATE INDEX IF NOT EXISTS idx_chat_bench_model ON chat_benchmark_results(model_id);
 CREATE INDEX IF NOT EXISTS idx_chat_bench_probe ON chat_benchmark_results(probe_type);
 CREATE INDEX IF NOT EXISTS idx_chat_bench_timestamp ON chat_benchmark_results(timestamp);
+CREATE INDEX IF NOT EXISTS idx_bench_verdicts_pair ON benchmark_verdicts(model_a, model_b, intent, prompt_generation);
 `;
