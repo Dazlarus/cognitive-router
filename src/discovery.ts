@@ -122,9 +122,12 @@ export class ModelDiscovery {
         ]) {
           try {
             const found = await fetcher.call(this);
-            for (const { provider, model } of found) {
-              if (this.registry.registerExternalModel(provider, model)) {
-                summary.registered.push(`${provider}/${model}`);
+            for (const f of found) {
+              if (this.registry.registerExternalModel(f.provider, f.model, {
+                costPer1kInput: f.costPer1kInput,
+                costPer1kOutput: f.costPer1kOutput,
+              })) {
+                summary.registered.push(`${f.provider}/${f.model}`);
               } else {
                 summary.alreadyKnown++;
               }
@@ -170,7 +173,7 @@ export class ModelDiscovery {
 
   // ---------- extended providers ----------
 
-  private async fetchOpenRouter(): Promise<Array<{ provider: string; model: string }>> {
+  private async fetchOpenRouter(): Promise<Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }>> {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) return [];
     const resp = await fetch("https://openrouter.ai/api/v1/models", {
@@ -179,18 +182,26 @@ export class ModelDiscovery {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = (await resp.json()) as any;
-    const out: Array<{ provider: string; model: string }> = [];
+    const out: Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }> = [];
     for (const m of data.data ?? []) {
       if (typeof m?.id !== "string" || !m.id) continue;
       // Chat-capable only: output must include text.
       const outputs: string[] = m?.architecture?.output_modalities ?? ["text"];
       if (!outputs.includes("text")) continue;
-      out.push({ provider: "openrouter", model: m.id });
+      // Pricing ships per-million tokens as strings; store per-1k.
+      const inPerM = parseFloat(m?.pricing?.prompt);
+      const outPerM = parseFloat(m?.pricing?.completion);
+      out.push({
+        provider: "openrouter",
+        model: m.id,
+        costPer1kInput: Number.isFinite(inPerM) ? inPerM / 1000 : undefined,
+        costPer1kOutput: Number.isFinite(outPerM) ? outPerM / 1000 : undefined,
+      });
     }
     return out;
   }
 
-  private async fetchAnthropic(): Promise<Array<{ provider: string; model: string }>> {
+  private async fetchAnthropic(): Promise<Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }>> {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) return [];
     const resp = await fetch("https://api.anthropic.com/v1/models?limit=1000", {
@@ -211,7 +222,7 @@ export class ModelDiscovery {
     return out;
   }
 
-  private async fetchGemini(): Promise<Array<{ provider: string; model: string }>> {
+  private async fetchGemini(): Promise<Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }>> {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) return [];
     const base =

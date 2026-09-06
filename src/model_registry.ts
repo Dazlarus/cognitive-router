@@ -449,7 +449,7 @@ export class ModelRegistry {
   registerExternalModel(
     provider: string,
     model: string,
-    opts?: { local?: boolean; contextWindow?: number },
+    opts?: { local?: boolean; contextWindow?: number; costPer1kInput?: number; costPer1kOutput?: number },
   ): boolean {
     const key = `${provider}/${model}`;
     if (this.models.has(key)) return false;
@@ -460,6 +460,10 @@ export class ModelRegistry {
     };
     const m = makeModel(provider, model, opts?.contextWindow ?? 128_000, caps,
       opts?.local ? { local: true } : {});
+    // Pricing MUST be set when known: cost scoring treats missing cost as
+    // free (?? 0 + free-boost) - unpriced paid models would dominate picks.
+    if (opts?.costPer1kInput !== undefined) m.costPer1kInput = opts.costPer1kInput;
+    if (opts?.costPer1kOutput !== undefined) m.costPer1kOutput = opts.costPer1kOutput;
     m.source = "inferred";
     this.models.set(key, m);
     logger.info(`Registered discovered model: ${key}`);
