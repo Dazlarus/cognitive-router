@@ -39,7 +39,6 @@ export function effortPolicyMode(): "auto" | "passthrough" {
 
 export function decideOutboundEffort(input: {
   intent: string;
-  estimatedTokens: number;
   /** Explicit client lever: "high" floors, "medium" pins, "low" caps. "none"/absent = router free. */
   clientHint?: string | null;
   speedMode?: string | null;
@@ -49,13 +48,6 @@ export function decideOutboundEffort(input: {
   const trace: string[] = [];
   let level: EffortLevel = HEAVY_INTENTS.has(input.intent) ? "medium" : "low";
   trace.push(`base(${input.intent})=${level}`);
-
-  // Already-expensive requests: don't stack deep thinking on a 100k+ context.
-  if (input.estimatedTokens > 100_000) {
-    const next = step(level, -1);
-    if (next !== level) trace.push(`ctx>100k→${next}`);
-    level = next;
-  }
 
   // Budget pressure: buy less thinking when the wallet is thin.
   if ((input.quotaMultiplier ?? 1) > 1 || input.budgetExceeded) {

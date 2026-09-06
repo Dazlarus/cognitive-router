@@ -903,7 +903,6 @@ export class ProxyServerStreaming {
     const effortDecision = effortPolicyMode() === "auto"
       ? decideOutboundEffort({
           intent: classification.intent,
-          estimatedTokens,
           clientHint: reqEffort,
           speedMode: reqSpeedMode,
           quotaMultiplier: this.costTracker.getCurrentQuotaMultiplier(),
