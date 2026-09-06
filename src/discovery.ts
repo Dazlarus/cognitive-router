@@ -202,12 +202,25 @@ export class ModelDiscovery {
   /** Upsert/resolve pricing gaps from current registry state.
    *  Returns the number of open gaps after the sweep. */
   private sweepPricingGaps(): number {
+    const known = new Set(
+      this.registry.getAllModels().map((m) => `${m.provider}/${m.model}`),
+    );
     for (const m of this.registry.getAllModels()) {
       if (m.isLocal) continue;
       if (m.costPer1kInput === undefined) {
         this.db.upsertPricingGap(m.provider, m.model);
       } else {
         this.db.resolvePricingGap(m.provider, m.model);
+      }
+    }
+    // Close gaps for models no longer in the registry (excluded/removed):
+    // they cannot route at all, so an open gap would be misleading.
+    for (const g of this.db.getPricingGaps()) {
+      if (!known.has(`${g.provider}/${g.model}`)) {
+        this.db.resolvePricingGap(g.provider, g.model);
+        logger.info(
+          `[pricing] gap closed for vanished model ${g.provider}/${g.model}`,
+        );
       }
     }
     return this.db.getPricingGaps().length;
