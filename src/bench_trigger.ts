@@ -79,14 +79,17 @@ export function collectBenchable(registry: ModelRegistry): BenchableIdentity[] {
 
   for (const m of registry.getAllModels()) {
     if (isEmbeddingOnlyModel(m.provider, m.model)) continue;
-    // Meta-router slugs are not real identities: they delegate to whatever
-    // underlying model the router picks (moving target). OpenRouter lists
-    // some with the vendor prefix baked in ("openrouter/auto",
-    // "openrouter/auto-beta"), some bare ("auto-beta", "fusion").
-    // Fusion is the same class as auto* — a smart-router, not a model.
+    // The ENTIRE openrouter/* namespace is meta, not models: their public
+    // listing exposes only routers/utilities there (auto, auto-beta, fusion,
+    // pareto-code, free, bodybuilder — verified against the live listing
+    // 2026-09-06). Some appear double-prefixed (model id itself starts with
+    // openrouter/), some bare (auto-beta). None is a benchable identity:
+    // each delegates to a moving target (pareto-code literally re-ranks by
+    // Artificial Analysis). Exclude the namespace + defensive bare forms.
     if (
       m.provider === "openrouter" &&
-      /(?:^|\/)(auto(?=-|$)|fusion$)/i.test(m.model)
+      (m.model.toLowerCase().startsWith("openrouter/") ||
+        /(?:^|\/)(auto(?=-|$)|fusion$|pareto-code$)/i.test(m.model))
     ) continue;
     const priced = m.costPer1kInput !== undefined && m.costPer1kOutput !== undefined;
     if (!m.isLocal && !priced) continue; // quarantined remote
