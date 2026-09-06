@@ -3,6 +3,7 @@
 // Or:  node dist/scripts/install-service.js
 
 import { Service } from "node-windows";
+import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -60,9 +61,9 @@ if (arg === "--uninstall") {
   svc.uninstall();
 } else if (arg === "--status") {
   // node-windows doesn't have a status method, use sc.exe
-  const { execSync } = require("node:child_process");
   try {
-    const status = execSync('sc query "Cognitive Router"').toString();
+    // node-windows/winsw registers the service under the slugified exe id, not the display name
+    const status = execSync('sc query "cognitiverouter.exe"').toString();
     console.log(status);
   } catch {
     console.log("Service not found.");
