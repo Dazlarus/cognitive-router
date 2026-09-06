@@ -202,6 +202,10 @@ Returns router aliases: `CognitiveRouter:latest`, `CogRouter:latest` (legacy), `
 
 Live provider health, model registry, per-intent capability scores, circuit breaker state, and fallback configuration.
 
+### `POST /admin/restart`
+
+Graceful self-restart: the process exits cleanly and your service manager (NSSM, systemd, Docker) respawns it. Requires `ROUTER_ADMIN_TOKEN` in `.env` plus `Authorization: Bearer <token>`; returns `503` if no token is configured. In-flight streams are cut — restart during quiet periods.
+
 ## Configuration
 
 All configuration is via environment variables (`.env` file):
@@ -215,6 +219,10 @@ All configuration is via environment variables (`.env` file):
 | `ROUTER_VRAM_LIMIT` | `11` | Max VRAM (GB) for local models |
 | `ROUTER_REQUEST_TIMEOUT_MS` | `55000` | Total deadline per request |
 | `ROUTER_MAX_ATTEMPTS_PER_PROVIDER` | `1` | Models to try per provider before moving on |
+| `ROUTER_BIND_HOST` | `127.0.0.1` | Bind address. Non-loopback hosts **require** `ROUTER_API_KEYS` or the router refuses to start |
+| `ROUTER_API_KEYS` | — | Comma-separated inbound Bearer keys (central-server mode) |
+| `ROUTER_ADMIN_TOKEN` | — | Token gating `POST /admin/restart` (generate your own) |
+| `ROUTER_JUDGE_SAMPLE_RATE` | `0.10` | Fraction of responses quality-judged; `0` disables |
 | `ZAI_API_KEY` | — | Z.AI API key |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key |
 | `GEMINI_API_KEY` | — | Google Gemini API key |
@@ -309,6 +317,20 @@ cognitive-router/
 | [OpenRouter](https://openrouter.ai/) | Remote | Qwen3-coder (free), Nemotron (free), Owl-alpha |
 | [Google Gemini](https://ai.google.dev/) | Remote | Gemini 3.5 Flash, Gemini 2.5 Flash |
 | [Ollama](https://ollama.ai/) | Local | Any local model (VRAM-filtered) |
+
+## Privacy & Security
+
+**Loopback-only by default; zero telemetry.** The router binds `127.0.0.1` and makes no phone-home calls — no analytics, no crash reporting, no usage beacons. Routing decisions live in a local SQLite database; logs stay on your disk.
+
+Where your data can go, honestly:
+
+- **Your configured providers.** Routing means forwarding: prompts go to whichever provider serves a request (Z.AI, OpenRouter, Gemini, …). Local Ollama traffic never leaves your machine.
+- **The quality judge (sampled).** A fraction of request/response pairs — prompt, response, and classified intent — go to the judge provider (`ROUTER_JUDGE_PROVIDER`, default OpenRouter) to score routing quality. Set `ROUTER_JUDGE_SAMPLE_RATE=0` to disable.
+- **Your provider's quota endpoint.** With a Z.AI key configured, the router polls Z.AI's usage-monitor endpoint using that key to steer around quota windows. That call goes to Z.AI, about your account — nowhere else.
+
+### Central-server mode
+
+Running the router for other people? Set `ROUTER_BIND_HOST=0.0.0.0` and generate strong keys for `ROUTER_API_KEYS`. **A non-loopback bind without API keys refuses to start.** With keys set, inbound requests require `Authorization: Bearer <key>` (`/health` stays open for load-balancer probes). The router itself speaks plain HTTP — put TLS in front of it — and as the operator you become the custodian of your users' traffic, so treat logs accordingly.
 
 ## Contributing
 
