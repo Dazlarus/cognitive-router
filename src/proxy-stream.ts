@@ -35,6 +35,7 @@ import { buildStatsPayload } from "./stats.js";
 import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
 import { BudgetTracker } from "./budget_tracker.js";
 import { ModelCurator } from "./curator.js";
+import { ModelDiscovery } from "./discovery.js";
 import { JudgeEvaluator } from "./judge.js";
 import { decideOutboundEffort, effortPolicyMode } from "./effort_policy.js";
 import { getZaiQuotaProbe } from "./quota_probe.js";
@@ -333,6 +334,7 @@ export class ProxyServerStreaming {
   private embedFn: (text: string) => Promise<number[]>;
   private judge: JudgeEvaluator;
   private curator: ModelCurator;
+  private discovery: ModelDiscovery;
   private initialized = false;
 
   constructor(config: CognitiveRouterConfig) {
@@ -357,6 +359,7 @@ export class ProxyServerStreaming {
     this.embedFn = this.createEmbedder();
     this.judge = new JudgeEvaluator();
     this.curator = new ModelCurator(this.db, this.modelRegistry, config);
+    this.discovery = new ModelDiscovery(this.modelRegistry);
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res).catch((err) => {
         logger.error(`Unhandled error: ${err}`);
@@ -408,6 +411,9 @@ export class ProxyServerStreaming {
     // Start periodic curator (every 6h)
     this.curator.startPeriodic();
 
+    // Start periodic model discovery (hourly, auto mode only)
+    this.discovery.startPeriodic();
+
     // Check Ollama health before starting classifier embeddings
     const ollamaHealthy = await this.checkOllamaHealth();
     if (!ollamaHealthy) {
@@ -427,6 +433,7 @@ export class ProxyServerStreaming {
 
   async stop(): Promise<void> {
     this.curator.stopPeriodic();
+    this.discovery.stopPeriodic();
     this.server.close();
     this.db.close();
   }
@@ -705,6 +712,37 @@ export class ProxyServerStreaming {
         res.end(JSON.stringify({ status: "restarting", message: "clean exit; service manager will restart" }));
         logger.info("ADMIN RESTART requested — exiting cleanly for service restart");
         setTimeout(() => process.exit(0), 500);
+        return;
+      }
+
+      // Admin discovery - forced model-discovery refresh in ANY mode.
+      // Same token gate as /admin/restart. Returns the discovery summary.
+      if (url === "/admin/discover" && req.method === "POST") {
+        const token = process.env.ROUTER_ADMIN_TOKEN;
+        if (!token) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "admin discovery disabled", message: "ROUTER_ADMIN_TOKEN not configured" }));
+          return;
+        }
+        const auth = req.headers["authorization"];
+        const provided =
+          (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
+          (req.headers["x-admin-token"] as string | undefined);
+        if (!provided || !timingSafeEqualStr(provided, token)) {
+          logger.warn("Admin discovery denied: bad or missing token");
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "forbidden" }));
+          return;
+        }
+        try {
+          const summary = await this.discovery.run("admin");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(summary, null, 2));
+        } catch (err) {
+          logger.error(`Discovery failed: ${err}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "discovery failed", message: err instanceof Error ? err.message : String(err) }));
+        }
         return;
       }
 

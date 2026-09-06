@@ -289,6 +289,10 @@ export class ModelRegistry {
     analysis: "analysis",
   };
 
+  /** Discovery-mode hook: when set (by ModelDiscovery), replaces built-in
+   *  endpoint discovery inside loadCachedState so modes own the behavior. */
+  discoveryHook?: () => Promise<void>;
+
   constructor(
     private db: DBService,
     private config: CognitiveRouterConfig,
@@ -300,8 +304,12 @@ export class ModelRegistry {
       this.models.set(`${m.provider}/${m.model}`, m);
     }
 
-    // Live-discover models from provider APIs
-    await this.discoverModels();
+    // Live-discover models from provider APIs (or via the discovery-mode hook)
+    if (this.discoveryHook) {
+      await this.discoveryHook();
+    } else {
+      await this.discoverModels();
+    }
 
     // Auto-benchmark discovered Ollama chat models (non-blocking — runs after server is ready)
     this.benchmarkDiscoveredModels().catch(err =>
@@ -363,7 +371,8 @@ export class ModelRegistry {
   }
 
   /** Discover available models from Z.AI and Ollama APIs at startup */
-  private async discoverModels(): Promise<void> {
+  /** Public so ModelDiscovery (auto/safe modes) can drive it. */
+  async discoverModels(): Promise<void> {
     // Discover Z.AI models
     try {
       const zaiApiKey = process.env.ZAI_API_KEY;
@@ -432,6 +441,29 @@ export class ModelRegistry {
     } catch (e) {
       logger.warn(`Failed to discover Ollama models: ${e instanceof Error ? e.message : e}`);
     }
+  }
+
+  /** Register a model discovered externally (extended providers, manual mode).
+   *  Neutral capability defaults — the benchmark ladder refines them later.
+   *  Returns true when newly registered, false when already known. */
+  registerExternalModel(
+    provider: string,
+    model: string,
+    opts?: { local?: boolean; contextWindow?: number },
+  ): boolean {
+    const key = `${provider}/${model}`;
+    if (this.models.has(key)) return false;
+    const caps: Caps = {
+      coding: 0.65, reasoning: 0.65, creative: 0.60,
+      math: 0.60, analysis: 0.65, conversation: 0.75,
+      retrieval: 0.65, science: 0.60, business: 0.65, summary: 0.70,
+    };
+    const m = makeModel(provider, model, opts?.contextWindow ?? 128_000, caps,
+      opts?.local ? { local: true } : {});
+    m.source = "inferred";
+    this.models.set(key, m);
+    logger.info(`Registered discovered model: ${key}`);
+    return true;
   }
 
   getCapability(provider: string, model: string): ModelCapability | undefined {
