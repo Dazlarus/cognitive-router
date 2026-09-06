@@ -112,6 +112,17 @@ const SEED_MODELS: ModelCapability[] = [
   // ✅ Coding Plan eligible (Opus-tier, 3× peak / 2× off-peak quota, 1× promo through Sep 2026)
   // Context-gate routing (Daz, 2026-09-03): glm-5.2 is the 1M-context class —
   // oversized requests route to it instead of skipping zai wholesale.
+  // GLM-5.3 + 5.3-flash (2026-09-05, Daz: 5.3 is based on 5.2 - 1M context class).
+  // 5.3 = new flagship reasoning tier; scores seeded slightly above 5.2 pending benchmarks.
+  // Context-gate stays on 5.2 (proven) until 5.3 earns it.
+  makeModel("zai", "glm-5.3", 1_000_000,
+    { coding: 0.90, reasoning: 0.94, creative: 0.85, math: 0.91, analysis: 0.92, conversation: 0.88, retrieval: 0.86, science: 0.94, business: 0.89, summary: 0.88 },
+    { input: 0, output: 0, usageMultiplier: 1, planEligible: true },
+  ),
+  makeModel("zai", "glm-5.3-flash", 1_000_000,
+    { coding: 0.82, reasoning: 0.84, creative: 0.78, math: 0.80, analysis: 0.82, conversation: 0.85, retrieval: 0.80, science: 0.80, business: 0.82, summary: 0.84 },
+    { input: 0, output: 0, usageMultiplier: 1, planEligible: true },
+  ),
   makeModel("zai", "glm-5.2", 1_000_000,
     { coding: 0.88, reasoning: 0.92, creative: 0.84, math: 0.90, analysis: 0.91, conversation: 0.87, retrieval: 0.85, science: 0.93, business: 0.88, summary: 0.87 },
     { input: 0, output: 0, usageMultiplier: 1, planEligible: true },

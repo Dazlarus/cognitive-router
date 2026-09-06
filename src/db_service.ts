@@ -17,7 +17,7 @@ export interface DecisionRecord {
   confidence: number;
   provider: string;
   model: string;
-  scores: Record<string, number>;
+  scores: Record<string, unknown>;
   overallScore: number;
   outcome: string;
   requestId?: string;

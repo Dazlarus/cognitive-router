@@ -885,11 +885,13 @@ export class ProxyServerStreaming {
       typeof request.model === "string" && request.model.toLowerCase().endsWith(":fast")
         ? "fast"
         : undefined;
+    const reqEffort = extractThinkingLevel(request);
+    const reqSpeedMode = extractSpeedMode(request);
     const decision = await this.router.decide(classification, sessionKey, {
       estimatedTokens,
       requiredModalities: modalityResult.modalities,
-      effortLevel: extractThinkingLevel(request),
-      speedMode: extractSpeedMode(request),
+      effortLevel: reqEffort,
+      speedMode: reqSpeedMode,
       modelTier: requestTier,
     }, req?.headers?.["x-routing-profile"] as string | undefined);
     const builtCandidates = this.buildCandidateList(decision, request);
@@ -908,7 +910,10 @@ export class ProxyServerStreaming {
         confidence: classification.confidence ?? 0.5, // Default if missing
         provider: decision.provider,
         model: decision.model,
-        scores: decision.scores,
+        scores: {
+          ...decision.scores,
+          levers: { effort: reqEffort, speed: reqSpeedMode, tier: requestTier ?? null },
+        },
         overallScore: decision.overallScore,
         outcome: decision.error ? decision.error.code : "PENDING",
         requestId,
@@ -1142,7 +1147,7 @@ export class ProxyServerStreaming {
             const genMs = Math.max(1, durationMs - ttftMs);
             const estTokensOut = Math.max(1, Math.round(accumulatedContent.length / 4));
             const tokensPerSec = estTokensOut / (genMs / 1000);
-            this.costTracker.recordSpeedSample(candidate.provider, candidate.model, ttftMs, tokensPerSec);
+            this.costTracker.recordSpeedSample(candidate.provider, candidate.model, ttftMs, tokensPerSec, reqEffort);
           }
           recordSource(true, candidate);
           // Open SSE headers now (deferred from request start) so the

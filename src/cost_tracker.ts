@@ -573,8 +573,10 @@ export class CostTracker {
   private modelSpeed = new Map<string, { ttftEwma: number; tpsEwma: number; samples: number }>();
 
   /** Record one observed speed sample for a model (streamed requests). */
-  recordSpeedSample(provider: string, model: string, ttftMs: number, tokensPerSec: number): void {
-    const key = `${provider}/${model}`;
+  recordSpeedSample(provider: string, model: string, ttftMs: number, tokensPerSec: number, effortLevel?: string): void {
+    // Effort-conditioned: reasoning-on ("high") samples live in their own bucket
+    // so a deep-thinking pass can't poison a model's fast-lane speed score.
+    const key = `${provider}/${model}|${effortLevel === "high" ? "H" : "S"}`;
     let s = this.modelSpeed.get(key);
     if (!s) {
       this.modelSpeed.set(key, { ttftEwma: ttftMs, tpsEwma: tokensPerSec, samples: 1 });
@@ -587,8 +589,8 @@ export class CostTracker {
   }
 
   /** Per-model speed score (0–1) from TTFT + throughput. null = not enough samples yet. */
-  getModelSpeedScore(provider: string, model: string): number | null {
-    const s = this.modelSpeed.get(`${provider}/${model}`);
+  getModelSpeedScore(provider: string, model: string, effortLevel?: string): number | null {
+    const s = this.modelSpeed.get(`${provider}/${model}|${effortLevel === "high" ? "H" : "S"}`);
     if (!s || s.samples < 3) return null;
     // TTFT: ≤400ms = 1.0, ≥4s = 0.0, linear between
     const ttftScore =
@@ -601,9 +603,9 @@ export class CostTracker {
 
   /** Compute latency score — per-model measured speed (TTFT/TPS) when
    *  available, otherwise the provider-level rolling average. */
-  getLatencyScore(providerName: string, modelName?: string): number {
+  getLatencyScore(providerName: string, modelName?: string, effortLevel?: string): number {
     if (modelName) {
-      const measured = this.getModelSpeedScore(providerName, modelName);
+      const measured = this.getModelSpeedScore(providerName, modelName, effortLevel);
       if (measured !== null) return measured;
     }
     const state = this.getProviderState(providerName);

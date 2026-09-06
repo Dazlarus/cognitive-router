@@ -604,7 +604,7 @@ export class RoutingEngine {
       const reliabilityScore =
         this.costTracker.getReliabilityScore(modelEntry.provider, modelEntry.model);
       let costScore = this.costTracker.getCostScore(modelEntry.provider);
-      let latencyScore = this.costTracker.getLatencyScore(modelEntry.provider, modelEntry.model);
+      let latencyScore = this.costTracker.getLatencyScore(modelEntry.provider, modelEntry.model, effortLevel);
 
       // ─── Ollama warm/cold scoring adjustments ───
       let warmthAdjust = 0;
