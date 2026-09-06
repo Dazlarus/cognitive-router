@@ -139,6 +139,14 @@ function buildZaiThinkingFields(model: string, level: string): { thinking?: unkn
     const effort = level === "high" ? "max" : level === "medium" ? "high" : "low";
     return { thinking: { type: "enabled" }, reasoning_effort: effort };
   }
+  if (/glm-5\.2/i.test(model)) {
+    // GLM-5.2 supports the full effort ladder AND a genuine disabled state
+    // (docs concept-param: low/medium internally map to high, xhigh→max;
+    // reasoning_effort requires thinking.type=enabled, GLM-5.2 and above).
+    if (level === "none") return { thinking: { type: "disabled" } };
+    const effort = level === "high" ? "max" : level === "medium" ? "medium" : "low";
+    return { thinking: { type: "enabled" }, reasoning_effort: effort };
+  }
   const thinking = buildZaiThinking(level);
   return thinking ? { thinking } : {};
 }
