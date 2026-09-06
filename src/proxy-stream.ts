@@ -21,6 +21,7 @@ import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
 import { BudgetTracker } from "./budget_tracker.js";
 import { ModelCurator } from "./curator.js";
 import { JudgeEvaluator } from "./judge.js";
+import { decideOutboundEffort, effortPolicyMode } from "./effort_policy.js";
 import { EmbeddingBenchmark, initializeBenchmarkTables } from "./benchmark_embeddings.js";
 import type { EmbeddingModelInfo } from "./benchmark_embeddings.js";
 import { raceHedgedRequests, hedgeRetryDelayMs, type HedgeCandidate } from "./hedged_request.js";
@@ -894,6 +895,24 @@ export class ProxyServerStreaming {
         : undefined;
     const reqEffort = extractThinkingLevel(request);
     const reqSpeedMode = extractSpeedMode(request);
+    // Outbound effort is the router's purchase decision (effort = tokens =
+    // cost vs depth), not a pass-through. The client lever stays a routing
+    // weight and an optional clamp inside the policy. Adapters translate the
+    // chosen level to per-provider formats (zai budget_tokens, Gemini
+    // thinkingBudget, OR reasoning_effort); ollama strips it.
+    const effortDecision = effortPolicyMode() === "auto"
+      ? decideOutboundEffort({
+          intent: classification.intent,
+          estimatedTokens,
+          clientHint: reqEffort,
+          speedMode: reqSpeedMode,
+          quotaMultiplier: this.costTracker.getCurrentQuotaMultiplier(),
+          budgetExceeded: this.costTracker.isBudgetExceeded("zai"),
+        })
+      : null;
+    if (effortDecision) {
+      logger.debug(`Effort policy: ${effortDecision.level} [${effortDecision.trace.join(" ")}]`);
+    }
     const decision = await this.router.decide(classification, sessionKey, {
       estimatedTokens,
       requiredModalities: modalityResult.modalities,
@@ -919,7 +938,12 @@ export class ProxyServerStreaming {
         model: decision.model,
         scores: {
           ...decision.scores,
-          levers: { effort: reqEffort, speed: reqSpeedMode, tier: requestTier ?? null },
+          levers: {
+            effort: reqEffort,
+            speed: reqSpeedMode,
+            tier: requestTier ?? null,
+            effortOut: effortDecision ? { level: effortDecision.level, why: effortDecision.trace.join(" ") } : "passthrough",
+          },
         },
         overallScore: decision.overallScore,
         outcome: decision.error ? decision.error.code : "PENDING",
@@ -1081,7 +1105,12 @@ export class ProxyServerStreaming {
           // a checkpoint is reached (finish_reason received). If the upstream
           // dies before that, the buffer is discarded and we silently retry
           // on the next candidate — the client never sees a truncated response.
-          const providerRequest = { ...request, model: candidate.model, stream: true };
+          const providerRequest = {
+            ...request,
+            model: candidate.model,
+            stream: true,
+            ...(effortDecision ? { thinking: effortDecision.level } : {}),
+          };
           let accumulatedContent = "";
           let hasPayload = false;
           const bufferedChunks: any[] = [];
@@ -1218,7 +1247,12 @@ export class ProxyServerStreaming {
         }
 
         // ── Non-streaming path ──
-        const providerRequest = { ...request, model: candidate.model, stream: false };
+        const providerRequest = {
+          ...request,
+          model: candidate.model,
+          stream: false,
+          ...(effortDecision ? { thinking: effortDecision.level } : {}),
+        };
         const response = await this.withRequestDeadline(
           adapter.chatCompletion(candidate.model, providerRequest, apiKey),
           requestDeadlineMs,
