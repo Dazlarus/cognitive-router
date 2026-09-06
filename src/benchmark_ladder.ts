@@ -111,9 +111,15 @@ export const LADDER_MAX_ROUNDS = 20;
 export type ModelCaller = (key: BenchModelKey, prompt: string) => Promise<string>;
 
 /** Judges two responses to one prompt; returns a/b/tie from A's perspective.
- *  Wiring must enforce family-wide judge recusal (judge family == candidate
- *  family -> alternate judge or throw). */
-export type JudgeCaller = (prompt: string, responseA: string, responseB: string) => Promise<Verdict>;
+ *  Receives both identities so wiring can enforce family-wide judge recusal
+ *  (judge family == candidate family -> alternate judge or throw). */
+export type JudgeCaller = (
+  prompt: string,
+  responseA: string,
+  responseB: string,
+  keyA?: BenchModelKey,
+  keyB?: BenchModelKey,
+) => Promise<Verdict>;
 
 export interface CompareDeps {
   db: DBService;
@@ -178,8 +184,10 @@ async function askRound(
   prompt: string,
   ra: string,
   rb: string,
+  keyA: BenchModelKey,
+  keyB: BenchModelKey,
 ): Promise<{ first: Verdict; swapped: Verdict; round: Verdict }> {
-  const first = await judge(prompt, ra, rb);
+  const first = await judge(prompt, ra, rb, keyA, keyB);
   const swappedRaw = await judge(prompt, rb, ra); // B in slot A
   const swapped: Verdict =
     swappedRaw === "a" ? "b" : swappedRaw === "b" ? "a" : "tie";
@@ -207,7 +215,7 @@ export async function comparePair(
       deps.callModel(a, prompt),
       deps.callModel(b, prompt),
     ]);
-    const { first, swapped, round } = await askRound(deps.judge, prompt, ra, rb);
+    const { first, swapped, round } = await askRound(deps.judge, prompt, ra, rb, a, b);
     deps.db.insertBenchmarkVerdict({
       modelA: aKey,
       modelB: bKey,
