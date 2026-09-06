@@ -40,6 +40,8 @@ function modelCostScore(model: ModelCapability, providerCostScore: number): numb
   return score;
 }
 
+import { getZaiQuotaProbe } from "./quota_probe.js";
+
 export function buildStatsPayload(
   modelRegistry: ModelRegistry,
   costTracker: CostTracker,
@@ -179,6 +181,7 @@ export function buildStatsPayload(
     });
 
   return {
+    zaiQuota: getZaiQuotaProbe().current(),
     providers: providerStates,
     modelHealth: modelHealthStates,
     patternFlags: costTracker.getPatternFlagSummary(),

@@ -42,17 +42,22 @@ export function decideOutboundEffort(input: {
   /** Explicit client lever: "high" floors, "medium" pins, "low" caps. "none"/absent = router free. */
   clientHint?: string | null;
   speedMode?: string | null;
-  quotaMultiplier?: number | null;
+  /** Real zai 5h-window pressure, 0-1 (from the quota probe). */
+  quotaPressure?: number | null;
   budgetExceeded?: boolean;
 }): EffortDecision {
   const trace: string[] = [];
   let level: EffortLevel = HEAVY_INTENTS.has(input.intent) ? "medium" : "low";
   trace.push(`base(${input.intent})=${level}`);
 
-  // Budget pressure: buy less thinking when the wallet is thin.
-  if ((input.quotaMultiplier ?? 1) > 1 || input.budgetExceeded) {
-    const next = step(level, -1);
-    if (next !== level) trace.push(`budget→${next}`);
+  // Budget pressure: buy less thinking when the wallet is thin. Real zai 5h
+  // window pressure (0-1) from the quota probe; paid-budget-exceeded counts.
+  let budgetSteps = 0;
+  if (input.quotaPressure != null && input.quotaPressure >= 0.9) budgetSteps = 2;
+  else if ((input.quotaPressure != null && input.quotaPressure >= 0.7) || input.budgetExceeded) budgetSteps = 1;
+  if (budgetSteps > 0) {
+    const next = step(level, -budgetSteps);
+    if (next !== level) trace.push(`budget(p=${input.quotaPressure?.toFixed(2)})→${next}`);
     level = next;
   }
 

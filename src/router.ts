@@ -10,6 +10,7 @@ import type { CognitiveRouterConfig } from "./config.js";
 import type { Classification } from "./classifier.js";
 import { isGenerationModel, generationRoutingExclusionReason } from "./model_policy.js";
 import { bucketForTokenCount, type SizeBucket } from "./cost_tracker.js";
+import { getZaiQuotaProbe, zaiQuotaCostWeight } from "./quota_probe.js";
 import type { BudgetTracker, CostEfficiency } from "./budget_tracker.js";
 import { OllamaWarmthChecker, type WarmthInfo } from "./ollama_warmth.js";
 import type { Modality } from "./modality.js";
@@ -695,6 +696,22 @@ export class RoutingEngine {
         }
       }
 
+      // ─── Zai 5h-window quota management ───
+      // Subscription economics: the window costs the same used or not, so we
+      // burn it — no penalty below 70%, flagship rides capability. As the
+      // window fills, squeeze heavy-burn models so routing tapers to the
+      // efficient tiers (5.1-flash/5.2) and we ride ~90% instead of slamming
+      // the wall. "Cheap is always more expensive than free."
+      let quotaAdjust = 0;
+      const zaiPressure = getZaiQuotaProbe().pressure();
+      if (modelEntry.provider === "zai" && zaiPressure !== null && zaiPressure >= 0.70) {
+        const ramp = Math.min((zaiPressure - 0.70) / 0.20, 1); // full strength at 90%
+        const weight = zaiQuotaCostWeight(modelEntry.model);
+        // flash(0.5) ≈ -0.03, mid(1.0) ≈ -0.18, flagship(1.5) ≈ -0.33 at full ramp
+        quotaAdjust = -0.30 * ramp * (weight - 0.4);
+        if (zaiPressure >= 0.95 && weight > 0.6) quotaAdjust -= 0.30; // near-wall: efficient tiers only
+      }
+
       // Apply budget cost weight boost: when auto-downgrade is active,
       // cost scoring carries more influence in the overall score
       const effectiveCostWeight = w.cost * budgetCostWeightBoost;
@@ -705,6 +722,7 @@ export class RoutingEngine {
         w.latency * latencyScore +
         sizeAdjust + // additive adjustment (not weighted)
         efficiencyAdjust +
+        quotaAdjust +
         warmthAdjust; // additive warmth adjustment
 
       const rationaleParts = [
@@ -713,6 +731,7 @@ export class RoutingEngine {
         `rel=${reliabilityScore.toFixed(2)}`,
         `cost=${costScore.toFixed(2)}`,
         `lat=${latencyScore.toFixed(2)}`,
+        ...(quotaAdjust !== 0 ? [`quota=${quotaAdjust.toFixed(2)}@${Math.round((zaiPressure ?? 0) * 100)}%`] : []),
         `mult=${usageMultiplier}`,
       ];
       if (requiredModalities.includes("vision") && modelEntry.visionQuality !== undefined) {

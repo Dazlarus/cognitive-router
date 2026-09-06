@@ -22,6 +22,7 @@ import { BudgetTracker } from "./budget_tracker.js";
 import { ModelCurator } from "./curator.js";
 import { JudgeEvaluator } from "./judge.js";
 import { decideOutboundEffort, effortPolicyMode } from "./effort_policy.js";
+import { getZaiQuotaProbe } from "./quota_probe.js";
 import { EmbeddingBenchmark, initializeBenchmarkTables } from "./benchmark_embeddings.js";
 import type { EmbeddingModelInfo } from "./benchmark_embeddings.js";
 import { raceHedgedRequests, hedgeRetryDelayMs, type HedgeCandidate } from "./hedged_request.js";
@@ -905,7 +906,7 @@ export class ProxyServerStreaming {
           intent: classification.intent,
           clientHint: reqEffort,
           speedMode: reqSpeedMode,
-          quotaMultiplier: this.costTracker.getCurrentQuotaMultiplier(),
+          quotaPressure: getZaiQuotaProbe().pressure(),
           budgetExceeded: this.costTracker.isBudgetExceeded("zai"),
         })
       : null;
@@ -2112,6 +2113,7 @@ class AllProvidersDeadError extends Error {
 }
 
 export async function startProxyStreaming(): Promise<void> {
+  getZaiQuotaProbe().start();
   const pluginConfig = {
     enabled: true,
     logLevel: process.env.ROUTER_LOG_LEVEL ?? "info",
