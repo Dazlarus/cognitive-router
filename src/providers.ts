@@ -128,6 +128,21 @@ function buildZaiThinking(level: string): any {
   return { type: "enabled", budget_tokens: budgets[level] ?? 8192 };
 }
 
+/** Model-aware zai thinking translation. GLM-5.3+ is reasoning-always-on:
+ *  it accepts ONLY `thinking.type: "enabled"` + `reasoning_effort`
+ *  low|high|max — the disabled type and budget_tokens style are rejected
+ *  (docs.z.ai/guides/llm/glm-5.3, migration notice). Older models keep the
+ *  budget_tokens ladder. Effort mapping preserves ordering:
+ *  low→low, medium→high, high→max, none→low (5.3 cannot disable). */
+function buildZaiThinkingFields(model: string, level: string): { thinking?: unknown; reasoning_effort?: string } {
+  if (/glm-5\.[3-9]|glm-[6-9]/i.test(model)) {
+    const effort = level === "high" ? "max" : level === "medium" ? "high" : "low";
+    return { thinking: { type: "enabled" }, reasoning_effort: effort };
+  }
+  const thinking = buildZaiThinking(level);
+  return thinking ? { thinking } : {};
+}
+
 function buildOpenRouterThinking(level: string): any {
   if (level === "none") return undefined;
   return level;
@@ -300,13 +315,13 @@ export const ZAIAdapter: ProviderAdapter = {
   ): Promise<ChatCompletionResponse> {
     const level = extractThinkingLevel(request);
     const cleaned = stripThinking(request);
-    const thinking = buildZaiThinking(level);
+    const thinkingFields = buildZaiThinkingFields(model, level);
 
     // Observe system prompt prefix for ZAI automatic prefix caching
     // (GLM-4+ caches identical prefixes ≥1024 tokens transparently)
     observeZaIPrefix(request.messages);
 
-    const body = { ...cleaned, model, stream: false, ...(thinking ? { thinking } : {}) };
+    const body = { ...cleaned, model, stream: false, ...thinkingFields };
     const resp = await fetch(`${ZAI_BASE}/chat/completions`, {
       method: "POST",
       headers: {
@@ -333,12 +348,12 @@ export const ZAIAdapter: ProviderAdapter = {
   ): AsyncIterable<ChatCompletionChunk> {
     const level = extractThinkingLevel(request);
     const cleaned = stripThinking(request);
-    const thinking = buildZaiThinking(level);
+    const thinkingFields = buildZaiThinkingFields(model, level);
 
     // Observe system prompt prefix for ZAI automatic prefix caching
     observeZaIPrefix(request.messages);
 
-    const body = { ...cleaned, model, stream: true, ...(thinking ? { thinking } : {}) };
+    const body = { ...cleaned, model, stream: true, ...thinkingFields };
     const resp = await fetch(`${ZAI_BASE}/chat/completions`, {
       method: "POST",
       headers: {

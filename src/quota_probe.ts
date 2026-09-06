@@ -130,12 +130,44 @@ export function getZaiQuotaProbe(): ZaiQuotaProbe {
   return probe;
 }
 
-/** Relative quota-burn weight of a zai model: heavier models drain the 5h
- *  window faster. Name heuristics for now — recalibrate against measured
- *  per-call percentage deltas once telemetry accumulates. */
-export function zaiQuotaCostWeight(model: string): number {
+/** Quota-burn weight from DOCUMENTED zai economics (2026-09-05, replacing
+ *  name heuristics). Sources: docs.z.ai/guides/overview/pricing (per-token
+ *  API prices, output-price primary since reasoning tokens bill as output)
+ *  and docs.z.ai/guides/llm/glm-5.3 (points-based plan rules).
+ *
+ *  Per-token price weight:
+ *    GLM-5.3-Flash   $0.25/1M out → 0.06   (promo price, ends Sep 9)
+ *    GLM-4.7/4.6/4.5 $2.2/1M out  → 0.5
+ *    GLM-5/5.1/5.2/5.3 $4.4/1M out → 1.0   (same price — a heavier 5.3 burn
+ *      comes from reasoning-token VOLUME, which the effort policy manages)
+ *
+ *  Time factors (points-based plan):
+ *    off-peak + all-day weekends → 50% points. Off-peak taken as
+ *    23:00–09:00 SGT, matching the campaign window definition.
+ *    GLM-5.3-Flash campaign, Sep 3–20 2026, 23:00–09:00 SGT: available
+ *    quota doubled for non-ZCode agents → ×0.5 (ZCode-only zero-quota
+ *    rule doesn't apply to API callers). */
+export function zaiQuotaCostWeight(model: string, now = Date.now()): number {
   const m = model.toLowerCase();
-  if (m.includes("flash")) return 0.5;
-  if (m.includes("glm-5.3") || m.includes("glm-5.4") || m.includes("glm-6")) return 1.5;
-  return 1.0;
+  let weight = 1.0;
+  if (m.includes("flash")) weight = 0.06;
+  else if (m.includes("glm-4.7") || m.includes("glm-4.6") || m.includes("glm-4.5")) weight = 0.5;
+
+  // SGT clock (UTC+8, no DST)
+  const sgt = new Date(now + 8 * 3600_000);
+  const hour = sgt.getUTCHours();
+  const weekend = sgt.getUTCDay() === 0 || sgt.getUTCDay() === 6;
+  const offPeak = hour >= 23 || hour < 9;
+
+  if (offPeak || weekend) weight *= 0.5; // documented: 50% points
+
+  const campaignStart = Date.UTC(2026, 8, 3);  // Sep 3 2026
+  const campaignEnd = Date.UTC(2026, 8, 20);   // through Sep 20
+  if (
+    m.includes("glm-5.3") && m.includes("flash") &&
+    now >= campaignStart && now < campaignEnd && offPeak
+  ) {
+    weight *= 0.5; // documented: doubled available quota
+  }
+  return weight;
 }
