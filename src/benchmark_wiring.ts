@@ -139,7 +139,7 @@ export function judgeRecused(
 
 // ---------- judge caller ----------
 
-function getJudgeCandidates(): BenchEndpoint[] {
+export function getJudgeCandidates(): BenchEndpoint[] {
   // Bench judge is steerable independently of the live judge loop (Daz,
   // 2026-09-06: benchmark on ZAI until the system is proven). Falls back to
   // the live ROUTER_JUDGE_* values when bench-specific ones are unset.

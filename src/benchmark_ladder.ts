@@ -363,11 +363,14 @@ export function computeBradleyTerry(
 
 /** Rebuild the full ladder for an intent from stored raw asks.
  *  Collapses rounds per pair, computes BT strengths, assigns ranks.
- *  Pairs never compared get no strength (ranked last, alphabetical). */
+ *  Pairs never compared get no strength (ranked last, alphabetical).
+ *  extraKeys admits identities with no verdicts yet (cold-start inserts:
+ *  the first identity into an empty ladder compares against nothing). */
 export function rebuildLadder(
   db: DBService,
   intent: BenchIntent,
   generation = PROMPT_GENERATION,
+  extraKeys: string[] = [],
 ): LadderEntry[] {
   const rows = db.getAllBenchmarkVerdicts(intent, generation);
 
@@ -407,6 +410,7 @@ export function rebuildLadder(
   }
   const allKeys = new Set<string>(db.getLadderKeys(intent, generation));
   for (const k of seen) allKeys.add(k);
+  for (const k of extraKeys) allKeys.add(k);
 
   const entries: Array<{ key: string; strength: number }> = [];
   for (const k of allKeys) {

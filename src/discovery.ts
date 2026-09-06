@@ -69,6 +69,10 @@ export class ModelDiscovery {
   private timer?: NodeJS.Timeout;
   private running = false;
   private catalogMap?: Map<string, { inputPerM: number; outputPerM: number }>;
+  /** Fired (not awaited) after every completed pass. The proxy wires this
+   *  to the bench trigger: new identities -> one deliberate ladder insert
+   *  per pass (ROUTER_BENCH_TRIGGER=1 gates spending). */
+  onPassComplete?: (summary: DiscoverySummary) => void;
 
   constructor(
     private registry: ModelRegistry,
@@ -193,6 +197,11 @@ export class ModelDiscovery {
           `${summary.errors.length ? `, ${summary.errors.length} errors` : ""} ` +
           `in ${summary.durationMs}ms`,
       );
+      try {
+        this.onPassComplete?.(summary);
+      } catch (err) {
+        logger.warn(`Discovery onPassComplete hook failed: ${err}`);
+      }
       return summary;
     } finally {
       this.running = false;
