@@ -611,6 +611,14 @@ export class ModelRegistry {
     return { baseline, n, preClamp, wouldBe };
   }
 
+  /** Effort-conditioned judge quality (backing GET /judge/effort). */
+  getJudgeQualityByEffort(windowDays = 7) {
+    if (typeof this.db.getJudgeQualityByEffort === "function") {
+      return this.db.getJudgeQualityByEffort(windowDays);
+    }
+    return [];
+  }
+
   /**
    * Full Phase-1 judged-score pipeline (§4.1): attribution gate → quarantine
    * → guardrails → apply, with shadow-mode logging. Returns the outcome.
@@ -628,6 +636,7 @@ export class ModelRegistry {
       confidence?: number | null;
       truncated?: boolean;
       malformed?: boolean;
+      effortLevel?: string | null;
     },
   ): { applied: boolean; arm: GateArm; reason: string; quarantined: boolean; wouldBe: number | null } {
     const shadow = learningShadowMode();
@@ -648,6 +657,7 @@ export class ModelRegistry {
           judgeNote: opts.judgeNote,
           judgeModel: opts.judgeModelId,
           noApply, gateArm: arm, gateReason: reason, noteHash: hash,
+          effortLevel: opts.effortLevel ?? null,
         });
       } else {
         this.db.recordJudgeEvaluation(provider, model, intent, opts.rawScore, opts.judgeNote, opts.judgeModelId);

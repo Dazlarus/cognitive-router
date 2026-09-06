@@ -182,6 +182,7 @@ export class DBService {
     this.addColumnIfMissing("judge_history", "gate_arm", "TEXT");
     this.addColumnIfMissing("judge_history", "gate_reason", "TEXT");
     this.addColumnIfMissing("judge_history", "note_hash", "TEXT");
+    this.addColumnIfMissing("judge_history", "effort_level", "TEXT");
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_cap_archive_batch ON capability_overrides_archive(archived_at);
@@ -736,12 +737,13 @@ export class DBService {
     gateReason: string | null;
     noteHash?: string | null;
     timestamp?: string;
+    effortLevel?: string | null;
   }): void {
     this.db.prepare(`
       INSERT INTO judge_history
         (timestamp, provider, model, intent, judge_score, judge_note, judge_model,
-         no_apply, gate_arm, gate_reason, note_hash)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         no_apply, gate_arm, gate_reason, note_hash, effort_level)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       data.timestamp ?? new Date().toISOString(),
       data.provider,
@@ -754,7 +756,36 @@ export class DBService {
       data.gateArm,
       data.gateReason,
       data.noteHash ?? (data.judgeNote ? noteHashOf(data.judgeNote) : null),
+      data.effortLevel ?? null,
     );
+  }
+
+  /** Effort-conditioned judge quality over a window — answers "which model
+   *  wins at effort=high". Legacy rows (pre-2026-09-05) report bucket
+   *  "unrecorded". Buckets with <2 samples are dropped (noise). */
+  getJudgeQualityByEffort(windowDays = 7): Array<{
+    provider: string; model: string; intent: string; effortLevel: string;
+    samples: number; applied: number; avgScore: number; avgAppliedScore: number | null;
+  }> {
+    const since = new Date(Date.now() - windowDays * 86400000).toISOString();
+    const rows = this.db.prepare(`
+      SELECT provider, model, intent,
+             COALESCE(effort_level, 'unrecorded') AS effortLevel,
+             COUNT(*) AS samples,
+             SUM(CASE WHEN no_apply = 0 THEN 1 ELSE 0 END) AS applied,
+             AVG(judge_score) AS avgScore,
+             AVG(CASE WHEN no_apply = 0 THEN judge_score END) AS avgAppliedScore
+      FROM judge_history
+      WHERE timestamp >= ?
+      GROUP BY provider, model, intent, COALESCE(effort_level, 'unrecorded')
+      HAVING COUNT(*) >= 2
+      ORDER BY samples DESC
+      LIMIT 200
+    `).all(since) as Array<{
+      provider: string; model: string; intent: string; effortLevel: string;
+      samples: number; applied: number; avgScore: number; avgAppliedScore: number | null;
+    }>;
+    return rows;
   }
 
   getCapabilityOverride(provider: string, model: string, intent: string): { score: number; sampleCount: number; pinned: boolean } | null {

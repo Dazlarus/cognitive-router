@@ -499,6 +499,13 @@ export class ProxyServerStreaming {
         return;
       }
 
+      if (url.startsWith("/judge/effort") && req.method === "GET") {
+        const days = Math.max(1, Math.min(90, parseInt(urlQuery.get("days") ?? "7", 10) || 7));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ windowDays: days, buckets: this.modelRegistry.getJudgeQualityByEffort(days) }, null, 2));
+        return;
+      }
+
       if (url.startsWith("/v1/fallback") && req.method === "GET") {
         const providerParam = urlQuery.get("provider");
         const modelParam = urlQuery.get("model");
@@ -1197,6 +1204,7 @@ export class ProxyServerStreaming {
                       judgeModelId: `${this.judge.judgeModelId}`,
                       confidence: classification.confidence,
                       truncated: result.truncated,
+                      effortLevel: reqEffort ?? null,
                     },
                   );
                 }
@@ -1292,6 +1300,7 @@ export class ProxyServerStreaming {
                     judgeModelId: `${this.judge.judgeModelId}`,
                     confidence: classification.confidence,
                     truncated: result.truncated,
+                    effortLevel: reqEffort ?? null,
                   },
                 );
               }
