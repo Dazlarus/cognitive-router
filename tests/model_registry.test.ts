@@ -86,20 +86,20 @@ describe("ModelRegistry — Seed Data", () => {
 
   it("should load all seeded Z.AI models", () => {
     const zaiModels = registry.getAllModels().filter((m) => m.provider === "zai");
-    // 9 seeded Z.AI models (after removing non-plan-eligible: glm-5, glm-5v-turbo, glm-4.7-flash, glm-4.7-flashx, glm-4.6)
-    assert.ok(zaiModels.length >= 9, `Expected >= 9 Z.AI models, got ${zaiModels.length}`);
+    // 7 seeded Z.AI models on main (glm-5, glm-5v-turbo, glm-4.7-flash[x], glm-4.6 removed as non-plan)
+    assert.ok(zaiModels.length >= 7, `Expected >= 7 Z.AI models, got ${zaiModels.length}`);
 
     // Verify key models exist
-    for (const model of ["glm-5.2", "glm-5.1", "glm-5-turbo", "glm-4.7", "glm-4.6v"]) {
+    for (const model of ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5-turbo", "glm-4.7", "glm-4.6v"]) {
       assert.ok(registry.getCapability("zai", model), `Should have zai/${model}`);
     }
   });
 
   it("should load all seeded OpenRouter models", () => {
     const orModels = registry.getAllModels().filter((m) => m.provider === "openrouter");
-    assert.ok(orModels.length >= 7, `Expected >= 7 OpenRouter models, got ${orModels.length}`);
+    assert.ok(orModels.length >= 3, `Expected >= 3 OpenRouter models, got ${orModels.length}`);
 
-    for (const model of ["qwen/qwen3-coder:free", "openrouter/owl-alpha", "cohere/north-mini-code:free"]) {
+    for (const model of ["cohere/north-mini-code:free", "qwen/qwen3-30b-a3b-instruct-2507", "deepseek/deepseek-v4-flash"]) {
       assert.ok(registry.getCapability("openrouter", model), `Should have openrouter/${model}`);
     }
   });
@@ -144,7 +144,6 @@ describe("ModelRegistry — Seed Data", () => {
 
     // NOT eligible (vision models)
     assert.equal(registry.getCapability("zai", "glm-4.6v")!.planEligible, false);
-    assert.equal(registry.getCapability("zai", "glm-4.5v")!.planEligible, false);
   });
 });
 

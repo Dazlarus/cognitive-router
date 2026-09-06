@@ -312,10 +312,15 @@ export class ModelRegistry {
       await this.discoverModels();
     }
 
-    // Auto-benchmark discovered Ollama chat models (non-blocking — runs after server is ready)
-    this.benchmarkDiscoveredModels().catch(err =>
-      logger.warn("Auto-benchmark failed: " + (err instanceof Error ? err.message : err))
-    );
+    // Legacy auto-benchmark (benchmark_chat) — RETIRED by the cold-start
+    // directive (Daz, 2026-09-06): no pre-refactor rankings are trusted; the
+    // benchmark-ladder system measures everything from zero. Re-enable
+    // temporarily with ROUTER_LEGACY_AUTO_BENCHMARK=1.
+    if (process.env.ROUTER_LEGACY_AUTO_BENCHMARK === "1") {
+      this.benchmarkDiscoveredModels().catch(err =>
+        logger.warn("Auto-benchmark failed: " + (err instanceof Error ? err.message : err))
+      );
+    }
 
     // Apply any saved capability overrides from the judge feedback loop
     this.applySavedOverrides();

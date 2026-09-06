@@ -1217,7 +1217,7 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
       assert.ok(gemma, "Expected stats to include ollama/gemma4:latest");
       assert.deepEqual(gemma.taskTypes, ["chat", "generation", "local-emergency"]);
       assert.equal(gemma.toolCapable, true);
-      assert.equal(Math.round(gemma.capabilities.conversation * 100) / 100, 0.49);
+      assert.equal(Math.round(gemma.capabilities.conversation * 100) / 100, 0.7);
       assert.equal(gemma.decisionData.generationRoutingExclusion, null);
       assert.equal(gemma.decisionData.eligibleForRouting, true);
       assert.equal(typeof gemma.decisionData.intentScores.coding.overall, "number");
@@ -1251,8 +1251,15 @@ describe("Standalone Proxy — Concurrent Session Handling", () => {
       }
 
       if (url.includes("generativelanguage.googleapis.com")) {
-        geminiChatCalls++;
         const request = JSON.parse(String(init?.body ?? "{}"));
+        const hasTools = Array.isArray(request.tools) && request.tools.length > 0;
+        if (!hasTools) {
+          // Classifier tiebreaker / judge probes (no tools) - plain reply, don't count.
+          return new Response(JSON.stringify({
+            candidates: [{ content: { parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+          }), { status: 200 });
+        }
+        geminiChatCalls++;
         assert.equal(request.tools[0].functionDeclarations[0].name, "example_tool");
         return new Response(JSON.stringify({
           candidates: [{

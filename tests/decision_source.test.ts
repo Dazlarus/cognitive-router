@@ -24,6 +24,7 @@ describe("decision source taxonomy", () => {
     assert.deepEqual([...DECISION_SOURCES], [
       "scored_pick",
       "provider_fallback",
+      "exploration_probe",
       "circuit_breaker_skip",
       "context_window_skip",
       "tool_policy",

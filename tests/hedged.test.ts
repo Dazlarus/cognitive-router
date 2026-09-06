@@ -14,6 +14,7 @@ import {
 } from "../src/hedged_request.ts";
 import type { ProviderAdapter, ChatCompletionResponse, ChatCompletionRequest } from "../src/providers.ts";
 import { ProxyServerStreaming } from "../src/proxy-stream.ts";
+import { providerBackoff } from "../src/failure_classifier.ts";
 import { loadConfig, type CognitiveRouterConfig } from "../src/config.ts";
 import { DBService } from "../src/db_service.ts";
 
@@ -377,6 +378,9 @@ afterEach(async () => {
     try { await proxy.stop(); } catch { /* already stopped */ }
   }
   activeProxies = [];
+  // Module-level backoff tracker survives across proxy instances — clear it
+  // so one test's deliberate 429s can't starve the next test's providers.
+  providerBackoff.clearAll();
 
   globalThis.fetch = originalFetch;
   delete process.env.HEDGE_RETRY_MIN_MS;
@@ -413,13 +417,18 @@ describe("E2E — Hedged request triggers on 429", () => {
         return new Response(JSON.stringify({ models: [{ name: "gemma4:latest" }] }), { status: 200 });
       }
 
-      // OpenRouter (primary) — returns 429 on first call, succeeds on retry
+      // OpenRouter (primary) — 429 on the first REAL request, succeeds on retry.
+      // Only count requests carrying the test's user message: the classifier
+      // tiebreaker also probes providers and would otherwise consume the
+      // one-shot 429 before the real request arrives.
       if (url.includes("openrouter.ai")) {
-        primaryCallCount++;
-        if (primaryCallCount === 1) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        const isRealRequest = Array.isArray(body.messages) &&
+          body.messages.some((m: any) => m.role === "user" && m.content === "Hello");
+        if (isRealRequest) primaryCallCount++;
+        if (isRealRequest && primaryCallCount === 1) {
           return makeErrorResponse(429, "Rate limit exceeded");
         }
-        const body = JSON.parse(String(init?.body ?? "{}"));
         return makeOpenAIChatResponse("Primary retry succeeded!", body.model);
       }
 
@@ -682,9 +691,12 @@ describe("E2E — Hedge outcomes tracked in CostTracker", () => {
       }
 
       if (url.includes("openrouter.ai")) {
-        orCallCount++;
-        if (orCallCount === 1) return makeErrorResponse(429, "Rate limited");
         const body = JSON.parse(String(init?.body ?? "{}"));
+        // Only count the test's real request (classifier probes don't consume the 429)
+        const isRealRequest = Array.isArray(body.messages) &&
+          body.messages.some((m: any) => m.role === "user" && m.content === "Hello");
+        if (isRealRequest) orCallCount++;
+        if (isRealRequest && orCallCount === 1) return makeErrorResponse(429, "Rate limited");
         return makeOpenAIChatResponse("Primary retry response", body.model);
       }
 

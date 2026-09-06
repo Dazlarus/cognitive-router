@@ -49,6 +49,8 @@ function makeMockDB(): DBService {
     recordJudgeEvaluation: () => {},
     recordSpend: () => {},
     getAllSpend: () => [],
+    saveCircuitState: () => {},
+    getCircuitState: () => null,
     close: () => {},
   } as any;
 }

@@ -8,6 +8,7 @@ import net from "node:net";
 import { rmSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { ProxyServerStreaming } from "../src/proxy-stream.ts";
+import { providerBackoff } from "../src/failure_classifier.ts";
 import { loadConfig, type CognitiveRouterConfig } from "../src/config.ts";
 import { DBService } from "../src/db_service.ts";
 
@@ -243,6 +244,9 @@ afterEach(async () => {
     try { await proxy.stop(); } catch { /* already stopped */ }
   }
   activeProxies = [];
+  // Module-level backoff tracker survives across proxy instances in this
+  // process — clear it so one test's 429s can't starve the next test's providers.
+  providerBackoff.clearAll();
 
   // Restore env
   globalThis.fetch = originalFetch;
@@ -890,7 +894,7 @@ describe("E2E — Streaming with tool calls", () => {
 });
 
 describe("E2E — Streaming mid-stream error handling", () => {
-  it("should forward an error chunk and [DONE] when provider stream errors mid-way", async () => {
+  it("should discard truncated content and emit a clean error + [DONE] when the provider stream errors mid-way", async () => {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input);
       if (url.includes("/api/embeddings")) return new Response(JSON.stringify({ embedding: [1, 0, 0] }), { status: 200 });
@@ -941,12 +945,16 @@ describe("E2E — Streaming mid-stream error handling", () => {
 
     try {
       const body = await streamChat(port, "e2e-midstream-err", "Hello");
-      // Should complete gracefully — not crash or hang
+      // Buffered-streaming contract (Daz, 2026-09-06: no passthrough):
+      // a mid-stream provider death must NEVER surface truncated content.
+      // The buffer is discarded, a retry is attempted invisibly, and when the
+      // chain is exhausted the client gets one well-formed in-band error,
+      // then a clean [DONE].
       assert.ok(body.includes("data: [DONE]"), "Should end with [DONE] even on error");
-      // Should have forwarded some content before the error
-      assert.ok(body.includes("partial"), "Should have partial content before error");
-      // Model name should be scrubbed
-      assert.ok(!body.includes("gemma4"), "Provider model name should not leak");
+      assert.ok(!body.includes("partial"), "Truncated provider content must be discarded, never forwarded");
+      // The failure is reported honestly as a structured SSE error event
+      assert.ok(body.includes('"type":"all_providers_exhausted"') || body.includes('"type": "all_providers_exhausted"'),
+        "Should surface a well-formed all_providers_exhausted error event");
     } finally {
       await proxy.stop();
     }
