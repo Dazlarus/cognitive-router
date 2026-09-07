@@ -42,7 +42,9 @@ export function mapResolver(
 
 // ---------- model caller ----------
 
-const MODEL_CALL_TIMEOUT_MS = 120_000;
+// 240s: reasoning gens at the 6144 ceiling can take 2-3 minutes on cold
+// providers; 120s cut them off mid-reasoning (empty content, wasted spend).
+const MODEL_CALL_TIMEOUT_MS = 240_000;
 
 function effortToRequest(effort: string): Record<string, unknown> {
   // Minimal v1 mapping: pass reasoning_effort where providers accept it.

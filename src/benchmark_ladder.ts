@@ -65,7 +65,11 @@ export function parseOllamaQuant(tag: string): { model: string; quant: string } 
  *  speed. Wiring passes these on every completion call. */
 export const PINNED_DECODE = {
   temperature: 0.1,
-  max_tokens: 2048,
+  // 6144 not 2048: reasoning-always-on models (GLM-5.3 at mapped effort
+  // high) burn the whole ceiling on reasoning before any content - live
+  // 2026-09-07: every zai bench gen returned empty content at 2048. Ceiling
+  // only; temp-0 concrete prompts make non-reasoning models stop far below.
+  max_tokens: 6144,
 } as const;
 
 // ---------- prompt generations ----------
