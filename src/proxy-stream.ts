@@ -216,6 +216,25 @@ function streamStallTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
 }
 
+/** Per-request deadline override from a trusted caller (bench sidecar).
+ *  Honored ONLY for loopback connections and capped at 10 minutes: the
+ *  default 55s failover budget exists so production requests fail over
+ *  before OpenClaw's outer LLM timeout, but the bench sidecar's
+ *  non-streaming generations legitimately run minutes (CONTRACT.md §2,
+ *  max_tokens 6144 reasoning gens). Cap keeps a buggy caller from parking
+ *  the router forever. */
+function requestTimeoutOverrideMs(req?: http.IncomingMessage): number | null {
+  if (!req) return null;
+  const raw = req.headers["x-router-timeout-ms"];
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const remote = req.socket.remoteAddress ?? "";
+  const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+  if (!isLoopback) return null;
+  return Math.min(n, 600_000);
+}
+
 // ─── Buffered streaming types ───
 
 interface BufferedChunk {
@@ -1218,7 +1237,9 @@ export class ProxyServerStreaming {
     // before OpenClaw's outer LLM timeout fires.
     let lastError: Error | null = null;
     const modelStrikes = new Map<string, number>();
-    const requestDeadlineMs = Date.now() + routerRequestTimeoutMs();
+    const effectiveRequestTimeoutMs =
+      requestTimeoutOverrideMs(req) ?? routerRequestTimeoutMs();
+    const requestDeadlineMs = Date.now() + effectiveRequestTimeoutMs;
     let hedgeAttempted = false;
 
     // ─── Decision-source observability (Switchyard §4) ───
@@ -1296,7 +1317,7 @@ export class ProxyServerStreaming {
     for (let ci = 0; ci < candidates.length; ci++) {
       const candidate = candidates[ci];
       if (Date.now() >= requestDeadlineMs) {
-        lastError = new Error(`router_request_timeout: exceeded ${routerRequestTimeoutMs()}ms before trying ${candidate.provider}/${candidate.model}`);
+        lastError = new Error(`router_request_timeout: exceeded ${effectiveRequestTimeoutMs}ms before trying ${candidate.provider}/${candidate.model}`);
         logger.warn(lastError.message);
         break;
       }
