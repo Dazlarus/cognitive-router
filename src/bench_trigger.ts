@@ -363,19 +363,37 @@ async function canaryPair(
         .replace("{prompt}", prompt)
         .replace("{responseA}", ra)
         .replace("{responseB}", rb);
-      const jr = await adapter.chatCompletion(
-        judge.model,
-        {
-          model: judge.model,
-          messages: [{ role: "user", content: filled }],
-          stream: false,
-          temperature: 0.1,
-          // 1024 not 100: thinking models burn the budget on reasoning
-          // before content (see makeJudgeCaller note; found by live canary).
-          max_tokens: 1024,
-        } as any,
-        apiKey,
-      );
+      // Rate-limit backoff mirrors makeModelCaller (ZAI 1302 bursts, live
+      // 2026-09-07). A failed judge call deletes the round's partial verdicts,
+      // so retrying here preserves comparison work, not just the call.
+      let jr: Awaited<ReturnType<typeof adapter.chatCompletion>> | undefined;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          jr = await adapter.chatCompletion(
+            judge.model,
+            {
+              model: judge.model,
+              messages: [{ role: "user", content: filled }],
+              stream: false,
+              temperature: 0.1,
+              // 1024 not 100: thinking models burn the budget on reasoning
+              // before content (see makeJudgeCaller note; found by live canary).
+              max_tokens: 1024,
+            } as any,
+            apiKey,
+          );
+          break;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (attempt < 3 && /rate_limit|\b1302\b|\b429\b/i.test(msg)) {
+            await new Promise((r) => setTimeout(r, 15_000 * (attempt + 1)));
+            continue;
+          }
+          result.error = msg;
+          break; // unretryable: fall through to next judge candidate
+        }
+      }
+      if (!jr) continue; // next judge candidate, not a total round failure
       const verdict = parseAbVerdict(jr.choices?.[0]?.message?.content ?? "");
       if (!verdict) throw new Error("judge returned unparseable verdict");
       result.judgeUsed = `${judge.provider}/${judge.model}`;

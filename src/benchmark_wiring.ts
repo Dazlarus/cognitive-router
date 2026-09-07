@@ -78,27 +78,42 @@ export function makeModelCaller(resolve: EndpointResolver): ModelCaller {
       throw new Error(`no API key for provider ${endpoint.provider}`);
     }
 
-    const result = await adapter.chatCompletion(
-      endpoint.model,
-      {
-        model: endpoint.model,
-        messages: [{ role: "user", content: prompt }],
-        stream: false,
-        temperature: PINNED_DECODE.temperature,
-        max_tokens: PINNED_DECODE.max_tokens,
-        ...effortToRequest(key.effort),
-      } as any,
-      apiKey,
-      AbortSignal.timeout(MODEL_CALL_TIMEOUT_MS),
-    );
-
-    const content = result.choices?.[0]?.message?.content ?? "";
-    if (!content.trim()) {
-      throw new Error(
-        `empty response from ${endpoint.provider}/${endpoint.model}`,
-      );
+    // ZAI coding plan enforces a request-frequency cap (error 1302, surfaced
+    // as "rate_limit"); a comparison bursts 10+ calls in quick succession.
+    // Retry with backoff instead of failing the attempt - the identity would
+    // just rotate and re-burst on the next pass (live 2026-09-07).
+    for (let attempt = 0; ; attempt++) {
+      let result: Awaited<ReturnType<typeof adapter.chatCompletion>>;
+      try {
+        result = await adapter.chatCompletion(
+          endpoint.model,
+          {
+            model: endpoint.model,
+            messages: [{ role: "user", content: prompt }],
+            stream: false,
+            temperature: PINNED_DECODE.temperature,
+            max_tokens: PINNED_DECODE.max_tokens,
+            ...effortToRequest(key.effort),
+          } as any,
+          apiKey,
+          AbortSignal.timeout(MODEL_CALL_TIMEOUT_MS),
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (attempt < 3 && /rate_limit|\b1302\b|\b429\b/i.test(msg)) {
+          await new Promise((r) => setTimeout(r, 15_000 * (attempt + 1)));
+          continue;
+        }
+        throw err;
+      }
+      const content = result.choices?.[0]?.message?.content ?? "";
+      if (!content.trim()) {
+        throw new Error(
+          `empty response from ${endpoint.provider}/${endpoint.model}`,
+        );
+      }
+      return content;
     }
-    return content;
   };
 }
 
