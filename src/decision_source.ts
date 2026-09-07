@@ -19,6 +19,11 @@ export type DecisionSource = (typeof DECISION_SOURCES)[number];
 /** Response header carrying the upstream model that actually served the request. */
 export const SELECTED_MODEL_HEADER = "x-model-router-selected-model";
 
+/** Response header carrying the provider's OWN reported model from its response
+ *  body (ZAI coding-endpoint pool aliases remap e.g. glm-5-turbo -> glm-5.3-flash
+ *  server-side; 2026-09-07 spike). Preserves provider truth for the bench seam. */
+export const UPSTREAM_MODEL_HEADER = "x-router-upstream-model";
+
 /** Runtime facts from the proxy request loop used to classify the FINAL decision
  *  source — the source of truth is how the request was actually served, not what
  *  the router predicted before the first attempt. */

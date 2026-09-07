@@ -47,11 +47,7 @@ import { raceHedgedRequests, hedgeRetryDelayMs, type HedgeCandidate } from "./he
 import { classifyFailure, computeFallbackDecision, providerBackoff } from "./failure_classifier.js";
 import { registryReadiness } from "./readiness.js";
 import { detectModalities, type Modality } from "./modality.js";
-import {
-  computeProxyDecisionSource,
-  decisionSourceCounters,
-  SELECTED_MODEL_HEADER,
-} from "./decision_source.js";
+import { computeProxyDecisionSource, decisionSourceCounters, SELECTED_MODEL_HEADER, UPSTREAM_MODEL_HEADER } from "./decision_source.js";
 
 const CHAT_ALIAS_MODEL = "CognitiveRouter:latest";
 const LEGACY_CHAT_ALIAS_MODEL = "CogRouter:latest";
@@ -1353,6 +1349,7 @@ export class ProxyServerStreaming {
           let reachedCheckpoint = false;
           let firstChunkAt: number | undefined;
           let firstContentAt: number | undefined;
+          let upstreamModel: string | undefined;
 
           try {
             const stallTimeout = streamStallTimeoutMs();
@@ -1366,6 +1363,11 @@ export class ProxyServerStreaming {
                 throw new Error(`stream_stall: no data for ${stallTimeout}ms from ${candidate.provider}/${candidate.model}`);
               }
               lastChunkTime = now;
+
+              // Capture the provider's own reported model before scrubbing (bench seam: provider truth)
+              if (upstreamModel === undefined && typeof chunk.model === "string" && chunk.model) {
+                upstreamModel = chunk.model;
+              }
 
               // Scrub provider model name
               chunk.model = CHAT_RESPONSE_MODEL;
@@ -1424,7 +1426,7 @@ export class ProxyServerStreaming {
           recordSource(true, candidate);
           // Open SSE headers now (deferred from request start) so the
           // selected-model header names the model that actually served.
-          this.openSSE(res, candidate.model);
+          this.openSSE(res, candidate.model, upstreamModel);
           for (const bufferedChunk of bufferedChunks) {
             this.writeSSE(res, bufferedChunk);
           }
@@ -1543,9 +1545,14 @@ export class ProxyServerStreaming {
         // Clear any provider backoff on success
         providerBackoff.clear(candidate.provider);
 
+        const upstreamModel = typeof response.model === "string" ? response.model : undefined;
         response.model = CHAT_RESPONSE_MODEL;
         recordSource(true, candidate);
-        res.writeHead(200, { "Content-Type": "application/json", [SELECTED_MODEL_HEADER]: candidate.model });
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          [SELECTED_MODEL_HEADER]: candidate.model,
+          ...(upstreamModel ? { [UPSTREAM_MODEL_HEADER]: upstreamModel } : {}),
+        });
         res.end(JSON.stringify(response));
 
         // ─── Async LLM-as-judge feedback ───
@@ -1750,9 +1757,14 @@ export class ProxyServerStreaming {
               providerBackoff.clear(hedgeOutcome.winnerProvider);
 
               // Send the winning response to client
+              const hedgeUpstreamModel = typeof winResponse.model === "string" ? winResponse.model : undefined;
               winResponse.model = CHAT_RESPONSE_MODEL;
               recordSource(true, { provider: hedgeOutcome.winnerProvider, model: hedgeOutcome.winnerModel });
-              res.writeHead(200, { "Content-Type": "application/json", [SELECTED_MODEL_HEADER]: hedgeOutcome.winnerModel });
+              res.writeHead(200, {
+                "Content-Type": "application/json",
+                [SELECTED_MODEL_HEADER]: hedgeOutcome.winnerModel,
+                ...(hedgeUpstreamModel ? { [UPSTREAM_MODEL_HEADER]: hedgeUpstreamModel } : {}),
+              });
               res.end(JSON.stringify(winResponse));
               return;
             } catch (hedgeErr) {
@@ -2036,9 +2048,10 @@ export class ProxyServerStreaming {
   /** Open SSE response headers. Deferred until the first write so the
    *  x-model-router-selected-model header can name the upstream model that
    *  actually served the request (set before any stream data is flushed). */
-  private openSSE(res: http.ServerResponse, selectedModel?: string): void {
+  private openSSE(res: http.ServerResponse, selectedModel?: string, upstreamModel?: string): void {
     if (res.headersSent || res.writableEnded) return;
     if (selectedModel) res.setHeader(SELECTED_MODEL_HEADER, selectedModel);
+    if (upstreamModel) res.setHeader(UPSTREAM_MODEL_HEADER, upstreamModel);
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",

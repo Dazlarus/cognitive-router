@@ -7,6 +7,8 @@ import {
   PROVIDERS,
   getProvider,
   ZAIAdapter,
+  OpenAIAdapter,
+  AnthropicAdapter,
   OpenRouterAdapter,
   GeminiAdapter,
   OllamaAdapter,

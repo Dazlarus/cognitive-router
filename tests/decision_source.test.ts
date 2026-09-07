@@ -23,6 +23,7 @@ describe("decision source taxonomy", () => {
   it("contains the fixed taxonomy with no duplicates", () => {
     assert.deepEqual([...DECISION_SOURCES], [
       "scored_pick",
+      "pinned_model",
       "provider_fallback",
       "exploration_probe",
       "circuit_breaker_skip",
