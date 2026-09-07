@@ -275,7 +275,34 @@ export class RoutingEngine {
       if (fastSet.length > 0) {
         candidates = fastSet;
       } else {
-        logger.warn("Tier=fast: no candidates — using full candidate set.");
+        logger.warn("Tier=fast: no candidates - using full candidate set.");
+      }
+    }
+
+    // "lite" tier (Daz, 2026-09-07): subscription-covered cheap models +
+    // locals ONLY - no metered APIs, no premium zai (5.3/5.3-flash) so light
+    // work (crons, mechanical subagents) burns window-eligible cheap capacity,
+    // not the premium tier. Strictest "no real money" reading: sunk-cost
+    // subscription models + local. Falls back to the full set when empty so
+    // utility work never hard-fails.
+    if (modelTier === "lite") {
+      const liteAllow = new Set(
+        (process.env.ROUTER_LITE_MODELS ?? "zai/glm-5-turbo,zai/glm-4.7")
+          .split(",")
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean),
+      );
+      const liteSet = candidates.filter(
+        (m) => m.isLocal || liteAllow.has(`${m.provider}/${m.model}`.toLowerCase()),
+      );
+      if (liteSet.length > 0) {
+        logger.info(
+          `Tier=lite: ${liteSet.length} subscription/local candidates ` +
+            `(allowlist: ${[...liteAllow].join(",")}).`,
+        );
+        candidates = liteSet;
+      } else {
+        logger.warn("Tier=lite: no candidates - using full candidate set.");
       }
     }
 

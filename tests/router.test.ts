@@ -2311,3 +2311,58 @@ describe("RoutingEngine — Modality Filtering", () => {
     );
   });
 });
+
+// ─── Lite tier (:lite alias) — spend-class lane (Daz, 2026-09-07) ───
+// Subscription-covered cheap models + locals ONLY: light work (crons,
+// mechanical subagents) must never land on premium zai (5.3/5.3-flash)
+// or metered APIs.
+
+describe("RoutingEngine - lite tier (:lite alias)", () => {
+  let registry: ModelRegistry;
+  let costTracker: CostTracker;
+  let db: DBService;
+  let config: CognitiveRouterConfig;
+  let router: RoutingEngine;
+
+  beforeEach(async () => {
+    config = makeConfig();
+    db = makeMockDB();
+    costTracker = new CostTracker(db, config);
+    await costTracker.refreshProviderStatus();
+    registry = new ModelRegistry(db, config);
+    await registry.loadCachedState();
+    router = new RoutingEngine(registry, costTracker, db, config);
+  });
+
+  it("lite requests never route to premium or metered models", async () => {
+    const decision = await router.decide(makeClassification(), "lite-sess", { modelTier: "lite" });
+    assert.ok(decision, "decision returned");
+    const key = `${decision.provider}/${decision.model}`;
+    assert.ok(
+      key === "zai/glm-5-turbo" || key === "zai/glm-4.7" || decision.provider === "ollama",
+      `expected lite-pool model (5-turbo/4.7/local), got ${key}`,
+    );
+    assert.notEqual(key, "zai/glm-5.3");
+    assert.notEqual(key, "zai/glm-5.3-flash");
+  });
+
+  it("requests without a tier stay unrestricted", async () => {
+    const decision = await router.decide(makeClassification(), "full-sess", {});
+    assert.ok(decision, "decision returned");
+  });
+
+  it("empty lite pool falls back to the full candidate set", async () => {
+    // Garbage allowlist + no local provider in priority = empty lite set.
+    const prev = process.env.ROUTER_LITE_MODELS;
+    process.env.ROUTER_LITE_MODELS = "nonexistent/model-x";
+    const noLocal = makeConfig({ providerPriority: ["zai", "gemini"] });
+    const fbRouter = new RoutingEngine(registry, costTracker, db, noLocal);
+    try {
+      const decision = await fbRouter.decide(makeClassification(), "lite-fallback", { modelTier: "lite" });
+      assert.ok(decision, "fallback must still produce a decision");
+    } finally {
+      if (prev === undefined) delete process.env.ROUTER_LITE_MODELS;
+      else process.env.ROUTER_LITE_MODELS = prev;
+    }
+  });
+});

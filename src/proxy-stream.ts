@@ -1081,10 +1081,14 @@ export class ProxyServerStreaming {
     }
 
     // Build candidate list - pass estimated tokens and required modalities for routing
+    // Tier aliases (Daz, 2026-09-07): ":fast" = speed tier; ":lite" =
+    // subscription-covered + local only (glm-5-turbo/4.7-class) - light work
+    // (crons, mechanical subagents) must not spend premium window or meters.
+    const modelAlias = typeof request.model === "string" ? request.model.toLowerCase() : "";
     const requestTier =
-      typeof request.model === "string" && request.model.toLowerCase().endsWith(":fast")
-        ? "fast"
-        : undefined;
+      modelAlias.endsWith(":fast") ? "fast"
+      : modelAlias.endsWith(":lite") ? "lite"
+      : undefined;
     const reqEffort = extractThinkingLevel(request);
     const reqSpeedMode = extractSpeedMode(request);
     // Outbound effort is the router's purchase decision (effort = tokens =
