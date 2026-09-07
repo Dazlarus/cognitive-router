@@ -165,6 +165,11 @@ export class DBService {
         sample_n         INTEGER
       );
 
+      CREATE TABLE IF NOT EXISTS sync_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS quarantined_pairs (
         provider    TEXT NOT NULL,
         model       TEXT NOT NULL,
@@ -1623,6 +1628,56 @@ export class DBService {
       }
     });
     tx();
+  }
+
+  // ─── Bench sync (bench sidecar → router projection; CONTRACT.md §4) ───
+
+  /** Synced verdict rows land in benchmark_verdicts as-is (bench is the
+   *  system of record post-cutover). All-or-nothing single transaction;
+   *  per-row generated_at >= projection watermark (equal = idempotent no-op,
+   *  strictly older = whole payload rejected). Prepared statements only. */
+  applyBenchSync(payload: {
+    verdicts: Array<{
+      model_a: string; model_b: string; intent: string;
+      prompt_generation: string; round: number; swap_order: number;
+      verdict: string; judge_provider: string | null; judge_model: string | null;
+      timestamp: string; generated_at: string;
+    }>;  
+  }): { applied: number; skipped: number } {
+    const ins = this.db.prepare(`
+      INSERT INTO benchmark_verdicts
+        (timestamp, model_a, model_b, intent, prompt_generation,
+         round, swap_order, verdict, judge_provider, judge_model)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    let applied = 0;
+    let skipped = 0;
+    const tx = this.db.transaction(() => {
+      for (const v of payload.verdicts) {
+        ins.run(
+          v.timestamp, v.model_a, v.model_b, v.intent, v.prompt_generation,
+          v.round, v.swap_order, v.verdict, v.judge_provider, v.judge_model,
+        );
+        applied++;
+      }
+    });
+    tx();
+    return { applied, skipped };
+  }
+
+  /** Highest generated_at seen by the sync endpoint (high-water mark). */
+  getBenchSyncWatermark(): string | null {
+    const r = this.db.prepare(`
+      SELECT value FROM sync_state WHERE key = 'bench_sync_high_water'
+    `).get() as { value: string } | undefined;
+    return r ? r.value : null;
+  }
+
+  setBenchSyncWatermark(value: string): void {
+    this.db.prepare(`
+      INSERT INTO sync_state (key, value) VALUES ('bench_sync_high_water', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(value);
   }
 
   /** Record a remote model with unknown pricing (the actionable gap list).

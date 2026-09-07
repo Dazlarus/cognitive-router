@@ -694,6 +694,102 @@ export class ProxyServerStreaming {
         return;
       }
 
+      // Admin bench sync — the bench sidecar's ONLY write path into router
+      // state (CONTRACT.md §4). BENCH_SYNC_TOKEN gate (separate secret from
+      // ROUTER_ADMIN_TOKEN; >=32 bytes, timing-safe compare). Whole-payload
+      // validation, single-transaction upsert, per-row generated_at >=
+      // watermark with equal = idempotent no-op, strictly older = reject.
+      if (url === "/admin/bench/sync" && req.method === "POST") {
+        const syncToken = process.env.BENCH_SYNC_TOKEN;
+        if (!syncToken) {
+          logger.warn("Bench sync denied: BENCH_SYNC_TOKEN not configured");
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "sync_disabled", message: "BENCH_SYNC_TOKEN not configured" } }));
+          return;
+        }
+        const auth = req.headers["authorization"];
+        const provided = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
+        if (!provided || !timingSafeEqualStr(provided, syncToken)) {
+          logger.warn(`Bench sync denied: bad or missing token (from ${req.socket.remoteAddress ?? "?"})`);
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "unauthorized", message: "invalid credentials" } }));
+          return;
+        }
+        // Body size cap BEFORE parse (2 MB)
+        const contentLength = parseInt(String(req.headers["content-length"] ?? "0"), 10);
+        if (contentLength > 2_000_000) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "payload_too_large", message: "body exceeds cap" } }));
+          return;
+        }
+        let raw = "";
+        req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
+        req.on("end", () => {
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed?.schema_version !== 1) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: { code: "unsupported_schema", message: "unknown schema_version" } }));
+              return;
+            }
+            const verdicts = Array.isArray(parsed?.verdicts) ? parsed.verdicts : null;
+            if (!verdicts || verdicts.length === 0 || verdicts.length > 500) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: { code: "bad_row_count", message: "verdicts must be 1..500 rows" } }));
+              return;
+            }
+            // Field validation: one bad row rejects the whole payload
+            const MODEL_ID = /^[a-z0-9._:/|-]+$/i;
+            const TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+            for (const v of verdicts) {
+              const bad =
+                !v ||
+                typeof v.model_a !== "string" || !MODEL_ID.test(v.model_a) || v.model_a.length > 128 ||
+                typeof v.model_b !== "string" || !MODEL_ID.test(v.model_b) || v.model_b.length > 128 ||
+                !["coding", "reasoning", "conversation"].includes(v.intent) ||
+                typeof v.prompt_generation !== "string" || v.prompt_generation.length > 64 ||
+                !Number.isInteger(v.round) || v.round < 0 || v.round > 100 ||
+                (v.swap_order !== 0 && v.swap_order !== 1) ||
+                !["a", "b", "tie"].includes(v.verdict) ||
+                (v.judge_provider !== null && (typeof v.judge_provider !== "string" || v.judge_provider.length > 64)) ||
+                (v.judge_model !== null && (typeof v.judge_model !== "string" || v.judge_model.length > 128)) ||
+                typeof v.timestamp !== "string" || !TS.test(v.timestamp) ||
+                typeof v.generated_at !== "string" || !TS.test(v.generated_at);
+              if (bad) {
+                logger.warn(`Bench sync rejected: invalid row (schema violation)`);
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: { code: "invalid_row", message: "one or more rows failed validation" } }));
+                return;
+              }
+            }
+            // Per-row staleness: all rows must be >= persisted watermark
+            const watermark = this.db.getBenchSyncWatermark();
+            if (watermark) {
+              const stale = verdicts.filter((v: any) => v.generated_at < watermark);
+              if (stale.length === verdicts.length) {
+                // entire payload strictly older — reject as stale
+                logger.warn(`Bench sync rejected: payload older than watermark`);
+                res.writeHead(409, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: { code: "stale_payload", message: "generated_at below high-water mark" } }));
+                return;
+              }
+            }
+            const result = this.db.applyBenchSync({ verdicts });
+            // advance watermark to max generated_at in payload
+            const maxGen = verdicts.reduce((m: string, v: any) => (v.generated_at > m ? v.generated_at : m), watermark ?? "");
+            if (maxGen) this.db.setBenchSyncWatermark(maxGen);
+            logger.info(`Bench sync ok: ${result.applied} rows applied, watermark -> ${maxGen}`);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "ok", applied: result.applied }));
+          } catch (err) {
+            logger.error(`Bench sync failed: ${err instanceof Error ? err.message : String(err)}`);
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { code: "internal", message: "sync failed" } }));
+          }
+        });
+        return;
+      }
+
       // Admin restart — Layer 1 of the no-elevation restart bridge (2026-09-06).
       // Gated by ROUTER_ADMIN_TOKEN (Bearer or x-admin-token header). Clean exit;
       // NSSM's default restart-on-exit respawns the process (~1.5s), loading any
@@ -2407,3 +2503,4 @@ export async function startProxyStreaming(): Promise<void> {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
+
