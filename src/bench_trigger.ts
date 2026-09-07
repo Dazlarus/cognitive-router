@@ -161,10 +161,19 @@ export interface BenchPassResult {
   error?: string;
 }
 
-function identityResolver(identity: BenchableIdentity) {
-  const byEncoded = new Map<string, BenchEndpoint>(
-    identity.endpoints.map((e) => [encodeKey(identity.key), e]),
-  );
+/** Resolver over the FULL benchable set - not just the chosen newcomer.
+ *  insertIntoLadder must also CALL existing ladder members (the anchor side
+ *  of every comparison), so the map has to cover them too. Live bug
+ *  2026-09-06: a newcomer-scoped map made every post-cold-start pass fail
+ *  with "no benchmark endpoint for <ladder anchor>" (silent - warns go to
+ *  stderr). Endpoints are cheapest-first; [0] is the serving pick. */
+function identityResolver(benchable: BenchableIdentity[]) {
+  const byEncoded = new Map<string, BenchEndpoint>();
+  for (const identity of benchable) {
+    if (identity.endpoints.length > 0) {
+      byEncoded.set(encodeKey(identity.key), identity.endpoints[0]);
+    }
+  }
   return (key: BenchModelKey): BenchEndpoint | null =>
     byEncoded.get(encodeKey(key)) ?? null;
 }
@@ -214,6 +223,7 @@ export async function benchPass(
   // must not stall the cheapest-first queue forever: try up to 3 pending
   // identities per pass, but admit at most one. Failed attempts leave no
   // verdict rows (comparePair deletes partials), so they stay pending.
+  const resolver = identityResolver(collectBenchable(registry));
   const MAX_ATTEMPTS = 3;
   let lastError = "";
   for (let attempt = 0; attempt < Math.min(MAX_ATTEMPTS, pending.length); attempt++) {
@@ -221,7 +231,7 @@ export async function benchPass(
     const { makeModelCaller, makeJudgeCaller } = await import("./benchmark_wiring.js");
     const deps = {
       db,
-      callModel: makeModelCaller(identityResolver(chosen)),
+      callModel: makeModelCaller(resolver),
       judge: makeJudgeCaller(),
       rounds: opts.rounds,
     };
