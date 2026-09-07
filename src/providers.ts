@@ -148,9 +148,22 @@ function buildZaiThinking(level: string): any {
  *  low|high|max — the disabled type and budget_tokens style are rejected
  *  (docs.z.ai/guides/llm/glm-5.3, migration notice). Older models keep the
  *  budget_tokens ladder. Effort mapping preserves ordering:
- *  low→low, medium→high, high→max, none→low (5.3 cannot disable). */
+ *  low→low, medium→high, high→max, none→low (5.3 cannot disable).
+ *  NOTE: glm-5-turbo and *-flash aliases are POOL aliases the ZAI coding
+ *  endpoint remaps server-side to glm-5.3-flash (live 2026-09-07 spike:
+ *  deterministic, response.model). They must take the 5.3-style fields or
+ *  ZAI silently ignores the budget_tokens thinking and reasoning burns the
+ *  whole ceiling (live: empty finish_reason=length 3/3). */
+function isZaiGlm53Class(model: string): boolean {
+  return (
+    /glm-5\.[3-9]|glm-[6-9]/i.test(model) ||
+    /glm-5[^.]*-(turbo|flash)/i.test(model) ||
+    /glm-4\.7-flash/i.test(model)
+  );
+}
+
 function buildZaiThinkingFields(model: string, level: string): { thinking?: unknown; reasoning_effort?: string } {
-  if (/glm-5\.[3-9]|glm-[6-9]/i.test(model)) {
+  if (isZaiGlm53Class(model)) {
     const effort = level === "high" ? "max" : level === "medium" ? "high" : "low";
     return { thinking: { type: "enabled" }, reasoning_effort: effort };
   }

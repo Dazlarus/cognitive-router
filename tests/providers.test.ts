@@ -554,6 +554,27 @@ describe("ZAI Adapter — thinking parameters", () => {
     assert.equal(body.thinking.budget_tokens, 8192);
   });
 
+  it("glm-5-turbo / 5.3-flash pool aliases take 5.3-style thinking fields", async () => {
+    // Live 2026-09-07: ZAI's coding endpoint remaps glm-5-turbo → glm-5.3-flash
+    // server-side. The alias must take reasoning_effort-style thinking or ZAI
+    // ignores it and reasoning burns the whole ceiling (empty finish_reason=length).
+    const { fetchMock, calls } = makeFetchCapture();
+    globalThis.fetch = fetchMock;
+
+    for (const alias of ["glm-5-turbo", "glm-5.3-flash", "glm-4.7-flash"]) {
+      calls.length = 0;
+      await ZAIAdapter.chatCompletion(
+        alias,
+        { model: alias, messages: [{ role: "user", content: "t" }], reasoning_effort: "low" },
+        "k",
+      );
+      const body = calls[0].body;
+      assert.equal(body.thinking?.type, "enabled", `${alias}: 5.3-class thinking.type`);
+      assert.equal(typeof body.reasoning_effort, "string", `${alias}: reasoning_effort present`);
+      assert.equal(body.thinking?.budget_tokens, undefined, `${alias}: no budget_tokens style`);
+    }
+  });
+
   it("should inject thinking for 'high' level", async () => {
     const { fetchMock, calls } = makeFetchCapture();
     globalThis.fetch = fetchMock;
