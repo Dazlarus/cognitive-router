@@ -36,7 +36,6 @@ import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
 import { BudgetTracker } from "./budget_tracker.js";
 import { ModelCurator } from "./curator.js";
 import { ModelDiscovery } from "./discovery.js";
-import { benchPass, pendingIdentities, runCanary } from "./bench_trigger.js";
 import { PROMPT_GENERATION, rebuildLadder } from "./benchmark_ladder.js";
 import { JudgeEvaluator } from "./judge.js";
 import { decideOutboundEffort, effortPolicyMode } from "./effort_policy.js";
@@ -358,15 +357,18 @@ export class ProxyServerStreaming {
     this.judge = new JudgeEvaluator();
     this.curator = new ModelCurator(this.db, this.modelRegistry, config);
     this.discovery = new ModelDiscovery(this.modelRegistry, this.db);
-    // Bench trigger: every completed discovery pass may admit ONE new identity
-    // into the coding ladder (deliberate spend; ROUTER_BENCH_TRIGGER=1 gates it).
-    // Gate at the hook itself so disabled = zero work (tests, fresh installs).
-    this.discovery.onPassComplete = () => {
-      if (process.env.ROUTER_BENCH_TRIGGER !== "1") return;
-      benchPass(this.db, this.modelRegistry, "discovery").catch((err) =>
-        logger.warn(`bench pass (discovery) crashed: ${err instanceof Error ? err.message : err}`),
-      );
-    };
+    // Bench subsystem EXTRACTED (2026-09-07): the cogrouter-bench sidecar now
+    // owns passes/judging; verdicts arrive via POST /admin/bench/sync and
+    // routing consumes them after restart (restart-to-apply, CONTRACT.md §6).
+    // At startup: rebuild the coding ladder from synced verdict rows so the
+    // projection is consistent with the verdict table (idempotent).
+    try {
+      const rebuilt = rebuildLadder(this.db, "coding", PROMPT_GENERATION);
+      if (rebuilt.length > 0) this.db.replaceLadder("coding", PROMPT_GENERATION, rebuilt);
+      logger.info(`Ladder projection rebuilt from synced verdicts: ${rebuilt.length} identities`);
+    } catch (err) {
+      logger.warn(`Ladder rebuild skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res).catch((err) => {
         logger.error(`Unhandled error: ${err}`);
@@ -849,77 +851,6 @@ export class ProxyServerStreaming {
         return;
       }
 
-      // Admin bench — ladder state + pending identities + forced pass + canary.
-      // Same token gate as /admin/restart + /admin/discover.
-      if (url.startsWith("/admin/bench") && req.method === "POST") {
-        const token = process.env.ROUTER_ADMIN_TOKEN;
-        if (!token) {
-          res.writeHead(503, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "admin bench disabled", message: "ROUTER_ADMIN_TOKEN not configured" }));
-          return;
-        }
-        const auth = req.headers["authorization"];
-        const provided =
-          (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
-          (req.headers["x-admin-token"] as string | undefined);
-        if (!provided || !timingSafeEqualStr(provided, token)) {
-          logger.warn("Admin bench denied: bad or missing token");
-          res.writeHead(403, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "forbidden" }));
-          return;
-        }
-        try {
-          if (url === "/admin/bench") {
-            const result = await benchPass(this.db, this.modelRegistry, "admin");
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(result, null, 2));
-          } else if (url === "/admin/bench/canary") {
-            const result = await runCanary(this.db, this.modelRegistry);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(result, null, 2));
-          } else {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "not found" }));
-          }
-        } catch (err) {
-          logger.error(`Admin bench failed: ${err}`);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "bench failed", message: err instanceof Error ? err.message : String(err) }));
-        }
-        return;
-      }
-      if (url === "/admin/bench" && req.method === "GET") {
-        const token = process.env.ROUTER_ADMIN_TOKEN;
-        if (!token) {
-          res.writeHead(503, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "admin bench disabled", message: "ROUTER_ADMIN_TOKEN not configured" }));
-          return;
-        }
-        const auth = req.headers["authorization"];
-        const provided =
-          (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
-          (req.headers["x-admin-token"] as string | undefined);
-        if (!provided || !timingSafeEqualStr(provided, token)) {
-          res.writeHead(403, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "forbidden" }));
-          return;
-        }
-        const pending = pendingIdentities(this.db, this.modelRegistry).map((i) => ({
-          key: `${i.key.model}|${i.key.quant}|${i.key.effort}`,
-          cheapestEndpoint: i.endpoints[0] ? `${i.endpoints[0].provider}/${i.endpoints[0].model}` : null,
-          costPer1k: i.cheapestCostPer1k,
-        }));
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          triggerEnabled: process.env.ROUTER_BENCH_TRIGGER === "1",
-          intent: "coding",
-          promptGeneration: PROMPT_GENERATION,
-          ladder: rebuildLadder(this.db, "coding", PROMPT_GENERATION),
-          pendingCount: pending.length,
-          pending: pending.slice(0, 20),
-        }, null, 2));
-        return;
-      }
       if (url === "/v1/benchmark/embeddings" && req.method === "POST") {
         const benchmark = new EmbeddingBenchmark(this.db);
         try {

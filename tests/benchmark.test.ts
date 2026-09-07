@@ -22,11 +22,6 @@ import {
 import {
   catalogKeyCandidates,
 } from "../src/discovery.js";
-import {
-  familyOf,
-  judgeRecused,
-  parseAbVerdict,
-} from "../src/benchmark_wiring.js";
 import { zaiBillingMode } from "../src/providers.js";
 
 // ---------- identity ----------
@@ -295,29 +290,8 @@ test("promptsFor: starter pool has 3 prompts per intent", () => {
 });
 
 // ---------- wiring: families, recusal, verdict parsing ----------
-
-test("familyOf: vendor prefixes, aliases, and bare ids", () => {
-  assert.equal(familyOf("openrouter", "google/gemini-2.5-flash"), "gemini");
-  assert.equal(familyOf("openrouter", "deepseek/deepseek-v4-flash"), "deepseek");
-  assert.equal(familyOf("zai", "glm-5.2"), "glm");
-  assert.equal(familyOf("zai", "glm-5.2-flash"), "glm");
-  assert.equal(familyOf("ollama", "qwen2.5-coder:7b"), "qwen");
-  assert.equal(familyOf("anything", "totally-unknown-model"), "anything");
-});
-
-test("judgeRecused: family-wide against both candidates", () => {
-  assert.equal(judgeRecused("zai", "glm-5.2", { provider: "zai", model: "glm-5.2-flash" }), true);
-  assert.equal(judgeRecused("zai", "glm-5.2", { provider: "ollama", model: "qwen2.5-coder:7b" }), false);
-  assert.equal(judgeRecused("ollama", "gemma4:latest", { provider: "ollama", model: "qwen2.5-coder:7b" }), false);
-});
-
-test("parseAbVerdict: single token, case-insensitive, garbage rejected", () => {
-  assert.equal(parseAbVerdict("A"), "a");
-  assert.equal(parseAbVerdict("  b\nsome reasoning"), "b");
-  assert.equal(parseAbVerdict("TIE"), "tie");
-  assert.equal(parseAbVerdict("The winner is..."), null);
-  assert.equal(parseAbVerdict(""), null);
-});
+// (familyOf/judgeRecused/parseAbVerdict moved to cogrouter-bench with the
+//  extraction — coverage lives there now; router keeps no judge wiring)
 
 // ---------- pricing ----------
 
