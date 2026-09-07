@@ -1114,6 +1114,7 @@ export class ProxyServerStreaming {
       effortLevel: reqEffort,
       speedMode: reqSpeedMode,
       modelTier: requestTier,
+      requestModelString: modelAlias,
     }, req?.headers?.["x-routing-profile"] as string | undefined);
     const builtCandidates = this.buildCandidateList(decision, request);
     const candidates = builtCandidates.list;

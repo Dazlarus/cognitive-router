@@ -183,6 +183,37 @@ export class RoutingEngine {
   ): Promise<RoutingDecision | null> {
     const { intent, confidence } = classification;
 
+    // Hard pin (bench-extraction linchpin, 2026-09-07): an explicit registry
+    // id ("provider/model") in the request is served AS ASKED - the
+    // OpenAI-compat contract. Alias/tier strings never match a registry id,
+    // so routed traffic (CognitiveRouter:latest, :fast, :lite) is unchanged.
+    // The bench sidecar's candidate measurements depend on this; clients can
+    // assert fidelity via the x-model-router-selected-model response header.
+    const requestModelString: string | undefined = context?.requestModelString;
+    if (typeof requestModelString === "string" && requestModelString.length > 0) {
+      const slash = requestModelString.indexOf("/");
+      if (
+        slash > 0 &&
+        !requestModelString.slice(0, slash).includes(":") &&
+        !requestModelString.endsWith(":fast") &&
+        !requestModelString.endsWith(":lite")
+      ) {
+        const pinProvider = requestModelString.slice(0, slash);
+        const pinModel = requestModelString.slice(slash + 1);
+        const cap = this.registry.getCapability(pinProvider, pinModel);
+        if (cap) {
+          return {
+            provider: cap.provider,
+            model: cap.model,
+            scores: { capability: 1, reliability: 1, cost: 1, latency: 1 },
+            overallScore: 1,
+            rationale: `Pinned model: explicit request for ${cap.provider}/${cap.model}`,
+            decisionSource: "pinned_model",
+          };
+        }
+      }
+    }
+
     // Extract estimated token count from context (passed by proxy-stream)
     const estimatedTokens: number = context?.estimatedTokens ?? 0;
     const sizeBucket: SizeBucket | null = estimatedTokens > 0

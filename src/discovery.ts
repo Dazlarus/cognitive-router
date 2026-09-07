@@ -12,7 +12,7 @@
 //            ("provider/model" comma-separated) register. Seeds still load.
 //
 // Extended providers beyond the registry's built-ins (zai/ollama):
-// openrouter, anthropic, gemini. A provider participates only when its API
+// openrouter, openai, anthropic, gemini. A provider participates only when its API
 // key is configured — keys gate inclusion.
 //
 // Cost safety: this module REGISTERS models (registry rows, neutral caps).
@@ -160,6 +160,7 @@ export class ModelDiscovery {
         }
         for (const fetcher of [
           this.fetchOpenRouter,
+          this.fetchOpenAI,
           this.fetchAnthropic,
           this.fetchGemini,
         ]) {
@@ -366,6 +367,32 @@ export class ModelDiscovery {
         costPer1kInput: Number.isFinite(inPerM) ? inPerM / 1000 : undefined,
         costPer1kOutput: Number.isFinite(outPerM) ? outPerM / 1000 : undefined,
       });
+    }
+    return out;
+  }
+
+  private async fetchOpenAI(): Promise<Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }>> {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return [];
+    const base =
+      process.env.OPENAI_BASE_URL?.replace(/\/+$/, "") ??
+      "https://api.openai.com/v1";
+    const resp = await fetch(`${base}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = (await resp.json()) as any;
+    // /v1/models lists every model family (embeddings, tts, whisper,
+    // moderation, image …). Keep chat-capable families only; pricing comes
+    // from the catalog lookup in run(), same as anthropic/gemini.
+    const CHAT_FAMILY = /^(gpt-|o\d|chatgpt-|codex)/;
+    const NON_CHAT = /embed|whisper|tts|audio|realtime|moderation|image|transcribe|search|video/i;
+    const out: Array<{ provider: string; model: string }> = [];
+    for (const m of data.data ?? []) {
+      if (typeof m?.id !== "string" || !m.id) continue;
+      if (!CHAT_FAMILY.test(m.id) || NON_CHAT.test(m.id)) continue;
+      out.push({ provider: "openai", model: m.id });
     }
     return out;
   }

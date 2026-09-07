@@ -4,6 +4,7 @@
 /** Fixed taxonomy of decision sources. Every routing decision is tagged with exactly one. */
 export const DECISION_SOURCES = [
   "scored_pick",
+  "pinned_model",
   "provider_fallback",
   "exploration_probe",
   "circuit_breaker_skip",

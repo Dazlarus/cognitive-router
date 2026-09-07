@@ -2317,6 +2317,55 @@ describe("RoutingEngine — Modality Filtering", () => {
 // mechanical subagents) must never land on premium zai (5.3/5.3-flash)
 // or metered APIs.
 
+describe("RoutingEngine - explicit model pin (bench sidecar linchpin)", () => {
+  let registry: ModelRegistry;
+  let costTracker: CostTracker;
+  let db: DBService;
+  let config: CognitiveRouterConfig;
+  let router: RoutingEngine;
+
+  beforeEach(async () => {
+    config = makeConfig();
+    db = makeMockDB();
+    costTracker = new CostTracker(db, config);
+    await costTracker.refreshProviderStatus();
+    registry = new ModelRegistry(db, config);
+    await registry.loadCachedState();
+    router = new RoutingEngine(registry, costTracker, db, config);
+  });
+
+  it("pins explicit registry ids as asked", async () => {
+    const decision = await router.decide(makeClassification(), "pin-sess", {
+      requestModelString: "zai/glm-5-turbo",
+    });
+    assert.ok(decision, "decision returned");
+    assert.equal(`${decision.provider}/${decision.model}`, "zai/glm-5-turbo");
+    assert.equal(decision.decisionSource, "pinned_model");
+  });
+
+  it("alias and tier strings never pin", async () => {
+    const aliasDecision = await router.decide(makeClassification(), "alias-sess", {
+      requestModelString: "cognitive-router/cognitiverouter:latest",
+    });
+    assert.ok(aliasDecision, "alias decision returned");
+    assert.notEqual(aliasDecision.decisionSource, "pinned_model");
+
+    const tierDecision = await router.decide(makeClassification(), "tier-sess", {
+      requestModelString: "zai/glm-5-turbo:fast",
+    });
+    assert.ok(tierDecision, "tier decision returned");
+    assert.notEqual(tierDecision.decisionSource, "pinned_model");
+  });
+
+  it("unknown provider/model falls through to normal routing", async () => {
+    const decision = await router.decide(makeClassification(), "unk-sess", {
+      requestModelString: "zai/nonexistent-model-xyz",
+    });
+    assert.ok(decision, "decision returned");
+    assert.notEqual(decision.decisionSource, "pinned_model");
+  });
+});
+
 describe("RoutingEngine - lite tier (:lite alias)", () => {
   let registry: ModelRegistry;
   let costTracker: CostTracker;

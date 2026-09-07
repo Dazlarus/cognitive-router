@@ -1,0 +1,392 @@
+[CognitiveRouter] Provider endpoints: zai=https://api.z.ai/api/coding/paas/v4 openrouter=https://openrouter.ai/api/v1 gemini=https://generativelanguage.googleapis.com/v1beta ollama=http://localhost:11434/v1
+[CognitiveRouter] Database opened: C:\Users\hi100\.openclaw\workspace\cognitive-router\data\cognitive-router.db
+[CognitiveRouter] Database schema verified.
+[CognitiveRouter] Judge evaluator active — sampling 10% of responses via gemini/gemini-3.5-flash (tier1≤32000 chars, tier2≤200000, 3.5:1 chars/token)
+[CognitiveRouter] Skipping non-subscription Z.AI model: zai/glm-4.5
+[CognitiveRouter] Skipping non-subscription Z.AI model: zai/glm-4.5-air
+[CognitiveRouter] Skipping non-subscription Z.AI model: zai/glm-4.6
+[CognitiveRouter] Skipping non-subscription Z.AI model: zai/glm-5
+[CognitiveRouter] Discovered unseeded Z.AI model: zai/glm-5.3 - using neutral defaults
+[CognitiveRouter] Discovered unseeded Z.AI model: zai/glm-5.3-flash - using neutral defaults
+[CognitiveRouter] Auto-disabled 1 deprecated Z.AI models
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/all-minilm:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/paraphrase-multilingual:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/granite-embedding:278m (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/snowflake-arctic-embed:335m (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/snowflake-arctic-embed2:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/mxbai-embed-large:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/bge-large:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/nomic-embed-text-v2-moe:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/minicpm-v:8b (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/qwen2.5vl:7b (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/llava:7b (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/bge-m3:567m (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/qwen3-embedding:4b (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/qwen3-embedding:8b (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/qwen3-embedding:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/embeddinggemma:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/deepseek-coder:6.7b (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/nomic-embed-text:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/qwen2.5-coder:1.5b-base (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/starcoder2:latest (inferred from name/size)
+[CognitiveRouter] Discovered unseeded Ollama model: ollama/mistral:latest (inferred from name/size)
+[CognitiveRouter] Chat benchmark: 14 model(s) need probing.
+[CognitiveRouter] Decay-to-prior: zai/glm-5.2 [retrieval] 0.573 → 0.568 (idle 15.9d, seed=0.543)
+[CognitiveRouter] Decay-to-prior: zai/glm-5-turbo [conversation] 0.834 → 0.838 (idle 25.2d, seed=0.840)
+[CognitiveRouter] Decay-to-prior: zai/glm-5-turbo [summary] 0.814 → 0.818 (idle 27.1d, seed=0.820)
+[CognitiveRouter] Decay-to-prior: zai/glm-5-turbo [coding] 0.794 → 0.798 (idle 25.3d, seed=0.800)
+[CognitiveRouter] Decay-to-prior: zai/glm-5-turbo [analysis] 0.798 → 0.800 (idle 27.5d, seed=0.800)
+[CognitiveRouter] Decay-to-prior: zai/glm-4.7 [doc-summary] 0.768 → 0.786 (idle 22.0d, seed=0.800)
+[CognitiveRouter] Decay-to-prior: zai/glm-4.7 [summary] 0.718 → 0.757 (idle 21.9d, seed=0.786)
+[CognitiveRouter] Decay-to-prior: zai/glm-4.7 [coding] 0.753 → 0.769 (idle 22.1d, seed=0.780)
+[CognitiveRouter] Decay-to-prior: zai/glm-4.7 [conversation] 0.815 → 0.818 (idle 25.3d, seed=0.820)
+[CognitiveRouter] Decay-to-prior: zai/glm-5-turbo [doc-summary] 0.803 → 0.814 (idle 25.2d, seed=0.818)
+[CognitiveRouter] Decay-to-prior: zai/glm-4.7 [retrieval] 0.775 → 0.778 (idle 21.7d, seed=0.780)
+[CognitiveRouter] Decay-to-prior: zai/glm-4.7 [math] 0.716 → 0.740 (idle 21.7d, seed=0.760)
+[CognitiveRouter] Applied 30 capability overrides from judge feedback (12 decayed toward seed).
+[CognitiveRouter] Provider registry sync complete.
+[CognitiveRouter] Model registry loaded - 49 models tracked.
+[CognitiveRouter] Chat benchmark starting for zai/glm-5.1 (version=zai/glm-5.1)...
+[CognitiveRouter] Restored circuit state for openrouter: healthy → healthy (failures=0→0, tier=0→0, age=1.6h, episodic half-life 1h)
+[CognitiveRouter] Restored circuit state for zai: circuit_open → healthy (failures=1→0, tier=1→0, age=21.3h, episodic half-life 1h)
+[CognitiveRouter] Restored circuit state for gemini: circuit_open → healthy (failures=26→0, tier=4→0, age=67.5h, episodic half-life 1h)
+[CognitiveRouter] Restored circuit state for ollama: circuit_open → healthy (failures=11→0, tier=4→0, age=238.6h, episodic half-life 1h)
+[CognitiveRouter] Tracking 5 providers. Budgets: daily=$5, monthly=$50
+[CognitiveRouter] Curator started — runs every 6h.
+[CognitiveRouter] Cognitive Router proxy listening on http://127.0.0.1:3456
+[CognitiveRouter]    POST /v1/chat/completions    - Chat (streaming + non-streaming)
+[CognitiveRouter]    POST /v1/embeddings           - Embeddings (caller-specified model or default)
+[CognitiveRouter]    GET  /v1/embeddings/models    - List all available embedding models
+[CognitiveRouter]    GET  /v1/embeddings/benchmarks - Embedding benchmark results
+[CognitiveRouter]    GET  /v1/models               - List available models
+[CognitiveRouter]    GET  /health                  - Health check
+[CognitiveRouter]    GET  /stats                   - Provider health + stats
+[CognitiveRouter]    GET  /v1/dashboard?range=24h   - Aggregated routing dashboard
+[CognitiveRouter]    POST /v1/benchmark/embeddings  - Run embedding model benchmark
+[CognitiveRouter]    POST /v1/curate                - Trigger model curator manually
+[CognitiveRouter] Proxy ready
+[CognitiveRouter] Pre-computing intent prototype embeddings...
+[CognitiveRouter] Classifier ready — 11 intent categories loaded.
+[CognitiveRouter] Embedding classifier ready
+[CognitiveRouter]   coding: score=1.00 latency=5632ms (judge: The function is correct, efficient, includes the requested t)
+[CognitiveRouter]   reasoning: score=0.00 latency=8811ms (judge: Empty response)
+[CognitiveRouter]   conversation: score=0.00 latency=13566ms (judge: Empty response)
+[CognitiveRouter] Chat benchmark complete for zai/glm-5.1: composite=0.596
+[CognitiveRouter] Chat benchmark starting for zai/glm-5-turbo (version=zai/glm-5-tu)...
+[CognitiveRouter]   coding: score=1.00 latency=4730ms (judge: The function is correct, efficient, includes the requested t)
+[CognitiveRouter]   reasoning: score=1.00 latency=14841ms (judge: The assistant provides an exceptionally clear, step-by-step )
+[CognitiveRouter]   conversation: cached (age=4.7d, score=0.90)
+[CognitiveRouter] Chat benchmark complete for zai/glm-5-turbo: composite=0.982
+[CognitiveRouter] Chat benchmark starting for openrouter/cohere/north-mini-code:free (version=openrouter/c)...
+[CognitiveRouter]   coding: score=0.00 latency=3831ms (judge: Empty response)
+[CognitiveRouter]   reasoning: score=0.20 latency=5286ms (judge: The response is incomplete and cuts off mid-sentence, failin)
+[CognitiveRouter]   conversation: score=0.70 latency=13217ms (judge: The response is highly engaging, natural, and well-written, )
+[CognitiveRouter] Chat benchmark complete for openrouter/cohere/north-mini-code:free: composite=0.169
+[CognitiveRouter] Chat benchmark starting for ollama/llama3.2-vision:11b (version=ollama/llama)...
+[CognitiveRouter] Chat benchmark starting for ollama/phi4:14b (version=ollama/phi4:)...
+[CognitiveRouter]   coding: score=1.00 latency=18268ms (judge: The function is correct, efficient, includes the requested t)
+[CognitiveRouter]   reasoning: cached (age=6.6d, score=1.00)
+[CognitiveRouter]   conversation: cached (age=6.6d, score=1.00)
+[CognitiveRouter] Chat benchmark complete for ollama/phi4:14b: composite=1.000
+[CognitiveRouter] Chat benchmark starting for ollama/all-minilm:latest (version=ollama/all-m)...
+[CognitiveRouter] Chat benchmark starting for ollama/paraphrase-multilingual:latest (version=ollama/parap)...
+[CognitiveRouter] Chat benchmark starting for ollama/minicpm-v:8b (version=ollama/minic)...
+[CognitiveRouter]   coding: cached (age=6.6d, score=0.00)
+[CognitiveRouter]   reasoning: cached (age=6.6d, score=0.00)
+[CognitiveRouter]   conversation: cached (age=6.6d, score=0.00)
+[CognitiveRouter] Chat benchmark complete for ollama/minicpm-v:8b: composite=0.000
+[CognitiveRouter] Chat benchmark starting for ollama/qwen2.5vl:7b (version=ollama/qwen2)...
+[CognitiveRouter]   coding: cached (age=6.6d, score=0.00)
+[CognitiveRouter]   reasoning: cached (age=6.6d, score=0.00)
+[CognitiveRouter]   conversation: cached (age=6.6d, score=0.00)
+[CognitiveRouter] Chat benchmark complete for ollama/qwen2.5vl:7b: composite=0.000
+[CognitiveRouter] Chat benchmark starting for ollama/llava:7b (version=ollama/llava)...
+[CognitiveRouter]   coding: cached (age=3.7d, score=0.40)
+[CognitiveRouter]   reasoning: cached (age=1.3d, score=0.40)
+[CognitiveRouter]   conversation: cached (age=6.6d, score=0.90)
+[CognitiveRouter] Chat benchmark complete for ollama/llava:7b: composite=0.489
+[CognitiveRouter] Chat benchmark starting for ollama/deepseek-coder:6.7b (version=ollama/deeps)...
+[CognitiveRouter]   coding: cached (age=6.6d, score=1.00)
+[CognitiveRouter]   reasoning: cached (age=6.6d, score=0.40)
+[CognitiveRouter]   conversation: cached (age=3.7d, score=0.30)
+[CognitiveRouter] Chat benchmark complete for ollama/deepseek-coder:6.7b: composite=0.740
+[CognitiveRouter] Chat benchmark starting for ollama/qwen2.5-coder:1.5b-base (version=ollama/qwen2)...
+[CognitiveRouter]   coding: cached (age=6.6d, score=0.00)
+[CognitiveRouter]   reasoning: cached (age=6.6d, score=0.00)
+[CognitiveRouter]   conversation: cached (age=6.6d, score=0.10)
+[CognitiveRouter] Chat benchmark complete for ollama/qwen2.5-coder:1.5b-base: composite=0.018
+[CognitiveRouter] Chat benchmark starting for ollama/starcoder2:latest (version=ollama/starc)...
+[CognitiveRouter]   coding: cached (age=6.6d, score=0.00)
+[CognitiveRouter]   reasoning: cached (age=6.6d, score=0.20)
+[CognitiveRouter]   conversation: cached (age=6.6d, score=0.20)
+[CognitiveRouter] Chat benchmark complete for ollama/starcoder2:latest: composite=0.081
+[CognitiveRouter] Chat benchmark starting for ollama/mistral:latest (version=ollama/mistr)...
+[CognitiveRouter]   coding: cached (age=6.6d, score=0.60)
+[CognitiveRouter]   reasoning: cached (age=6.6d, score=0.70)
+[CognitiveRouter]   conversation: cached (age=6.6d, score=0.90)
+[CognitiveRouter] Chat benchmark complete for ollama/mistral:latest: composite=0.676
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 1884ms
+[CognitiveRouter] Chat request - session=proxy intent=research stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] PrefixCache: prefix 58002684… seen 2× — activating caching (~5505 system tokens)
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 40 chunks) in 2199ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 36 chunks) in 4737ms
+[CognitiveRouter] Chat request - session=proxy intent=summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 28 chunks) in 2392ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 24 chunks) in 2958ms
+[CognitiveRouter] Chat request - session=proxy intent=research stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 60 chunks) in 2342ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 103 chunks) in 2434ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 139 chunks) in 7496ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 42 chunks) in 2389ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 28 chunks) in 3243ms
+[CognitiveRouter] Chat request - session=proxy intent=research stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 36 chunks) in 1822ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 122 chunks) in 2649ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 167 chunks) in 4881ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 17 chunks) in 1841ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 36 chunks) in 4262ms
+[CognitiveRouter] Chat request - session=proxy intent=analysis stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 58 chunks) in 2154ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 2042ms
+[CognitiveRouter] Chat request - session=proxy intent=research stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 47 chunks) in 2419ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 55 chunks) in 6645ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 31 chunks) in 1843ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 18 chunks) in 1839ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 120 chunks) in 5192ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 13 chunks) in 1216ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 22 chunks) in 2496ms
+[CognitiveRouter] Chat request - session=proxy intent=research stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 53 chunks) in 3542ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 34 chunks) in 2914ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~15894 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 139 chunks) in 4111ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~17137 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 250 chunks) in 7984ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~17146 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=math stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 100 chunks) in 3505ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 2881ms
+[CognitiveRouter] Chat request - session=proxy intent=research stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 40 chunks) in 2816ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 188 chunks) in 4970ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 66 chunks) in 3300ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 43 chunks) in 2958ms
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 352 chunks) in 9686ms
+[CognitiveRouter] Chat request - session=proxy intent=math stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 73 chunks) in 3152ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 109 chunks) in 5174ms
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 62 chunks) in 1896ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~18212 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 64 chunks) in 6020ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~22641 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 1402 chunks) in 30579ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~24357 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 1157 chunks) in 28503ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~24492 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] Judge scored response: 8/10 via gemini/gemini-3.5-flash — The assistant correctly analyzed the provided JSON session data, identifying that there are no active worker sessions (the only failed subagent ended earlier) and made a logical decision based on the 
+[CognitiveRouter] Judge gate Arm B (low_confidence): zai/glm-5.2 [coding] — no_apply.
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 61 chunks) in 16625ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~24609 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~15034 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 38 chunks) in 8796ms
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 184 chunks) in 5879ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~17252 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] PrefixCache: prefix e1e7353c… seen 2× — activating caching (~7046 system tokens)
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 367 chunks) in 11730ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~18373 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=research stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 1517 chunks) in 36370ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~25034 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 756 chunks) in 22733ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~29088 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=science stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 1463 chunks) in 38969ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~29819 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 5 candidates across 4 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 1037 chunks) in 26685ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~35031 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~35031 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 1156 chunks) in 34514ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~37149 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~37149 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 1157 chunks) in 28603ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~39609 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~39609 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 897 chunks) in 24040ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~39740 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~39740 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=math stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 3 chunks) in 16373ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~39795 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~39795 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=retrieval stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 133 chunks) in 7162ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40004 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40004 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 195 chunks) in 7671ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40119 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40119 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 2162ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40277 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40277 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=retrieval stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 197 chunks) in 10209ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40378 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40378 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 1543ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40397 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40397 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 2944ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40444 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40444 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 2900ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40462 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40462 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 19 chunks) in 2901ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40480 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40480 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 2527ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40498 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40498 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 59 chunks) in 4172ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40557 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40557 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 126 chunks) in 4730ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~40732 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~40732 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=retrieval stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 229 chunks) in 10486ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~42194 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~42194 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=coding stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 739 chunks) in 20228ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~42297 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~42297 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 4646ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~42394 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~42394 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 65 chunks) in 5746ms
+[CognitiveRouter] Context filter: excluded ollama/phi4:14b (skip_reason=context_window_exceeded) — ~42431 tokens > 12800 limit (80% of 16,000).
+[CognitiveRouter] Skipping ollama - request ~42431 tokens exceeds provider limit 32768
+[CognitiveRouter] Chat request - session=proxy intent=doc-summary stream=true - 4 candidates across 3 providers tools=yes
+[CognitiveRouter] Trying zai/glm-5.2...
+[CognitiveRouter] ✅ zai/glm-5.2 streamed (buffered, 2 chunks) in 2171ms

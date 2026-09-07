@@ -125,11 +125,13 @@ function providerBaseUrl(envVar: string, fallback: string): string {
 }
 
 const ZAI_BASE = providerBaseUrl("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4");
+const OPENAI_BASE = providerBaseUrl("OPENAI_BASE_URL", "https://api.openai.com/v1");
 const OPENROUTER_BASE = providerBaseUrl("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1");
+const ANTHROPIC_BASE = providerBaseUrl("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
 const GEMINI_BASE = providerBaseUrl("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta");
 const OLLAMA_BASE = providerBaseUrl("OLLAMA_BASE_URL", "http://localhost:11434/v1");
 
-logger.info(`Provider endpoints: zai=${ZAI_BASE} openrouter=${OPENROUTER_BASE} gemini=${GEMINI_BASE} ollama=${OLLAMA_BASE}`);
+logger.info(`Provider endpoints: zai=${ZAI_BASE} openai=${OPENAI_BASE} openrouter=${OPENROUTER_BASE} anthropic=${ANTHROPIC_BASE} gemini=${GEMINI_BASE} ollama=${OLLAMA_BASE}`);
 
 function buildZaiThinking(level: string): any {
   if (level === "none") return undefined;
@@ -158,6 +160,20 @@ function buildZaiThinkingFields(model: string, level: string): { thinking?: unkn
   }
   const thinking = buildZaiThinking(level);
   return thinking ? { thinking } : {};
+}
+
+function buildOpenAIThinking(level: string): string | undefined {
+  if (level === "none") return undefined;
+  return level; // reasoning_effort: none|minimal|low|medium|high|xhigh|max (per-model support)
+}
+
+function buildAnthropicThinking(level: string): { thinking?: { type: "adaptive" }; effort?: string } {
+  if (level === "none") return {};
+  // Claude 4.7+ rejects thinking.type "enabled" (400); the current control
+  // surface is thinking.type "adaptive" + top-level effort (docs: Thinking /
+  // Thinking and effort, platform.claude.com). "none" means "model default"
+  // here — some models (Claude 5 family) cannot disable thinking at all.
+  return { thinking: { type: "adaptive" }, effort: level };
 }
 
 function buildOpenRouterThinking(level: string): any {
@@ -390,6 +406,82 @@ export const ZAIAdapter: ProviderAdapter = {
   },
 };
 
+// ─── OpenAI Adapter (native /v1/chat/completions, supports streaming) ───
+// The inbound format is already OpenAI-compatible; translation is limited to
+// the reasoning-era deltas: max_tokens is deprecated (rejected by o-series —
+// max_completion_tokens replaces it), and thinking maps to reasoning_effort
+// (docs.openai.com: supported values none|minimal|low|medium|high|xhigh|max).
+
+export const OpenAIAdapter: ProviderAdapter = {
+  name: "openai",
+
+  async chatCompletion(
+    model: string,
+    request: ChatCompletionRequest,
+    apiKey: string,
+    externalSignal?: AbortSignal,
+  ): Promise<ChatCompletionResponse> {
+    const level = extractThinkingLevel(request);
+    const cleaned = stripThinking(request);
+    const reasoningEffort = buildOpenAIThinking(level);
+    const body = {
+      ...maxTokensToCompletionTokens(cleaned),
+      model,
+      stream: false,
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    };
+    const resp = await fetch(`${OPENAI_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: withExternalSignal(remoteTimeoutMs(), externalSignal),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw classifyError(resp.status, text);
+    }
+
+    return (await resp.json()) as ChatCompletionResponse;
+  },
+
+  async* chatCompletionStream(
+    model: string,
+    request: ChatCompletionRequest,
+    apiKey: string,
+    externalSignal?: AbortSignal,
+  ): AsyncIterable<ChatCompletionChunk> {
+    const level = extractThinkingLevel(request);
+    const cleaned = stripThinking(request);
+    const reasoningEffort = buildOpenAIThinking(level);
+    const body = {
+      ...maxTokensToCompletionTokens(cleaned),
+      model,
+      stream: true,
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    };
+    const resp = await fetch(`${OPENAI_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: withExternalSignal(remoteStreamTimeoutMs(), externalSignal),
+    });
+
+    if (!resp.ok || !resp.body) {
+      const text = await resp.text().catch(() => "");
+      throw classifyError(resp.status, text);
+    }
+
+    yield* parseSSEStream(resp, model);
+  },
+};
+
 // ─── OpenRouter Adapter (OpenAI-compatible, supports streaming) ───
 
 export const OpenRouterAdapter: ProviderAdapter = {
@@ -453,6 +545,77 @@ export const OpenRouterAdapter: ProviderAdapter = {
     }
 
     yield* parseSSEStream(resp, model);
+  },
+};
+
+// ─── Anthropic Adapter (native Messages API, supports streaming) ───
+// Wire-format differences vs OpenAI (docs: platform.claude.com/en/api/messages):
+//   - system prompt is a top-level `system` param, NOT a message role
+//   - messages carry only user/assistant roles; tool results are user-role
+//     content blocks (`tool_result`) keyed by tool_use_id
+//   - tools use {name, description, input_schema} + tool_choice {auto|any|tool}
+//   - max_tokens is REQUIRED (no server default)
+//   - stop_reason: end_turn|stop_sequence→stop, max_tokens→length,
+//     tool_use→tool_calls, refusal→content_filter
+//   - thinking: {type:"adaptive"} + top-level effort (Claude 4.7+ rejects the
+//     legacy `enabled`+budget_tokens form)
+//   - streaming uses named SSE events (message_start, content_block_start,
+//     content_block_delta, content_block_stop, message_delta, message_stop)
+
+export const AnthropicAdapter: ProviderAdapter = {
+  name: "anthropic",
+
+  async chatCompletion(
+    model: string,
+    request: ChatCompletionRequest,
+    apiKey: string,
+    externalSignal?: AbortSignal,
+  ): Promise<ChatCompletionResponse> {
+    const { body, url } = buildAnthropicRequest(model, request, false);
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+      signal: withExternalSignal(remoteTimeoutMs(), externalSignal),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw classifyError(resp.status, text);
+    }
+
+    const data = await resp.json() as any;
+    return anthropicToOpenAI(data, model);
+  },
+
+  async* chatCompletionStream(
+    model: string,
+    request: ChatCompletionRequest,
+    apiKey: string,
+    externalSignal?: AbortSignal,
+  ): AsyncIterable<ChatCompletionChunk> {
+    const { body, url } = buildAnthropicRequest(model, request, true);
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+      signal: withExternalSignal(remoteStreamTimeoutMs(), externalSignal),
+    });
+
+    if (!resp.ok || !resp.body) {
+      const text = await resp.text().catch(() => "");
+      throw classifyError(resp.status, text);
+    }
+
+    yield* parseAnthropicSSEStream(resp, model);
   },
 };
 
@@ -630,6 +793,333 @@ export const OllamaAdapter: ProviderAdapter = {
     yield* parseSSEStream(resp, model);
   },
 };
+
+// ─── OpenAI Helpers ───
+
+/** Translate max_tokens → max_completion_tokens. OpenAI deprecated max_tokens
+ *  and rejects it on o-series reasoning models; max_completion_tokens is
+ *  accepted across the current lineup. An explicit max_completion_tokens
+ *  on the inbound request wins untouched. */
+function maxTokensToCompletionTokens(request: ChatCompletionRequest): ChatCompletionRequest {
+  if (request.max_tokens === undefined || request.max_completion_tokens !== undefined) return request;
+  const { max_tokens, ...rest } = request;
+  return { ...rest, max_completion_tokens: max_tokens } as ChatCompletionRequest;
+}
+
+// ─── Anthropic Helpers ───
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b: any) => (typeof b === "string" ? b : b?.type === "text" ? b.text ?? "" : ""))
+      .filter(Boolean)
+      .join("");
+  }
+  return "";
+}
+
+function mapAnthropicStopReason(stopReason: string | undefined): string {
+  switch (stopReason) {
+    case "tool_use": return "tool_calls";
+    case "max_tokens":
+    case "model_context_window_exceeded": return "length";
+    case "refusal": return "content_filter";
+    default: return "stop"; // end_turn | stop_sequence | unknown
+  }
+}
+
+/** Convert OpenAI-style content (string or parts array) to Anthropic content
+ *  blocks. Text parts become text blocks; image_url parts become image blocks
+ *  (base64 data URIs decode to the base64 source, plain URLs use the URL
+ *  source — both documented ImageBlockParam forms). */
+function openAIContentToAnthropicBlocks(content: any): any[] {
+  if (typeof content === "string") {
+    return [{ type: "text", text: content }];
+  }
+  if (!Array.isArray(content)) {
+    return [{ type: "text", text: String(content ?? "") }];
+  }
+  const blocks: any[] = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      blocks.push({ type: "text", text: part });
+    } else if (part?.type === "text" && part.text) {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part?.type === "image_url" && part.image_url?.url) {
+      const url: string = part.image_url.url;
+      const dataUri = url.match(/^data:(image\/[a-z+]+);base64,(.*)$/s);
+      if (dataUri) {
+        blocks.push({ type: "image", source: { type: "base64", media_type: dataUri[1], data: dataUri[2] } });
+      } else {
+        blocks.push({ type: "image", source: { type: "url", url } });
+      }
+    }
+  }
+  return blocks.length > 0 ? blocks : [{ type: "text", text: "" }];
+}
+
+/** Convert OpenAI chat messages (minus system) to Anthropic message params. */
+function openAIToAnthropicMessages(messages: ChatMessage[]): any[] {
+  const out: any[] = [];
+  for (const m of messages) {
+    if (m.role === "tool" || m.role === "function") {
+      // Tool results ride on user-role tool_result blocks keyed by tool_use_id
+      // (OpenAI's equivalent field is tool_call_id).
+      out.push({
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: m.tool_call_id ?? m.name ?? "tool",
+          content: extractTextContent(m.content),
+        }],
+      });
+      continue;
+    }
+    if (m.role === "assistant") {
+      const blocks: any[] = [];
+      const text = extractTextContent(m.content);
+      if (text) blocks.push({ type: "text", text });
+      for (const toolCall of m.tool_calls ?? []) {
+        const fn = toolCall?.function;
+        if (!fn?.name) continue;
+        blocks.push({
+          type: "tool_use",
+          id: toolCall.id ?? `call_${Date.now()}_${blocks.length}`,
+          name: fn.name,
+          input: parseFunctionArguments(fn.arguments),
+        });
+      }
+      out.push({ role: "assistant", content: blocks.length > 0 ? blocks : [{ type: "text", text: "" }] });
+      continue;
+    }
+    out.push({ role: "user", content: openAIContentToAnthropicBlocks(m.content) });
+  }
+  return out;
+}
+
+/** Convert OpenAI tools/functions to Anthropic tool definitions. */
+function openAIToolsToAnthropic(request: ChatCompletionRequest): any[] {
+  const tools: any[] = [];
+  for (const tool of request.tools ?? []) {
+    const fn = tool?.function;
+    if (!fn?.name) continue;
+    tools.push({ name: fn.name, description: fn.description ?? "", input_schema: fn.parameters ?? { type: "object", properties: {} } });
+  }
+  for (const fn of request.functions ?? []) {
+    if (!fn?.name) continue;
+    tools.push({ name: fn.name, description: fn.description ?? "", input_schema: fn.parameters ?? { type: "object", properties: {} } });
+  }
+  return tools;
+}
+
+function buildAnthropicRequest(
+  model: string,
+  request: ChatCompletionRequest,
+  stream: boolean,
+): { body: any; url: string } {
+  const level = extractThinkingLevel(request);
+  const cleaned = stripThinking(request);
+  const thinkingFields = buildAnthropicThinking(level);
+
+  const systemPrompt = request.messages
+    .filter((m) => m.role === "system")
+    .map((m) => extractTextContent(m.content))
+    .filter(Boolean)
+    .join("\n\n");
+  const messages = openAIToAnthropicMessages(
+    request.messages.filter((m) => m.role !== "system"),
+  );
+
+  const body: any = {
+    model,
+    // Anthropic requires max_tokens; OpenAI-compatible requests may omit it.
+    max_tokens: request.max_tokens ?? 8192,
+    messages,
+    ...(systemPrompt ? { system: systemPrompt } : {}),
+    ...(stream ? { stream: true } : {}),
+    // Anthropic temperature range is 0-1 (OpenAI allows up to 2) — clamp.
+    ...(request.temperature !== undefined ? { temperature: Math.min(Math.max(request.temperature, 0), 1) } : {}),
+    ...(request.top_p !== undefined ? { top_p: request.top_p } : {}),
+    ...(cleaned.stop !== undefined
+      ? { stop_sequences: Array.isArray(cleaned.stop) ? cleaned.stop : [cleaned.stop] }
+      : {}),
+    ...thinkingFields,
+  };
+
+  const tools = openAIToolsToAnthropic(request);
+  if (tools.length > 0) {
+    body.tools = tools;
+    // Anthropic tool_choice: {auto|any|tool{name}} — no "none" (omit tools
+    // entirely for that semantic instead).
+    if (request.tool_choice === "auto") body.tool_choice = { type: "auto" };
+    else if (request.tool_choice === "required") body.tool_choice = { type: "any" };
+    else if (typeof request.tool_choice === "object" && (request.tool_choice as any)?.function?.name) {
+      body.tool_choice = { type: "tool", name: (request.tool_choice as any).function.name };
+    }
+  }
+
+  return { body, url: `${ANTHROPIC_BASE}/v1/messages` };
+}
+
+function anthropicToOpenAI(data: any, model: string): ChatCompletionResponse {
+  const blocks: any[] = Array.isArray(data?.content) ? data.content : [];
+  const text = blocks.filter((b) => b?.type === "text").map((b) => b.text ?? "").join("");
+  const thinking = blocks.filter((b) => b?.type === "thinking").map((b) => b.thinking ?? "").join("");
+  const toolCalls = blocks
+    .filter((b) => b?.type === "tool_use")
+    .map((b, index) => ({
+      id: b.id ?? `call_${Date.now()}_${index}`,
+      type: "function",
+      function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
+    }));
+
+  const usage = data?.usage;
+  const promptTokens = (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0) + (usage?.cache_creation_input_tokens ?? 0);
+
+  return {
+    id: data?.id ?? generateId(),
+    object: "chat.completion",
+    created: Date.now(),
+    model: `anthropic/${model}`,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: text,
+        ...(thinking ? { reasoning_content: thinking } : {}),
+        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: mapAnthropicStopReason(data?.stop_reason),
+    }],
+    usage: usage ? {
+      prompt_tokens: promptTokens,
+      completion_tokens: usage.output_tokens ?? 0,
+      total_tokens: promptTokens + (usage.output_tokens ?? 0),
+    } : undefined,
+  };
+}
+
+/** Parse Anthropic's named-event SSE stream into OpenAI-style chunks.
+ *  Event flow (docs: Streaming messages): message_start → per-block
+ *  content_block_start/content_block_delta/content_block_stop →
+ *  message_delta (stop_reason + CUMULATIVE usage) → message_stop. */
+async function* parseAnthropicSSEStream(
+  response: Response,
+  model: string,
+): AsyncIterable<ChatCompletionChunk> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const id = generateId();
+  // content-block index → tool_calls array index (text blocks skip indexing)
+  const toolCallIndexByBlock = new Map<number, number>();
+  let toolCallCount = 0;
+  let finishReason = "stop";
+  let usage: any;
+
+  const makeChunk = (
+    delta: Record<string, unknown>,
+    finish: string | null,
+  ): ChatCompletionChunk => ({
+    id,
+    object: "chat.completion.chunk",
+    created: Date.now(),
+    model: `anthropic/${model}`,
+    choices: [{ index: 0, delta: delta as any, finish_reason: finish }],
+  });
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(":") || trimmed.startsWith("event:")) continue;
+      if (!trimmed.startsWith("data: ")) continue;
+
+      const data = trimmed.substring(6);
+      if (data === "[DONE]") return;
+
+      let ev: any;
+      try {
+        ev = JSON.parse(data);
+      } catch {
+        continue; // skip malformed events
+      }
+      const blockIndex: number = ev.index ?? 0;
+
+      switch (ev.type) {
+        case "message_start":
+          yield makeChunk({ role: "assistant", content: "" }, null);
+          break;
+
+        case "content_block_start":
+          if (ev.content_block?.type === "tool_use") {
+            const tcIndex = toolCallCount++;
+            toolCallIndexByBlock.set(blockIndex, tcIndex);
+            yield makeChunk({
+              tool_calls: [{
+                index: tcIndex,
+                id: ev.content_block.id,
+                type: "function",
+                function: { name: ev.content_block.name, arguments: "" },
+              }],
+            }, null);
+          }
+          break;
+
+        case "content_block_delta": {
+          const delta = ev.delta ?? {};
+          if (delta.type === "text_delta") {
+            yield makeChunk({ content: delta.text ?? "" }, null);
+          } else if (delta.type === "thinking_delta") {
+            yield makeChunk({ reasoning_content: delta.thinking ?? "" }, null);
+          } else if (delta.type === "input_json_delta") {
+            yield makeChunk({
+              tool_calls: [{
+                index: toolCallIndexByBlock.get(blockIndex) ?? 0,
+                function: { arguments: delta.partial_json ?? "" },
+              }],
+            }, null);
+          }
+          break;
+        }
+
+        case "message_delta":
+          if (ev.delta?.stop_reason) finishReason = mapAnthropicStopReason(ev.delta.stop_reason);
+          if (ev.usage) usage = ev.usage; // cumulative
+          break;
+
+        case "message_stop": {
+          const chunk = makeChunk({}, finishReason);
+          if (usage) {
+            const promptTokens = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+            (chunk as any).usage = {
+              prompt_tokens: promptTokens,
+              completion_tokens: usage.output_tokens ?? 0,
+              total_tokens: promptTokens + (usage.output_tokens ?? 0),
+            };
+          }
+          yield chunk;
+          return;
+        }
+
+        case "error":
+          throw classifyError(502, JSON.stringify(ev.error ?? ev));
+      }
+    }
+  }
+
+  // Stream ended without message_stop — still emit a terminal chunk.
+  yield makeChunk({}, finishReason);
+}
 
 // ─── Gemini Helpers ───
 
@@ -911,7 +1401,9 @@ function geminiToOpenAI(data: any, model: string): ChatCompletionResponse {
 
 export const PROVIDERS: Record<string, ProviderAdapter> = {
   zai: ZAIAdapter,
+  openai: OpenAIAdapter,
   openrouter: OpenRouterAdapter,
+  anthropic: AnthropicAdapter,
   gemini: GeminiAdapter,
   ollama: OllamaAdapter,
 };

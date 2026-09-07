@@ -91,19 +91,40 @@ function makeGeminiSSEResponse(parts: any[][]): Response {
   return new Response(stream, { status: 200 });
 }
 
+/** Create a mock Anthropic SSE stream response (named events). */
+function makeAnthropicSSEResponse(events: any[]): Response {
+  const sseBody = events
+    .map((ev) => `event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`)
+    .join("") + "data: [DONE]\n\n";
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(sseBody));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, { status: 200 });
+}
+
 // ─── Tests ──────────────────────────────────────────────────
 
 describe("Provider Registry", () => {
-  it("should export all four providers", () => {
+  it("should export all six providers", () => {
     assert.ok(PROVIDERS.zai, "ZAI provider should exist");
+    assert.ok(PROVIDERS.openai, "OpenAI provider should exist");
     assert.ok(PROVIDERS.openrouter, "OpenRouter provider should exist");
+    assert.ok(PROVIDERS.anthropic, "Anthropic provider should exist");
     assert.ok(PROVIDERS.gemini, "Gemini provider should exist");
     assert.ok(PROVIDERS.ollama, "Ollama provider should exist");
   });
 
   it("getProvider should return the correct adapter by name", () => {
     assert.equal(getProvider("zai"), ZAIAdapter);
+    assert.equal(getProvider("openai"), OpenAIAdapter);
     assert.equal(getProvider("openrouter"), OpenRouterAdapter);
+    assert.equal(getProvider("anthropic"), AnthropicAdapter);
     assert.equal(getProvider("gemini"), GeminiAdapter);
     assert.equal(getProvider("ollama"), OllamaAdapter);
   });
@@ -114,7 +135,9 @@ describe("Provider Registry", () => {
 
   it("each adapter should have a name property", () => {
     assert.equal(ZAIAdapter.name, "zai");
+    assert.equal(OpenAIAdapter.name, "openai");
     assert.equal(OpenRouterAdapter.name, "openrouter");
+    assert.equal(AnthropicAdapter.name, "anthropic");
     assert.equal(GeminiAdapter.name, "gemini");
     assert.equal(OllamaAdapter.name, "ollama");
   });

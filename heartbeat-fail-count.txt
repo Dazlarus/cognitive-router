@@ -1,0 +1,4 @@
+count=1
+first_failure=2026-09-04T07:55:00-05:00
+last_failure=2026-09-04T07:55:00-05:00
+detail=port 3456 no listener; router-restart-20260903-1625.log last write 2026-09-04T04:03 (died ~4h ago). Beat 07:54 observed failure #1; alert at 3+. Do not restart during heartbeat.
