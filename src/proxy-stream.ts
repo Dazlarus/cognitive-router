@@ -37,6 +37,7 @@ import { BudgetTracker } from "./budget_tracker.js";
 import { ModelCurator } from "./curator.js";
 import { ModelDiscovery } from "./discovery.js";
 import { PROMPT_GENERATION, rebuildLadder } from "./benchmark_ladder.js";
+import { withUpstreamTimeoutOverride } from "./upstream_timeout_scope.js";
 import { JudgeEvaluator } from "./judge.js";
 import { decideOutboundEffort, effortPolicyMode } from "./effort_policy.js";
 import { getZaiQuotaProbe } from "./quota_probe.js";
@@ -887,7 +888,14 @@ export class ProxyServerStreaming {
       if (url === "/v1/chat/completions" && req.method === "POST") {
         const body = await this.readBody(req);
         const request = JSON.parse(body) as ChatCompletionRequest;
-        await this.handleChat(request, res, this.extractSessionKey(req, request), req);
+        // Trusted loopback callers (bench sidecar) may lift BOTH the total
+        // request deadline and the per-attempt upstream fetch timeout via
+        // x-router-timeout-ms (CONTRACT.md §2). The AsyncLocalStorage scope
+        // propagates to adapters without signature changes.
+        const overrideMs = requestTimeoutOverrideMs(req);
+        const chat = () => this.handleChat(request, res, this.extractSessionKey(req, request), req);
+        if (overrideMs === null) await chat();
+        else await withUpstreamTimeoutOverride(overrideMs, chat);
         return;
       }
 

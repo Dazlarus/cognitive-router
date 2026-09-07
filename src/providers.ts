@@ -72,6 +72,8 @@ export function extractSpeedMode(request: ChatCompletionRequest): SpeedMode {
   return "normal";
 }
 
+import { getUpstreamTimeoutOverrideMs } from "./upstream_timeout_scope.js";
+
 function envTimeoutMs(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -81,19 +83,21 @@ function envTimeoutMs(name: string, fallback: number): number {
 }
 
 function remoteTimeoutMs(): number {
-  return envTimeoutMs("ROUTER_REMOTE_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_TIMEOUT_MS", 25_000));
+  // Per-request override (bench sidecar via x-router-timeout-ms) wins over
+  // env/default: scoped via AsyncLocalStorage, see upstream_timeout_scope.ts.
+  return getUpstreamTimeoutOverrideMs() ?? envTimeoutMs("ROUTER_REMOTE_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_TIMEOUT_MS", 25_000));
 }
 
 function remoteStreamTimeoutMs(): number {
-  return envTimeoutMs("ROUTER_REMOTE_STREAM_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_STREAM_TIMEOUT_MS", 120_000));
+  return getUpstreamTimeoutOverrideMs() ?? envTimeoutMs("ROUTER_REMOTE_STREAM_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_STREAM_TIMEOUT_MS", 120_000));
 }
 
 function localTimeoutMs(): number {
-  return envTimeoutMs("ROUTER_LOCAL_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_TIMEOUT_MS", 45_000));
+  return getUpstreamTimeoutOverrideMs() ?? envTimeoutMs("ROUTER_LOCAL_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_TIMEOUT_MS", 45_000));
 }
 
 function localStreamTimeoutMs(): number {
-  return envTimeoutMs("ROUTER_LOCAL_STREAM_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_STREAM_TIMEOUT_MS", 120_000));
+  return getUpstreamTimeoutOverrideMs() ?? envTimeoutMs("ROUTER_LOCAL_STREAM_TIMEOUT_MS", envTimeoutMs("ROUTER_PROVIDER_STREAM_TIMEOUT_MS", 120_000));
 }
 
 /**
