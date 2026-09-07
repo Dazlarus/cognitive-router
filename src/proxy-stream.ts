@@ -2158,6 +2158,18 @@ export class ProxyServerStreaming {
     const usesTools = requestUsesTools(request);
     const estimatedTokens = estimateTokenCount(request);
 
+    // Pin means pin (bench-extraction, 2026-09-07): when the decision came
+    // from an explicit registry id, the candidate list is THAT MODEL ALONE.
+    // Walking the failover chain on a pinned failure silently substitutes a
+    // different model — the exact disease pin-mode exists to kill (live:
+    // anchor gen returned empty → router served glm-5.1 → ollama last-resort
+    // → 5-minute chain walk → client fetch died at undici's 300s
+    // headersTimeout). Failing loudly lets the bench retry/backoff itself.
+    if (decision?.decisionSource === "pinned_model") {
+      candidates.push({ provider: decision.provider, model: decision.model });
+      return { list: candidates, lastResortAppended: false };
+    }
+
     // Router's top pick first for plain chat. For tool turns, keep provider
     // priority strict so remote tool-capable providers stay ahead of local ones.
     // Only include the decision winner if its provider is in the active priority list.
