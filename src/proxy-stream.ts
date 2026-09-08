@@ -1166,7 +1166,7 @@ export class ProxyServerStreaming {
       modelTier: requestTier,
       requestModelString: modelAlias,
     }, req?.headers?.["x-routing-profile"] as string | undefined);
-    const builtCandidates = this.buildCandidateList(decision, request);
+    const builtCandidates = this.buildCandidateList(decision, request, req);
     const candidates = builtCandidates.list;
     const lastResortCandidate = builtCandidates.lastResortAppended
       ? candidates[candidates.length - 1]
@@ -2152,6 +2152,7 @@ export class ProxyServerStreaming {
   private buildCandidateList(
     decision: Awaited<ReturnType<RoutingEngine["decide"]>>,
     request: ChatCompletionRequest,
+    req?: http.IncomingMessage,
   ): { list: Array<{ provider: string; model: string }>; lastResortAppended: boolean } {
     const candidates: Array<{ provider: string; model: string }> = [];
     let lastResortAppended = false;
@@ -2167,6 +2168,43 @@ export class ProxyServerStreaming {
     // headersTimeout). Failing loudly lets the bench retry/backoff itself.
     if (decision?.decisionSource === "pinned_model") {
       candidates.push({ provider: decision.provider, model: decision.model });
+      // Cross-provider failover for bench pins (Daz 2026-09-07): same model,
+      // different door. Opt-in via x-bench-failover header (bench-only seam,
+      // CONTRACT.md §2 rule 7). The pin stays first — free/subscription
+      // endpoint serves when healthy; alternates append in cost order, so a
+      // dead or zombie coding endpoint degrades to metered serving instead
+      // of a 503. Pin semantics hold: every alternate is the SAME base model
+      // (walking to a different model is the disease pin-mode kills).
+      if (req?.headers["x-bench-failover"] === "true") {
+        const base = (m: string) => m.split("/").pop()?.toLowerCase() ?? "";
+        const pinnedBase = base(decision.model);
+        const equivalents = this.modelRegistry
+          .getAvailableModels(this.config.providerPriority)
+          .filter(
+            (m) =>
+              m.provider !== decision.provider &&
+              pinnedBase !== "" &&
+              base(m.model) === pinnedBase &&
+              this.costTracker.isAvailable(m.provider) &&
+              estimatedTokens <= (m.contextWindow ?? 128_000),
+          )
+          .sort(
+            (a, b) =>
+              (a.costPer1kInput ?? 9e9) + (a.costPer1kOutput ?? 9e9) -
+              ((b.costPer1kInput ?? 9e9) + (b.costPer1kOutput ?? 9e9)),
+          )
+          .slice(0, 3);
+        for (const eq of equivalents) {
+          candidates.push({ provider: eq.provider, model: eq.model });
+        }
+        if (equivalents.length > 0) {
+          logger.info(
+            `bench pin failover armed: ${decision.provider}/${decision.model} → ${equivalents
+              .map((e) => `${e.provider}/${e.model}`)
+              .join(", ")}`,
+          );
+        }
+      }
       return { list: candidates, lastResortAppended: false };
     }
 

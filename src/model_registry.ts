@@ -181,6 +181,30 @@ const SEED_MODELS: ModelCapability[] = [
     { input: 0.09, output: 0.18 }, // per 1K tokens (paid)
   ),
 
+  // GLM via OpenRouter — bench pin failover doors (Daz 2026-09-07): same
+  // model, different provider. The router walks these when the zai coding
+  // endpoint 503s on a pinned bench request carrying x-bench-failover.
+  // Caps mirror the zai seeds for the same models; pricing from
+  // openrouter.ai/api/v1/models (live 2026-09-07; per-1k = $/1M ÷ 1000).
+  // METERED: they serve pins only via the failover path or normal paid
+  // fallback — cost scoring keeps subscription zai ahead otherwise.
+  makeModel("openrouter", "z-ai/glm-4.7", 204_800,
+    { coding: 0.78, reasoning: 0.80, creative: 0.74, math: 0.76, analysis: 0.78, conversation: 0.82, retrieval: 0.78, science: 0.77, business: 0.78, summary: 0.80 },
+    { input: 0.0004, output: 0.00175 },
+  ),
+  makeModel("openrouter", "z-ai/glm-5-turbo", 202_800,
+    { coding: 0.80, reasoning: 0.82, creative: 0.76, math: 0.78, analysis: 0.80, conversation: 0.84, retrieval: 0.78, science: 0.78, business: 0.80, summary: 0.82 },
+    { input: 0.0012, output: 0.004 },
+  ),
+  makeModel("openrouter", "z-ai/glm-5.3", 1_000_000,
+    { coding: 0.90, reasoning: 0.94, creative: 0.85, math: 0.91, analysis: 0.92, conversation: 0.88, retrieval: 0.86, science: 0.94, business: 0.89, summary: 0.88 },
+    { input: 0.0014, output: 0.0044 },
+  ),
+  makeModel("openrouter", "z-ai/glm-5.3-flash", 1_000_000,
+    { coding: 0.82, reasoning: 0.84, creative: 0.78, math: 0.80, analysis: 0.82, conversation: 0.85, retrieval: 0.80, science: 0.80, business: 0.82, summary: 0.84 },
+    { input: 0.000075, output: 0.00025 },
+  ),
+
   // ═══════════════════════════════════════════════════════════════
   // Ollama Local Models
   // ═══════════════════════════════════════════════════════════════
