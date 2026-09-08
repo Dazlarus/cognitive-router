@@ -74,9 +74,12 @@ export const PINNED_DECODE = {
 
 // ---------- prompt generations ----------
 
-/** Generation tag invalidates caches when prompts change. LLM-generated
- *  rotating suites come later; this is the static v1 starter pool. */
-export const PROMPT_GENERATION = "gen-2026-09";
+/** Generation tag invalidates caches when prompts OR the decode protocol
+ *  change. gen-2026-09-02 (2026-09-08): as-served decode — uncapped, full
+ *  response (reasoning + answer) captured and judged by the bench sidecar
+ *  (cogrouter-bench ladder.ts is the twin; keep both tags in lockstep —
+ *  CONTRACT.md §3 records the re-integration diff). */
+export const PROMPT_GENERATION = "gen-2026-09-02";
 
 export type BenchIntent = "coding" | "reasoning" | "conversation";
 
