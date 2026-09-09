@@ -192,6 +192,13 @@ const SEED_MODELS: ModelCapability[] = [
     { coding: 0.78, reasoning: 0.80, creative: 0.74, math: 0.76, analysis: 0.78, conversation: 0.82, retrieval: 0.78, science: 0.77, business: 0.78, summary: 0.80 },
     { input: 0.0004, output: 0.00175 },
   ),
+  makeModel("openrouter", "z-ai/glm-5.1", 202_800,
+    // Scores mirror the zai glm-5.1 seed; pricing interpolated from the OR
+    // family (between 4.7 and 5.3) — card page didn't render $ figures when
+    // seeded 2026-09-08; re-verify against openrouter.ai/api/v1/models.
+    { coding: 0.85, reasoning: 0.88, creative: 0.80, math: 0.84, analysis: 0.86, conversation: 0.87, retrieval: 0.83, science: 0.86, business: 0.84, summary: 0.86 },
+    { input: 0.0007, output: 0.0025 },
+  ),
   makeModel("openrouter", "z-ai/glm-5-turbo", 202_752,
     { coding: 0.80, reasoning: 0.82, creative: 0.76, math: 0.78, analysis: 0.80, conversation: 0.84, retrieval: 0.78, science: 0.78, business: 0.80, summary: 0.82 },
     { input: 0.0012, output: 0.004 },
