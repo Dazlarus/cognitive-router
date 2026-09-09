@@ -26,7 +26,10 @@ import type { DBService } from "./db_service.js";
 
 // ---------- identity ----------
 
-export type EffortLevel = "none" | "low" | "medium" | "high";
+// Effort-matrix (2026-09-09): extended with max + thinking-on/off so ladder
+// identities can carry CONFIGURATIONS (model x effort). Keep in lockstep
+// with cogrouter-bench src/ladder.ts (CONTRACT.md §3/§12).
+export type EffortLevel = "none" | "low" | "medium" | "high" | "max" | "thinking-off" | "thinking-on";
 
 export interface BenchModelKey {
   /** Provider-agnostic model id, e.g. "claude-opus-4.5" */

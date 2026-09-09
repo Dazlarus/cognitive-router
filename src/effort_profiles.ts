@@ -143,7 +143,18 @@ export const SEED_CONFIG_CARDS: Record<string, ConfigCard> = {
   "zai/glm-5.3-flash": flashFast(),
   "zai/glm-5-turbo": flashFast(), // pool alias -> 5.3-flash
   "zai/glm-5.2": glm52Card,
-  "zai/glm-5.1": { ...budgetLadderCard },
+  // glm-5.1 OBSERVED LIVE (probe 2026-09-09, cogrouter-bench/tmp-probe-51.log):
+  // accepts thinking {disabled|enabled|budget_tokens} AND a native
+  // reasoning_effort low|medium|high ladder (reasoning channel scales 3->11->75
+  // chars on a tiny probe); disabled serves zero reasoning. Card raised from
+  // confidence "low" (docs guess) to "medium" (direct observation).
+  "zai/glm-5.1": {
+    cacheUsage: false,
+    fastMode: { supported: false },
+    effortProfile: { axis: "effort_ladder", levels: ["thinking-off", "low", "medium", "high"], defaultLevel: "medium" },
+    confidence: "medium",
+    source: "seed",
+  },
   "zai/glm-4.7": glm47Card,
   "zai/glm-4.6v": {
     cacheUsage: false, fastMode: { supported: false },
@@ -154,7 +165,7 @@ export const SEED_CONFIG_CARDS: Record<string, ConfigCard> = {
   "openrouter/z-ai/glm-5.3": { ...glm53Card, confidence: "medium" },
   "openrouter/z-ai/glm-5.3-flash": { ...flashFast(), confidence: "medium" },
   "openrouter/z-ai/glm-5-turbo": { ...flashFast(), confidence: "medium" },
-  "openrouter/z-ai/glm-5.1": { ...budgetLadderCard, confidence: "low" },
+  "openrouter/z-ai/glm-5.1": { ...budgetLadderCard, confidence: "low" }, // OR mirror unprobed; zai door card observed 2026-09-09
   "openrouter/z-ai/glm-4.7": { ...glm47Card, confidence: "low" },
 };
 
