@@ -233,7 +233,11 @@ function requestTimeoutOverrideMs(req?: http.IncomingMessage): number | null {
   const remote = req.socket.remoteAddress ?? "";
   const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
   if (!isLoopback) return null;
-  return Math.min(n, 600_000);
+  // 900s cap (Daz 2026-09-09 00:15): bench-pinned as-served generations for
+  // slow thinkers legitimately run 5-8 min; loopback-only callers may ask for
+  // up to 15 min. Normal (non-pinned) traffic is unaffected — this override
+  // only applies to requests that carry the header from localhost.
+  return Math.min(n, 900_000);
 }
 
 // ─── Buffered streaming types ───
