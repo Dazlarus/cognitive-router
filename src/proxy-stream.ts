@@ -573,8 +573,14 @@ export class ProxyServerStreaming {
             context_window: 8_000,
           },
         ];
+        // Phase 2 config cards: per-model effort/thinking profile map
+        // (provider/model -> card). Additive; alias entries unchanged.
+        const config_cards: Record<string, unknown> = {};
+        for (const m of this.modelRegistry.getAllModels()) {
+          if (m.configCard) config_cards[`${m.provider}/${m.model}`] = m.configCard;
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ object: "list", data: aliases }));
+        res.end(JSON.stringify({ object: "list", data: aliases, config_cards }));
         return;
       }
 
@@ -870,7 +876,42 @@ export class ProxyServerStreaming {
         return;
       }
 
-      // Admin restart — Layer 1 of the no-elevation restart bridge (2026-09-06).
+      // Admin registry - full model registry dump incl. Phase 2 config cards.
+      // Gated by ROUTER_ADMIN_TOKEN, same as /admin/restart.
+      if (url === "/admin/registry" && req.method === "GET") {
+        const token = process.env.ROUTER_ADMIN_TOKEN;
+        if (!token) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "admin registry disabled", message: "ROUTER_ADMIN_TOKEN not configured" }));
+          return;
+        }
+        const auth = req.headers["authorization"];
+        const provided =
+          (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
+          (req.headers["x-admin-token"] as string | undefined);
+        if (!provided || !timingSafeEqualStr(provided, token)) {
+          logger.warn("Admin registry denied: bad or missing token");
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "forbidden" }));
+          return;
+        }
+        const models = this.modelRegistry.getAllModels().map((m) => ({
+          provider: m.provider,
+          model: m.model,
+          contextWindow: m.contextWindow,
+          costPer1kInput: m.costPer1kInput,
+          costPer1kOutput: m.costPer1kOutput,
+          isLocal: m.isLocal,
+          source: m.source,
+          planEligible: m.planEligible,
+          configCard: m.configCard ?? null,
+        }));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ count: models.length, models }, null, 2));
+        return;
+      }
+
+      // Admin restart - Layer 1 of the no-elevation restart bridge (2026-09-06).
       // Gated by ROUTER_ADMIN_TOKEN (Bearer or x-admin-token header). Clean exit;
       // NSSM's default restart-on-exit respawns the process (~1.5s), loading any
       // freshly compiled dist/. In-flight streams are cut — restart during idle.

@@ -6,6 +6,7 @@ import type { DBService } from "./db_service.js";
 import type { CognitiveRouterConfig } from "./config.js";
 import { ChatBenchmark } from "./benchmark_chat.js";
 import { zaiBillingMode } from "./providers.js";
+import { SEED_CONFIG_CARDS, heuristicCardFor, mergeConfigCard, type ConfigCard } from "./effort_profiles.js";
 import {
   clampCapability,
   classifyAttribution,
@@ -58,6 +59,8 @@ export interface ModelCapability {
   source: "benchmark" | "observed" | "blended" | "auto-bench" | "inferred"; // how current the data is
   /** Whether this model is included in the provider's subscription plan (vs pay-per-credit) */
   planEligible?: boolean;
+  /** Effort/thinking config card (Phase 2). Seed cards win over discovery. */
+  configCard?: ConfigCard;
 }
 
 type Caps = ModelCapability["capabilities"];
@@ -331,8 +334,10 @@ export class ModelRegistry {
   ) {}
 
   async loadCachedState(): Promise<void> {
-    // Seed with known models
+    // Seed with known models (+ hand-maintained config cards; seed > discovery)
     for (const m of SEED_MODELS) {
+      const card = SEED_CONFIG_CARDS[`${m.provider}/${m.model}`];
+      if (card) m.configCard = card;
       this.models.set(`${m.provider}/${m.model}`, m);
     }
 
@@ -433,13 +438,15 @@ export class ModelRegistry {
                 continue;
               }
               logger.info(`Discovered unseeded Z.AI model: zai/${id} - using neutral defaults`);
-              this.models.set(`zai/${id}`, makeModel("zai", id, 128_000,
+              const discoveredZai = makeModel("zai", id, 128_000,
                 { coding: 0.65, reasoning: 0.65, creative: 0.60, math: 0.60, analysis: 0.65, conversation: 0.68, retrieval: 0.62, science: 0.62, business: 0.63, summary: 0.65 },
                 // Pricing follows billing truth: coding-plan endpoint = sunk cost
                 // (explicit 0); platform endpoint = per-token, unknown until priced
                 // (quarantined + logged via pricing_gaps).
                 zaiBillingMode() === "coding_plan" ? { input: 0, output: 0 } : {},
-              ));
+              );
+              this.applyDiscoveredConfigCard("zai", id, heuristicCardFor("zai", id));
+              this.models.set(`zai/${id}`, discoveredZai);
             }
           }
 
@@ -489,10 +496,14 @@ export class ModelRegistry {
   registerExternalModel(
     provider: string,
     model: string,
-    opts?: { local?: boolean; contextWindow?: number; costPer1kInput?: number; costPer1kOutput?: number },
+    opts?: { local?: boolean; contextWindow?: number; costPer1kInput?: number; costPer1kOutput?: number; configCard?: ConfigCard },
   ): boolean {
     const key = `${provider}/${model}`;
-    if (this.models.has(key)) return false;
+    if (this.models.has(key)) {
+      // Already known: discovery may only fill config-card gaps (seed wins).
+      if (opts?.configCard) this.applyDiscoveredConfigCard(provider, model, opts.configCard);
+      return false;
+    }
     const caps: Caps = {
       coding: 0.65, reasoning: 0.65, creative: 0.60,
       math: 0.60, analysis: 0.65, conversation: 0.75,
@@ -507,6 +518,21 @@ export class ModelRegistry {
     m.source = "inferred";
     this.models.set(key, m);
     logger.info(`Registered discovered model: ${key}`);
+    return true;
+  }
+
+  /** Discovery-side config-card write (Phase 2). Field-level merge: the
+   *  hand-maintained seed card always wins; discovery fills gaps only.
+   *  Returns true when the stored card changed. */
+  applyDiscoveredConfigCard(provider: string, model: string, card?: ConfigCard): boolean {
+    if (!card) return false;
+    const key = `${provider}/${model}`;
+    const existing = this.models.get(key);
+    if (!existing) return false;
+    const merged = mergeConfigCard(existing.configCard, card);
+    if (!merged || merged === existing.configCard) return false;
+    existing.configCard = merged;
+    logger.debug(`Config card updated for ${key} (source: ${merged.source ?? (merged === card ? "discovery" : "seed")})`);
     return true;
   }
 

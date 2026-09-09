@@ -20,6 +20,16 @@
 // separate, deliberate step (benchmark ladder) owned by its own triggers.
 
 import { logger } from "./logger.js";
+import { heuristicCardFor, type ConfigCard } from "./effort_profiles.js";
+
+/** Extended-provider discovery row (model identity + pricing + config card). */
+type DiscoveredModel = {
+  provider: string;
+  model: string;
+  costPer1kInput?: number;
+  costPer1kOutput?: number;
+  configCard?: ConfigCard;
+};
 import type { ModelRegistry } from "./model_registry.js";
 import type { DBService } from "./db_service.js";
 
@@ -171,6 +181,7 @@ export class ModelDiscovery {
               if (this.registry.registerExternalModel(f.provider, f.model, {
                 costPer1kInput: f.costPer1kInput ?? cat?.costPer1kInput,
                 costPer1kOutput: f.costPer1kOutput ?? cat?.costPer1kOutput,
+                configCard: f.configCard,
               })) {
                 summary.registered.push(`${f.provider}/${f.model}`);
               } else {
@@ -343,7 +354,7 @@ export class ModelDiscovery {
 
   // ---------- extended providers ----------
 
-  private async fetchOpenRouter(): Promise<Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }>> {
+  private async fetchOpenRouter(): Promise<DiscoveredModel[]> {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) return [];
     const resp = await fetch("https://openrouter.ai/api/v1/models", {
@@ -352,7 +363,7 @@ export class ModelDiscovery {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = (await resp.json()) as any;
-    const out: Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }> = [];
+    const out: DiscoveredModel[] = [];
     for (const m of data.data ?? []) {
       if (typeof m?.id !== "string" || !m.id) continue;
       // Chat-capable only: output must include text.
@@ -361,17 +372,24 @@ export class ModelDiscovery {
       // Pricing ships per-million tokens as strings; store per-1k.
       const inPerM = parseFloat(m?.pricing?.prompt);
       const outPerM = parseFloat(m?.pricing?.completion);
+      const cacheReadPerM = parseFloat(m?.pricing?.cache_read);
+      const params: string[] = Array.isArray(m?.supported_parameters) ? m.supported_parameters : [];
       out.push({
         provider: "openrouter",
         model: m.id,
         costPer1kInput: Number.isFinite(inPerM) ? inPerM / 1000 : undefined,
         costPer1kOutput: Number.isFinite(outPerM) ? outPerM / 1000 : undefined,
+        // Config card from live capability data (seed cards still win on merge).
+        configCard: heuristicCardFor("openrouter", m.id, {
+          cacheReadPrice: Number.isFinite(cacheReadPerM) ? cacheReadPerM : undefined,
+          supportsReasoningEffort: params.includes("reasoning") || params.includes("reasoning_effort"),
+        }),
       });
     }
     return out;
   }
 
-  private async fetchOpenAI(): Promise<Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }>> {
+  private async fetchOpenAI(): Promise<DiscoveredModel[]> {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return [];
     const base =
@@ -388,16 +406,16 @@ export class ModelDiscovery {
     // from the catalog lookup in run(), same as anthropic/gemini.
     const CHAT_FAMILY = /^(gpt-|o\d|chatgpt-|codex)/;
     const NON_CHAT = /embed|whisper|tts|audio|realtime|moderation|image|transcribe|search|video/i;
-    const out: Array<{ provider: string; model: string }> = [];
+    const out: DiscoveredModel[] = [];
     for (const m of data.data ?? []) {
       if (typeof m?.id !== "string" || !m.id) continue;
       if (!CHAT_FAMILY.test(m.id) || NON_CHAT.test(m.id)) continue;
-      out.push({ provider: "openai", model: m.id });
+      out.push({ provider: "openai", model: m.id, configCard: heuristicCardFor("openai", m.id, { supportsReasoningEffort: true }) });
     }
     return out;
   }
 
-  private async fetchAnthropic(): Promise<Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }>> {
+  private async fetchAnthropic(): Promise<DiscoveredModel[]> {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) return [];
     const resp = await fetch("https://api.anthropic.com/v1/models?limit=1000", {
@@ -409,16 +427,16 @@ export class ModelDiscovery {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = (await resp.json()) as any;
-    const out: Array<{ provider: string; model: string }> = [];
+    const out: DiscoveredModel[] = [];
     for (const m of data.data ?? []) {
       if (typeof m?.id === "string" && m.id) {
-        out.push({ provider: "anthropic", model: m.id });
+        out.push({ provider: "anthropic", model: m.id, configCard: heuristicCardFor("anthropic", m.id, { supportsReasoningEffort: true }) });
       }
     }
     return out;
   }
 
-  private async fetchGemini(): Promise<Array<{ provider: string; model: string; costPer1kInput?: number; costPer1kOutput?: number }>> {
+  private async fetchGemini(): Promise<DiscoveredModel[]> {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) return [];
     const base =
@@ -430,13 +448,14 @@ export class ModelDiscovery {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = (await resp.json()) as any;
-    const out: Array<{ provider: string; model: string }> = [];
+    const out: DiscoveredModel[] = [];
     for (const m of data.models ?? []) {
       const name: string | undefined = m?.name;
       if (!name) continue;
       const model = name.replace(/^models\//, "");
       if (GEMINI_EXCLUDE.test(model)) continue;
-      out.push({ provider: "gemini", model });
+      // Gemini thinking = thinkingBudget ladder (0|1024|8192|24576) -> normalized low/medium/high + off.
+      out.push({ provider: "gemini", model, configCard: heuristicCardFor("gemini", model, { supportsReasoningEffort: true }) });
     }
     return out;
   }

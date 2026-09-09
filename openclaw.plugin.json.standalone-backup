@@ -1,0 +1,11 @@
+{
+  "id": "cognitive-router",
+  "name": "cognitive-router",
+  "version": "0.1.0",
+  "description": "Intent-aware LLM proxy (standalone, not a plugin)",
+  "disabled": true,
+  "configSchema": {
+    "type": "object",
+    "properties": {}
+  }
+}
