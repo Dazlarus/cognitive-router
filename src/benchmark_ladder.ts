@@ -79,7 +79,7 @@ export const PINNED_DECODE = {
  *  response (reasoning + answer) captured and judged by the bench sidecar
  *  (cogrouter-bench ladder.ts is the twin; keep both tags in lockstep —
  *  CONTRACT.md §3 records the re-integration diff). */
-export const PROMPT_GENERATION = "gen-2026-09-02";
+export const PROMPT_GENERATION = "gen-2026-09-08";
 
 export type BenchIntent = "coding" | "reasoning" | "conversation";
 
