@@ -443,3 +443,29 @@ export function rebuildLadder(
     strength: e.strength,
   }));
 }
+
+/** Hot-load (P1, 2026-09-09): apply synced verdict rows to the ladder
+ *  projection in-process, no restart. Only rows tagged with the CURRENT
+ *  PROMPT_GENERATION participate; intents seen solely under other tags are
+ *  skipped (their reconciliation stays with the restart/curator backstop).
+ *  Reuses rebuildLadder + replaceLadder — the exact startup code path, so
+ *  hot-apply and cold rebuild can never diverge. */
+export function applySyncedVerdictsToLadder(
+  db: DBService,
+  rows: Array<{ intent: string; prompt_generation: string }>,
+): { applied: string[]; skipped: string[] } {
+  const currentGen = new Set<string>();
+  const otherGen = new Set<string>();
+  for (const r of rows) {
+    if (r.prompt_generation === PROMPT_GENERATION) currentGen.add(r.intent);
+    else otherGen.add(r.intent);
+  }
+  const applied: string[] = [];
+  for (const intent of currentGen) {
+    const rebuilt = rebuildLadder(db, intent as BenchIntent, PROMPT_GENERATION);
+    if (rebuilt.length > 0) db.replaceLadder(intent, PROMPT_GENERATION, rebuilt);
+    applied.push(intent);
+  }
+  const skipped = [...otherGen].filter((i) => !currentGen.has(i));
+  return { applied, skipped };
+}

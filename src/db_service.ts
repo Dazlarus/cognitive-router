@@ -1595,6 +1595,27 @@ export class DBService {
     `).run(intent, promptGeneration, modelA, modelB, modelB, modelA);
   }
 
+  /** Full ladder entries for an intent + generation, rank order.
+   *  Read side of the projection (admin GET /admin/bench/ladder). */
+  getLadder(intent: string, promptGeneration: string): Array<{
+    modelKey: string; rank: number; strength: number; updatedAt: string;
+  }> {
+    return this.db.prepare(`
+      SELECT model_key AS modelKey, rank, strength, updated_at AS updatedAt
+      FROM benchmark_ladder
+      WHERE intent = ? AND prompt_generation = ?
+      ORDER BY rank ASC
+    `).all(intent, promptGeneration) as any[];
+  }
+
+  /** Distinct intents present in the ladder projection for a generation. */
+  getLadderIntents(promptGeneration: string): string[] {
+    const rows = this.db.prepare(`
+      SELECT DISTINCT intent FROM benchmark_ladder WHERE prompt_generation = ?
+    `).all(promptGeneration) as any[];
+    return rows.map((r) => r.intent as string);
+  }
+
   /** Distinct model keys known to the ladder for an intent + generation. */
   getLadderKeys(intent: string, promptGeneration: string): string[] {
     const rows = this.db.prepare(`
@@ -1667,6 +1688,7 @@ export class DBService {
 
   /** Highest generated_at seen by the sync endpoint (high-water mark). */
   getBenchSyncWatermark(): string | null {
+    this.ensureSyncStateTable();
     const r = this.db.prepare(`
       SELECT value FROM sync_state WHERE key = 'bench_sync_high_water'
     `).get() as { value: string } | undefined;
@@ -1674,10 +1696,23 @@ export class DBService {
   }
 
   setBenchSyncWatermark(value: string): void {
+    this.ensureSyncStateTable();
     this.db.prepare(`
       INSERT INTO sync_state (key, value) VALUES ('bench_sync_high_water', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(value);
+  }
+
+  /** sync_state was added to the schema init AFTER existing installs created
+ *  their DBs (live 2026-09-07: 'no such table: sync_state' on first sync).
+ *  Idempotent create so pre-existing DBs self-heal. */
+  private ensureSyncStateTable(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sync_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    `);
   }
 
   /** Record a remote model with unknown pricing (the actionable gap list).

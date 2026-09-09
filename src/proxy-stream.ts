@@ -36,7 +36,7 @@ import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
 import { BudgetTracker } from "./budget_tracker.js";
 import { ModelCurator } from "./curator.js";
 import { ModelDiscovery } from "./discovery.js";
-import { PROMPT_GENERATION, rebuildLadder } from "./benchmark_ladder.js";
+import { PROMPT_GENERATION, rebuildLadder, applySyncedVerdictsToLadder } from "./benchmark_ladder.js";
 import { withUpstreamTimeoutOverride } from "./upstream_timeout_scope.js";
 import { JudgeEvaluator } from "./judge.js";
 import { decideOutboundEffort, effortPolicyMode } from "./effort_policy.js";
@@ -720,7 +720,41 @@ export class ProxyServerStreaming {
         return;
       }
 
-      // Admin bench sync — the bench sidecar's ONLY write path into router
+      // Admin bench ladder read (P1 hot-load verification): the live ladder
+      // projection for the current generation, all intents. Gated by
+      // ROUTER_ADMIN_TOKEN (Bearer or x-admin-token), same as /admin/restart.
+      if (url === "/admin/bench/ladder" && req.method === "GET") {
+        const token = process.env.ROUTER_ADMIN_TOKEN;
+        if (!token) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "admin_disabled", message: "ROUTER_ADMIN_TOKEN not configured" } }));
+          return;
+        }
+        const auth = req.headers["authorization"];
+        const provided =
+          (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
+          (req.headers["x-admin-token"] as string | undefined);
+        if (!provided || !timingSafeEqualStr(provided, token)) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "forbidden", message: "invalid credentials" } }));
+          return;
+        }
+        try {
+          const ladders: Record<string, unknown> = {};
+          for (const intent of this.db.getLadderIntents(PROMPT_GENERATION)) {
+            ladders[intent] = this.db.getLadder(intent, PROMPT_GENERATION);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ generation: PROMPT_GENERATION, ladders }));
+        } catch (err) {
+          logger.error(`Ladder read failed: ${err instanceof Error ? err.message : String(err)}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "internal", message: "ladder read failed" } }));
+        }
+        return;
+      }
+
+      // Admin bench sync - the bench sidecar's ONLY write path into router
       // state (CONTRACT.md §4). BENCH_SYNC_TOKEN gate (separate secret from
       // ROUTER_ADMIN_TOKEN; >=32 bytes, timing-safe compare). Whole-payload
       // validation, single-transaction upsert, per-row generated_at >=
@@ -804,9 +838,29 @@ export class ProxyServerStreaming {
             // advance watermark to max generated_at in payload
             const maxGen = verdicts.reduce((m: string, v: any) => (v.generated_at > m ? v.generated_at : m), watermark ?? "");
             if (maxGen) this.db.setBenchSyncWatermark(maxGen);
-            logger.info(`Bench sync ok: ${result.applied} rows applied, watermark -> ${maxGen}`);
+            // HOT-LOAD (P1, 2026-09-09): apply the synced rows to the in-memory
+            // ladder projection immediately — no restart needed. Same code path
+            // as the startup rebuild (applySyncedVerdictsToLadder reuses
+            // rebuildLadder/replaceLadder); other-generation tags fall back to
+            // the restart/curator reconciliation backstop. Failure here must
+            // NOT fail the sync: verdict rows are already durable; the
+            // projection reconciles on next restart.
+            let ladder: unknown = { deferred: "hot-apply failed; restart backstop applies" };
+            try {
+              ladder = applySyncedVerdictsToLadder(this.db, verdicts);
+              logger.info(
+                `Bench sync ok: ${result.applied} rows applied, watermark -> ${maxGen}, ` +
+                `ladder hot-applied intents=[${(ladder as any).applied.join(", ")}] ` +
+                `deferred=[${(ladder as any).skipped.join(", ")}]`,
+              );
+            } catch (ladderErr) {
+              logger.warn(
+                `Ladder hot-apply failed (restart backstop will reconcile): ` +
+                `${ladderErr instanceof Error ? ladderErr.message : String(ladderErr)}`,
+              );
+            }
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "ok", applied: result.applied }));
+            res.end(JSON.stringify({ status: "ok", applied: result.applied, ladder }));
           } catch (err) {
             logger.error(`Bench sync failed: ${err instanceof Error ? err.message : String(err)}`);
             res.writeHead(500, { "Content-Type": "application/json" });
