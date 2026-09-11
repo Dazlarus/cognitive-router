@@ -74,6 +74,7 @@ export function buildStatsPayload(
     },
     available: costTracker.isAvailable(s.name),
     isThrottled: costTracker.isThrottled(s.name),
+    latencyDegraded: costTracker.isLatencyDegraded(s.name),
     budgetExceeded: costTracker.isBudgetExceeded(s.name),
     // Quota tracking for subscription providers (e.g., Z.AI)
     quotaPercent: s.budget.budgetType === "subscription" ? costTracker.getQuotaPercent(s.name) : null,
@@ -227,6 +228,7 @@ export function buildStatsPayload(
       },
       notes: [
         "intentScores use confidence=1.0; runtime requests multiply capability by classifier confidence",
+        "providers with latencyDegraded=true are skipped proactively while healthy alternatives exist (ROUTER_SKIP_LATENCY_MS, default 30000ms)",
         "local models receive the same cost penalty used by the router before scoring",
         "tool-capable Ollama models come from ROUTER_OLLAMA_TOOL_MODELS",
         "embedding-only models are listed for inventory and embeddings routing but are not eligible for chat/generation routing",

@@ -54,6 +54,9 @@ export interface ProviderState {
   /** Type of the current consecutive failure streak. */
   consecutiveFailureType: FailureType | null;
   recentLatencies: number[]; // rolling window
+  /** Sample timestamps mirroring recentLatencies — powers the proactive
+   *  latency-skip's freshness check (stale samples stop counting as health). */
+  recentLatencyTimes: number[];
   recentCalls: number; // calls in current window
   monthlySpendUsd: number;
   dailySpendUsd: number;
@@ -124,6 +127,24 @@ const BACKOFF_MS = [
 
 const LATENCY_WINDOW_SIZE = 20;
 
+// ─── Proactive latency-skip (throttle avoidance) constants ───
+
+/** Default threshold for the proactive latency skip: a provider whose fresh
+ *  latency samples average above this is dropped from ranking BEFORE its next
+ *  request eats the latency or fails. Deliberately generous — healthy
+ *  providers never come close, so the default never fires on a healthy fleet.
+ *  Env: ROUTER_SKIP_LATENCY_MS (values <= 0 disable the skip entirely). */
+const LATENCY_SKIP_DEFAULT_MS = 30_000;
+
+/** Fresh samples required before the latency skip may fire (outlier guard:
+ *  one slow request must never exclude a provider). */
+const LATENCY_SKIP_MIN_SAMPLES = 3;
+
+/** Latency samples older than this stop counting as "current health" — so a
+ *  skipped provider is automatically re-probed once its window goes stale,
+ *  and recovers the moment fresh samples are fast again. */
+const LATENCY_SKIP_SAMPLE_TTL_DEFAULT_MS = 120_000;
+
 // ─── Negative signal amplification constants ───
 
 /** Number of consecutive same-type failures before aggressive deprioritization kicks in. */
@@ -173,6 +194,11 @@ export class CostTracker {
   private zombieStallCounts = new Map<string, number>();
   private dailyBudgetUsd: number;
   private monthlyBudgetUsd: number;
+  /** Proactive latency-skip: skip providers whose fresh latency samples are
+   *  sustainably degraded, BEFORE their next request fails (Daz, 2026-09-10). */
+  private latencySkipMs: number;
+  private latencySkipMinSamples: number;
+  private latencySkipSampleTtlMs: number;
   private budgetWarnedProviders = new Set<string>();
   /** Per-provider latency data keyed by size bucket: provider → bucket → entry. */
   private sizeLatency = new Map<string, Partial<Record<SizeBucket, BucketLatencyEntry>>>();
@@ -192,6 +218,15 @@ export class CostTracker {
   ) {
     this.dailyBudgetUsd = parseFloat(process.env.ROUTER_DAILY_BUDGET_USD ?? "") || DEFAULT_DAILY_BUDGET_USD;
     this.monthlyBudgetUsd = parseFloat(process.env.ROUTER_MONTHLY_BUDGET_USD ?? "") || DEFAULT_MONTHLY_BUDGET_USD;
+    // Proactive latency-skip config (env-driven like the budget knobs above).
+    const skipMs = parseFloat(process.env.ROUTER_SKIP_LATENCY_MS ?? "");
+    this.latencySkipMs = Number.isFinite(skipMs) ? skipMs : LATENCY_SKIP_DEFAULT_MS;
+    const skipMinSamples = parseInt(process.env.ROUTER_SKIP_LATENCY_MIN_SAMPLES ?? "", 10);
+    this.latencySkipMinSamples =
+      Number.isFinite(skipMinSamples) && skipMinSamples >= 1 ? skipMinSamples : LATENCY_SKIP_MIN_SAMPLES;
+    const skipTtl = parseFloat(process.env.ROUTER_SKIP_SAMPLE_TTL_MS ?? "");
+    this.latencySkipSampleTtlMs =
+      Number.isFinite(skipTtl) && skipTtl > 0 ? skipTtl : LATENCY_SKIP_SAMPLE_TTL_DEFAULT_MS;
   }
 
   /** Get current quota multiplier for Z.AI based on time of day */
@@ -249,6 +284,7 @@ export class CostTracker {
         consecutiveFailures: restoredFailures,
         consecutiveFailureType: null,
         recentLatencies: [],
+        recentLatencyTimes: [],
         recentCalls: 0,
         monthlySpendUsd: monthlySpend,
         dailySpendUsd: dailySpend,
@@ -307,6 +343,7 @@ export class CostTracker {
         consecutiveFailures: 0,
         consecutiveFailureType: null,
         recentLatencies: [],
+        recentLatencyTimes: [],
         recentCalls: 0,
         monthlySpendUsd: 0,
         dailySpendUsd: 0,
@@ -697,10 +734,12 @@ export class CostTracker {
     const providerState = this.states.get(providerName);
     if (!providerState) return;
 
-    // Update latency window
+    // Update latency window (timestamps power the proactive latency-skip)
     providerState.recentLatencies.push(result.durationMs);
+    providerState.recentLatencyTimes.push(Date.now());
     if (providerState.recentLatencies.length > LATENCY_WINDOW_SIZE) {
       providerState.recentLatencies.shift();
+      providerState.recentLatencyTimes.shift();
     }
     providerState.recentCalls++;
 
@@ -725,8 +764,10 @@ export class CostTracker {
 
     if (state !== providerState) {
       state.recentLatencies.push(result.durationMs);
+      state.recentLatencyTimes.push(Date.now());
       if (state.recentLatencies.length > LATENCY_WINDOW_SIZE) {
         state.recentLatencies.shift();
+        state.recentLatencyTimes.shift();
       }
       state.recentCalls++;
     }
@@ -952,6 +993,37 @@ export class CostTracker {
     // Expired — clean up
     delete state.patternFlags.throttled;
     return false;
+  }
+
+  /** Effective latency-skip threshold in ms (<= 0 means the skip is disabled). */
+  getLatencySkipMs(): number {
+    return this.latencySkipMs;
+  }
+
+  /** Proactive throttle avoidance: true when the provider's FRESH latency
+   *  samples (recorded within the sample TTL) are numerous enough to be a
+   *  pattern (>= ROUTER_SKIP_LATENCY_MIN_SAMPLES) and average above
+   *  ROUTER_SKIP_LATENCY_MS.
+   *
+   *  Unlike the pattern flags this is computed live from the rolling window —
+   *  no sticky state — so recovery is automatic: fresh fast samples pull the
+   *  average back under the threshold, and a fully stale window (provider was
+   *  skipped, so no new samples arrived) counts as "no current evidence" and
+   *  makes the provider eligible again for a re-probe. */
+  isLatencyDegraded(providerName: string): boolean {
+    if (this.latencySkipMs <= 0) return false; // skip disabled
+    const state = this.states.get(providerName);
+    if (!state) return false;
+    const cutoff = Date.now() - this.latencySkipSampleTtlMs;
+    const fresh: number[] = [];
+    for (let i = 0; i < state.recentLatencies.length; i++) {
+      if ((state.recentLatencyTimes[i] ?? 0) >= cutoff) {
+        fresh.push(state.recentLatencies[i]);
+      }
+    }
+    if (fresh.length < this.latencySkipMinSamples) return false; // not enough evidence
+    const avg = fresh.reduce((a, b) => a + b, 0) / fresh.length;
+    return avg > this.latencySkipMs;
   }
 
   /** Check if a model is flagged as unstable. */

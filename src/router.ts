@@ -404,6 +404,34 @@ export class RoutingEngine {
       return true;
     });
 
+    // ─── Proactive latency-degradation skip (throttle avoidance) ───
+    // The pattern-flag skips above fire only AFTER hard failures. This skip
+    // acts on the health signal DURING degradation: a provider whose fresh
+    // latency samples average above ROUTER_SKIP_LATENCY_MS is dropped from
+    // ranking BEFORE its next request eats the latency or times out
+    // (Daz-approved, 2026-09-10). Soft by design: if every remaining candidate
+    // is degraded, keep them all — never empty the pool (same philosophy as
+    // "throttled != dead"), and recovery is automatic (live window check).
+    if (candidates.length > 0) {
+      const candidateProviders = new Set(candidates.map((m) => m.provider));
+      const degraded = new Set(
+        [...candidateProviders].filter((p) => this.costTracker.isLatencyDegraded(p)),
+      );
+      if (degraded.size > 0) {
+        if (degraded.size < candidateProviders.size) {
+          candidates = candidates.filter((m) => !degraded.has(m.provider));
+          logger.info(
+            `Latency skip: excluding [${[...degraded].join(", ")}] — sustained avg latency > ` +
+              `${this.costTracker.getLatencySkipMs()}ms (proactive, pre-failure).`,
+          );
+        } else {
+          logger.info(
+            `Latency skip: [${[...degraded].join(", ")}] degraded but no healthy alternative — keeping them ranked.`,
+          );
+        }
+      }
+    }
+
     if (candidates.length === 0) {
       // No models available at all — return a safe default
       logger.warn("No models available — defaulting to ollama/gemma4.");
