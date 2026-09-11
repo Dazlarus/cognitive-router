@@ -1,0 +1,19 @@
+{
+  "id": "coding-exec-010",
+  "generation": "gen-2026-09-08b",
+  "subIntent": "quick",
+  "prompt": "Write a Python function hardware_check(cpu_temp, gpu_mem_used, gpu_mem_total) returning a tuple (bool, str). It should return (True, 'ok') if AND ONLY if ALL of the following conditions are met: (1) cpu_temp < 85, (2) gpu_mem_used < gpu_mem_total * 0.9, (3) gpu_mem_total > 0. Return (False, reason) otherwise, where reason is a human-readable string identifying the first failing condition. The check must be strict: if memory_used is zero and memory_total is zero, that's not 'ok' (can't determine utilization). If memory_used equals memory_total exactly, that's full utilization and not ok.",
+  "language": "python",
+  "entry": "hardware_check",
+  "harness": {
+    "setup": "from solution import hardware_check",
+    "cases": [
+      { "call": "hardware_check(70, 4000, 12288)", "expect": "(True, 'ok')" },
+      { "call": "hardware_check(90, 4000, 12288)", "expect": "(False, 'cpu too hot')" },
+      { "call": "hardware_check(70, 11000, 12288)", "expect": "(False, 'gpu memory too high')" },
+      { "call": "hardware_check(70, 0, 0)", "expect": "(False, 'gpu memory unavailable')" },
+      { "call": "hardware_check(70, 12288, 12288)", "expect": "(False, 'gpu memory full')" }
+    ],
+    "casesHidden": 2
+  }
+}

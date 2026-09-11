@@ -1,0 +1,19 @@
+{
+  "id": "coding-exec-003",
+  "generation": "gen-2026-09-08b",
+  "subIntent": "quick",
+  "prompt": "Write a Python function run_length_encode(s: str) -> str that performs run-length encoding: consecutive identical characters are replaced by the character followed by the count. Single characters keep count '1'. Example: 'aaabcc' -> 'a3b1c2'. Output must be a string.",
+  "language": "python",
+  "entry": "run_length_encode",
+  "harness": {
+    "setup": "from solution import run_length_encode",
+    "cases": [
+      { "call": "run_length_encode('aaabcc')", "expect": "'a3b1c2'" },
+      { "call": "run_length_encode('')", "expect": "''" },
+      { "call": "run_length_encode('a')", "expect": "'a1'" },
+      { "call": "run_length_encode('aaa')", "expect": "'a3'" },
+      { "call": "run_length_encode('abc')", "expect": "'a1b1c1'" }
+    ],
+    "casesHidden": 2
+  }
+}

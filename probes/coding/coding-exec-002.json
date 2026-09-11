@@ -1,0 +1,18 @@
+{
+  "id": "coding-exec-002",
+  "generation": "gen-2026-09-08b",
+  "subIntent": "quick",
+  "prompt": "Write a Python function longest_palindromic_substring(s: str) -> str that returns the longest substring that is a palindrome. If multiple have the same length, return the one that appears first.",
+  "language": "python",
+  "entry": "longest_palindromic_substring",
+  "harness": {
+    "setup": "from solution import longest_palindromic_substring",
+    "cases": [
+      { "call": "longest_palindromic_substring('babad')", "expect": "'bab'" },
+      { "call": "longest_palindromic_substring('cbbd')", "expect": "'bb'" },
+      { "call": "longest_palindromic_substring('a')", "expect": "'a'" },
+      { "call": "longest_palindromic_substring('')", "expect": "''" }
+    ],
+    "casesHidden": 3
+  }
+}

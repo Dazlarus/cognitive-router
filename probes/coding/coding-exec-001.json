@@ -1,0 +1,19 @@
+{
+  "id": "coding-exec-001",
+  "generation": "gen-2026-09-08b",
+  "subIntent": "quick",
+  "prompt": "Write a Python function is_balanced(s: str) -> bool that checks if brackets are properly matched and nested. Acceptable pairs: (), [], {}. Return True if balanced, else False.",
+  "language": "python",
+  "entry": "is_balanced",
+  "harness": {
+    "setup": "from solution import is_balanced",
+    "cases": [
+      { "call": "is_balanced('()[]{}')", "expect": "True" },
+      { "call": "is_balanced('([)]')", "expect": "False" },
+      { "call": "is_balanced('')", "expect": "True" },
+      { "call": "is_balanced('((([[[{{{}}}]]])))')", "expect": "True" },
+      { "call": "is_balanced('(')", "expect": "False" }
+    ],
+    "casesHidden": 3
+  }
+}

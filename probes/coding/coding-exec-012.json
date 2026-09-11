@@ -1,0 +1,19 @@
+{
+  "id": "coding-exec-012",
+  "generation": "gen-2026-09-08b",
+  "subIntent": "quick",
+  "prompt": "Write a Python class OrphanGuard that monitors child processes. Constructor takes a list of (child_pid, parent_pid) tuples. Method check_orphans() returns a sorted list of child_pids whose parent is no longer alive (i.e., parent_pid not found as any entry's child_pid in the monitored set). Also provide reap_orphans() that prints 'REAP <pid>' for each orphaned child. Helper: treat parent_pid -1 as 'root' (always alive). Use only the tuple data as ground truth (no actual OS process calls, no external libraries).",
+  "language": "python",
+  "entry": "OrphanGuard",
+  "harness": {
+    "setup": "from solution import OrphanGuard\n\ndef test_no_orphans():\n    g = OrphanGuard([(101, 100), (102, 100), (100, -1)])\n    return str(sorted(g.check_orphans()))\n\ndef test_one_orphan():\n    g = OrphanGuard([(201, 200), (202, 201), (200, -1)])\n    return str(sorted(g.check_orphans()))\n\ndef test_orphan_without_parent_in_table():\n    g = OrphanGuard([(301, 300), (302, 999)])\n    return str(sorted(g.check_orphans()))\n\ndef test_no_entries():\n    g = OrphanGuard([])\n    return str(sorted(g.check_orphans()))\n\ndef test_orphan_chain():\n    g = OrphanGuard([(401, 400), (400, -1)])\n    return str(sorted(g.check_orphans()))",
+    "cases": [
+      { "call": "test_no_orphans()", "expect": "[]" },
+      { "call": "test_one_orphan()", "expect": "['202']" },
+      { "call": "test_orphan_without_parent_in_table()", "expect": "['302']" },
+      { "call": "test_no_entries()", "expect": "[]" },
+      { "call": "test_orphan_chain()", "expect": "[]" }
+    ],
+    "casesHidden": 2
+  }
+}

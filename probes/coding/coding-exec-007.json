@@ -1,0 +1,16 @@
+{
+  "id": "coding-exec-007",
+  "generation": "gen-2026-09-08b",
+  "subIntent": "quick",
+  "prompt": "Write a SQL query that returns the names of employees who earn more than their manager. The database has two tables: employees(id, name, salary, manager_id). manager_id is nullable and references employees(id). Output should be a single column 'name'.",
+  "language": "python",
+  "entry": "rich_employees",
+  "harness": {
+    "setup": "import sqlite3, json\nconn = sqlite3.connect(':memory:')\nc = conn.cursor()\nc.execute('CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, salary REAL, manager_id INTEGER)')\nc.execute('INSERT INTO employees VALUES (1, \"Alice\", 80000, NULL)')\nc.execute('INSERT INTO employees VALUES (2, \"Bob\", 75000, 1)')\nc.execute('INSERT INTO employees VALUES (3, \"Carol\", 90000, 1)')\nc.execute('INSERT INTO employees VALUES (4, \"Dave\", 60000, 2)')\nc.execute('INSERT INTO employees VALUES (5, \"Eve\", 95000, 2)')\nc.execute('INSERT INTO employees VALUES (6, \"Frank\", 50000, 3)')\nconn.commit()\n# Run the model's query against this in-memory db:\ndef run_query(sql):\n    try:\n        cur = conn.execute(sql)\n        rows = cur.fetchall()\n        names = sorted([r[0] for r in rows])\n        return str(names)\n    except Exception as e:\n        return f'ERROR: {e}'",
+    "cases": [
+      { "call": "run_query(solution)", "expect": "['Carol', 'Eve']" }
+    ],
+    "casesHidden": 1,
+    "check": ""
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "coding-exec-011",
+  "generation": "gen-2026-09-08b",
+  "subIntent": "quick",
+  "prompt": "Write a Python class ServiceMonitor that monitors a JSON state file. The constructor takes a file path. It has two methods: read_state() which returns the parsed dict, and transition(new_state) which updates the 'status' key in the state dict to new_state and writes it back. Bug: the read_state method currently checks for an attribute 'active' on the dict (using hasattr-style logic), but the state file uses the key 'status' with values 'active'/'inactive'. Your fix: make transition() work correctly regardless of this attribute confusion. Specifically, transition('inactive') must set status='inactive' in the file even if the previous code path tried to check a nonexistent 'active' attribute.",
+  "language": "python",
+  "entry": "ServiceMonitor",
+  "harness": {
+    "setup": "from solution import ServiceMonitor\nimport tempfile, os, json\n\ndef run_test():\n    with tempfile.TemporaryDirectory() as tmpdir:\n        fpath = os.path.join(tmpdir, 'state.json')\n        with open(fpath, 'w') as f:\n            json.dump({'status': 'active', 'lastCheck': '2026-08-14T12:00:00Z'}, f)\n        sm = ServiceMonitor(fpath)\n        sm.transition('inactive')\n        with open(fpath) as f:\n            data = json.load(f)\n        return data.get('status')",
+    "cases": [
+      { "call": "run_test()", "expect": "'inactive'" }
+    ],
+    "casesHidden": 2
+  }
+}

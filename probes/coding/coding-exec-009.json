@@ -1,0 +1,17 @@
+{
+  "id": "coding-exec-009",
+  "generation": "gen-2026-09-08b",
+  "subIntent": "quick",
+  "prompt": "Write a Python class TaskProcessor that processes tasks from a queue without leaking threads. The class must accept a list of task names in its constructor, and provide a method process_all() that processes each task. The implementation must: (1) create exactly ONE background processing thread at startup that processes all tasks sequentially via a thread-safe queue, (2) never spawn a new thread per task, (3) shut down cleanly when no more tasks remain. Use threading.Thread and queue.Queue. Include proper cleanup in a close() method that signals shutdown and joins the thread.",
+  "language": "python",
+  "entry": "TaskProcessor",
+  "harness": {
+    "setup": "from solution import TaskProcessor\n\ndef run_test(task_count):\n    results = []\n    processor = TaskProcessor(tasks=[f'task_{i}' for i in range(task_count)])\n    processor.process_all()\n    processor.close()\n    return 'ok'",
+    "cases": [
+      { "call": "run_test(3)", "expect": "'ok'" },
+      { "call": "run_test(0)", "expect": "'ok'" },
+      { "call": "run_test(10)", "expect": "'ok'" }
+    ],
+    "casesHidden": 2
+  }
+}
