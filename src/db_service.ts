@@ -1070,6 +1070,111 @@ export class DBService {
     return result;
   }
 
+  // ─── Exec Benchmark Methods ───
+
+  /** Save an exec-benchmark result row (one probe × one model identity). */
+  saveExecBenchmarkResult(data: {
+    modelKey: string;
+    provider: string;
+    probeId: string;
+    generation: string;
+    passRate: number;
+    casesPassed: number;
+    casesTotal: number;
+    failReason: string | null;
+    durationMs: number;
+    modelVersionHash: string;
+    backend: string | null;
+    /** Injectable for tests; defaults to wall clock. */
+    timestamp?: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO exec_benchmark_results
+        (model_key, provider, probe_id, generation, pass_rate, cases_passed,
+         cases_total, fail_reason, duration_ms, model_version_hash, backend, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      data.modelKey,
+      data.provider,
+      data.probeId,
+      data.generation,
+      data.passRate,
+      data.casesPassed,
+      data.casesTotal,
+      data.failReason,
+      data.durationMs,
+      data.modelVersionHash,
+      data.backend,
+      data.timestamp ?? new Date().toISOString(),
+    );
+  }
+
+  /** Most recent exec result for identity × probe × generation (cache check). */
+  getLatestExecBenchmarkResult(
+    modelKey: string,
+    probeId: string,
+    generation: string,
+  ): {
+    passRate: number;
+    casesPassed: number;
+    casesTotal: number;
+    failReason: string | null;
+    durationMs: number;
+    modelVersionHash: string;
+    backend: string | null;
+    timestamp: string;
+  } | null {
+    const row = this.db.prepare(`
+      SELECT pass_rate AS passRate, cases_passed AS casesPassed,
+             cases_total AS casesTotal, fail_reason AS failReason,
+             duration_ms AS durationMs, model_version_hash AS modelVersionHash,
+             backend, timestamp
+      FROM exec_benchmark_results
+      WHERE model_key = ? AND probe_id = ? AND generation = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(modelKey, probeId, generation) as any;
+    return row ?? null;
+  }
+
+  /** All exec results for an identity (optionally generation-filtered),
+   *  newest first per probe — used for mean + Wilson interval. */
+  getExecResultsForIdentity(
+    modelKey: string,
+    generation?: string,
+  ): Array<{
+    probeId: string;
+    generation: string;
+    passRate: number;
+    casesPassed: number;
+    casesTotal: number;
+    failReason: string | null;
+    durationMs: number;
+    modelVersionHash: string;
+    backend: string | null;
+    timestamp: string;
+  }> {
+    const rows = generation
+      ? this.db.prepare(`
+          SELECT probe_id AS probeId, generation, pass_rate AS passRate,
+                 cases_passed AS casesPassed, cases_total AS casesTotal,
+                 fail_reason AS failReason, duration_ms AS durationMs,
+                 model_version_hash AS modelVersionHash, backend, timestamp
+          FROM exec_benchmark_results
+          WHERE model_key = ? AND generation = ?
+          ORDER BY id DESC
+        `).all(modelKey, generation)
+      : this.db.prepare(`
+          SELECT probe_id AS probeId, generation, pass_rate AS passRate,
+                 cases_passed AS casesPassed, cases_total AS casesTotal,
+                 fail_reason AS failReason, duration_ms AS durationMs,
+                 model_version_hash AS modelVersionHash, backend, timestamp
+          FROM exec_benchmark_results
+          WHERE model_key = ?
+          ORDER BY id DESC
+        `).all(modelKey);
+    return rows as Array<any>;
+  }
+
   /** Get the intent distribution from recent routing decisions.
    *  Returns a map of intent -> proportion (0-1). */
   getTrafficDistribution(days: number = 7): Map<string, number> {
@@ -1910,6 +2015,22 @@ CREATE TABLE IF NOT EXISTS chat_benchmark_results (
   timestamp       TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS exec_benchmark_results (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_key          TEXT NOT NULL,
+  provider           TEXT NOT NULL,
+  probe_id           TEXT NOT NULL,
+  generation         TEXT NOT NULL,
+  pass_rate          REAL NOT NULL,
+  cases_passed       INTEGER NOT NULL,
+  cases_total        INTEGER NOT NULL,
+  fail_reason        TEXT,
+  duration_ms        INTEGER NOT NULL,
+  model_version_hash TEXT NOT NULL,
+  backend            TEXT,
+  timestamp          TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS benchmark_verdicts (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   timestamp         TEXT NOT NULL,
@@ -1953,6 +2074,8 @@ CREATE TABLE IF NOT EXISTS catalog_pricing (
 
 const INDEX_SCHEMA_SQL = `
 CREATE INDEX IF NOT EXISTS idx_decisions_session ON routing_decisions(session_key);
+CREATE INDEX IF NOT EXISTS idx_exec_results_key ON exec_benchmark_results(model_key, generation);
+CREATE INDEX IF NOT EXISTS idx_exec_results_probe ON exec_benchmark_results(probe_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_intent ON routing_decisions(intent);
 CREATE INDEX IF NOT EXISTS idx_decisions_provider ON routing_decisions(chosen_provider);
 CREATE INDEX IF NOT EXISTS idx_decisions_timestamp ON routing_decisions(timestamp);
