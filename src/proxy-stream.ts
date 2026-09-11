@@ -38,6 +38,7 @@ import { ModelCurator } from "./curator.js";
 import { ModelDiscovery } from "./discovery.js";
 import { PROMPT_GENERATION, applySyncedVerdictsToLadder } from "./benchmark_ladder.js";
 import { LadderProjectionService } from "./ladder_refresh.js";
+import { JudgeCalibrationService } from "./judge_calibration.js";
 import { withUpstreamTimeoutOverride } from "./upstream_timeout_scope.js";
 import { JudgeEvaluator } from "./judge.js";
 import { decideOutboundEffort, effortPolicyMode } from "./effort_policy.js";
@@ -358,6 +359,7 @@ export class ProxyServerStreaming {
   private curator: ModelCurator;
   private discovery: ModelDiscovery;
   private ladderRefresh: LadderProjectionService;
+  private judgeCalibration: JudgeCalibrationService;
   private initialized = false;
 
   constructor(config: CognitiveRouterConfig) {
@@ -384,6 +386,9 @@ export class ProxyServerStreaming {
     this.curator = new ModelCurator(this.db, this.modelRegistry, config);
     this.discovery = new ModelDiscovery(this.modelRegistry, this.db);
     this.ladderRefresh = new LadderProjectionService(this.db);
+    // p3e-005: periodic judge↔exec agreement report (reads judge_calibration;
+    // pairs are logged by ExecBenchmark's judge hook — no model calls here).
+    this.judgeCalibration = new JudgeCalibrationService(this.db);
     // Bench subsystem EXTRACTED (2026-09-07): the cogrouter-bench sidecar now
     // owns passes/judging; verdicts arrive via POST /admin/bench/sync, which
     // HOT-APPLIES them in-process (no restart). The startup refresh lives in
@@ -464,6 +469,9 @@ export class ProxyServerStreaming {
     // hot-apply remains the fast path)
     this.ladderRefresh.startPeriodic();
 
+    // Start periodic judge calibration agreement report (daily default)
+    this.judgeCalibration.startPeriodic();
+
     // Check Ollama health before starting classifier embeddings
     const ollamaHealthy = await this.checkOllamaHealth();
     if (!ollamaHealthy) {
@@ -485,6 +493,7 @@ export class ProxyServerStreaming {
     this.curator.stopPeriodic();
     this.discovery.stopPeriodic();
     this.ladderRefresh.stopPeriodic();
+    this.judgeCalibration.stopPeriodic();
     this.server.close();
     this.db.close();
   }
@@ -809,6 +818,38 @@ export class ProxyServerStreaming {
           logger.error(`Ladder refresh failed: ${err instanceof Error ? err.message : String(err)}`);
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: { code: "internal", message: "ladder refresh failed" } }));
+        }
+        return;
+      }
+
+      // Admin judge calibration report (p3e-005): on-demand read of the
+      // periodic agreement report — (judge_score, pass@1) pairs logged by
+      // ExecBenchmark's judge hook. Derived data only (no new writes, no
+      // model calls). Gated by ROUTER_ADMIN_TOKEN like the ladder GETs.
+      if (url === "/admin/bench/judge-calibration" && req.method === "GET") {
+        const token = process.env.ROUTER_ADMIN_TOKEN;
+        if (!token) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "admin_disabled", message: "ROUTER_ADMIN_TOKEN not configured" } }));
+          return;
+        }
+        const auth = req.headers["authorization"];
+        const provided =
+          (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
+          (req.headers["x-admin-token"] as string | undefined);
+        if (!provided || !timingSafeEqualStr(provided, token)) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "forbidden", message: "invalid credentials" } }));
+          return;
+        }
+        try {
+          const report = await this.judgeCalibration.report("admin");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(report));
+        } catch (err) {
+          logger.error(`Judge calibration report failed: ${err instanceof Error ? err.message : String(err)}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "internal", message: "judge calibration report failed" } }));
         }
         return;
       }

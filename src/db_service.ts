@@ -1175,6 +1175,99 @@ export class DBService {
     return rows as Array<any>;
   }
 
+  /** Log one (judge_score, pass@1) calibration pair — p3e-005.
+   *  Written whenever the judge scores a response that the exec sandbox
+   *  also scored objectively (docs/EXEC_SANDBOX_SPEC.md §4). */
+  insertJudgeCalibration(data: {
+    probeId: string;
+    modelKey: string;
+    generation: string;
+    judgeScore: number;
+    passRate: number;
+    casesPassed: number | null;
+    casesTotal: number | null;
+    judgeProvider?: string | null;
+    judgeModel?: string | null;
+    execBackend?: string | null;
+    timestamp?: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO judge_calibration
+        (timestamp, probe_id, model_key, generation, judge_score, pass_rate,
+         cases_passed, cases_total, judge_provider, judge_model, exec_backend)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      data.timestamp ?? new Date().toISOString(),
+      data.probeId,
+      data.modelKey,
+      data.generation,
+      data.judgeScore,
+      data.passRate,
+      data.casesPassed,
+      data.casesTotal,
+      data.judgeProvider ?? null,
+      data.judgeModel ?? null,
+      data.execBackend ?? null,
+    );
+  }
+
+  /** All calibration rows for a generation, oldest first — agreement
+   *  reporting input (JudgeCalibrationService). */
+  getJudgeCalibrationRows(
+    generation?: string,
+  ): Array<{
+    id: number;
+    timestamp: string;
+    probeId: string;
+    modelKey: string;
+    generation: string;
+    judgeScore: number;
+    passRate: number;
+    casesPassed: number | null;
+    casesTotal: number | null;
+    judgeProvider: string | null;
+    judgeModel: string | null;
+    execBackend: string | null;
+  }> {
+    const rows = (generation
+      ? this.db.prepare(`
+          SELECT * FROM judge_calibration WHERE generation = ? ORDER BY id ASC
+        `).all(generation)
+      : this.db.prepare(`
+          SELECT * FROM judge_calibration ORDER BY id ASC
+        `).all()
+    ) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: Number(r.id),
+      timestamp: String(r.timestamp),
+      probeId: String(r.probe_id),
+      modelKey: String(r.model_key),
+      generation: String(r.generation),
+      judgeScore: Number(r.judge_score),
+      passRate: Number(r.pass_rate),
+      casesPassed: r.cases_passed == null ? null : Number(r.cases_passed),
+      casesTotal: r.cases_total == null ? null : Number(r.cases_total),
+      judgeProvider: r.judge_provider == null ? null : String(r.judge_provider),
+      judgeModel: r.judge_model == null ? null : String(r.judge_model),
+      execBackend: r.exec_backend == null ? null : String(r.exec_backend),
+    }));
+  }
+
+  /** Newest calibration row timestamp for a (model, probe, generation) —
+   *  avoids duplicate pairs when an exec row is re-scored within a run. */
+  getLatestJudgeCalibrationTimestamp(
+    modelKey: string,
+    probeId: string,
+    generation: string,
+  ): string | null {
+    const row = this.db.prepare(`
+      SELECT timestamp FROM judge_calibration
+      WHERE model_key = ? AND probe_id = ? AND generation = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(modelKey, probeId, generation) as { timestamp: string } | undefined;
+    return row?.timestamp ?? null;
+  }
+
   /** Get the intent distribution from recent routing decisions.
    *  Returns a map of intent -> proportion (0-1). */
   getTrafficDistribution(days: number = 7): Map<string, number> {
@@ -2070,6 +2163,21 @@ CREATE TABLE IF NOT EXISTS catalog_pricing (
   cache_read_per_m REAL,
   generated_at     TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS judge_calibration (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp         TEXT NOT NULL,
+  probe_id          TEXT NOT NULL,
+  model_key         TEXT NOT NULL,
+  generation        TEXT NOT NULL,
+  judge_score       INTEGER NOT NULL,
+  pass_rate         REAL NOT NULL,
+  cases_passed      INTEGER,
+  cases_total       INTEGER,
+  judge_provider    TEXT,
+  judge_model       TEXT,
+  exec_backend      TEXT
+);
 `;
 
 const INDEX_SCHEMA_SQL = `
@@ -2092,4 +2200,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_bench_model ON chat_benchmark_results(model_
 CREATE INDEX IF NOT EXISTS idx_chat_bench_probe ON chat_benchmark_results(probe_type);
 CREATE INDEX IF NOT EXISTS idx_chat_bench_timestamp ON chat_benchmark_results(timestamp);
 CREATE INDEX IF NOT EXISTS idx_bench_verdicts_pair ON benchmark_verdicts(model_a, model_b, intent, prompt_generation);
+CREATE INDEX IF NOT EXISTS idx_judge_calib_model ON judge_calibration(model_key);
+CREATE INDEX IF NOT EXISTS idx_judge_calib_probe ON judge_calibration(probe_id);
+CREATE INDEX IF NOT EXISTS idx_judge_calib_time ON judge_calibration(timestamp);
 `;

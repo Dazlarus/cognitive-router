@@ -64,6 +64,9 @@ export interface ExecProbeOutcome {
   /** Transient model-call/infra failure — NOT persisted, excluded from
    *  summaries (a dead provider must not count as a 0-score probe). */
   modelError?: boolean;
+  /** p3e-005: judge also scored this response (raw 0-10) — logged as a
+   *  (judge_score, pass@1) calibration pair alongside the exec outcome. */
+  judgeScore?: number;
 }
 
 /** Aggregated view over an identity's exec results. */
@@ -85,10 +88,22 @@ export interface ExecIdentitySummary {
   failReasonCounts: Record<string, number>;
 }
 
+/** p3e-005: judge hook result for calibration logging. */
+export interface JudgeScoreResult {
+  /** Raw judge score 0–10. */
+  rawScore: number;
+  judgeProvider?: string;
+  judgeModel?: string;
+}
+
 export interface ExecBenchDeps {
   db: DBService;
   /** Sends the probe prompt to the identity; wiring applies PINNED_DECODE. */
   callModel: ModelCaller;
+  /** p3e-005: optional judge on the SAME fresh response the sandbox scores —
+   *  every usable pair lands in judge_calibration (spec §4). Returning null
+   *  (judge down/unparseable) skips the pair; exec results are unaffected. */
+  judgeScore?: (prompt: string, responseText: string) => Promise<JudgeScoreResult | null>;
   /** Sandbox; defaults to the exec_sandbox module singleton. */
   sandbox?: ExecSandbox;
   /** Model version hash (ollama digest / provider:model for remotes). */
@@ -205,6 +220,7 @@ async function defaultGpuIdle(): Promise<boolean | null> {
 export class ExecBenchmark {
   private readonly db: DBService;
   private readonly callModel: ModelCaller;
+  private readonly judgeScore: ((prompt: string, responseText: string) => Promise<JudgeScoreResult | null>) | undefined;
   private readonly sandbox: ExecSandbox;
   private readonly versionHash: (provider: string, model: string) => Promise<string>;
   private readonly gpuIdle: () => Promise<boolean | null>;
@@ -213,6 +229,7 @@ export class ExecBenchmark {
   constructor(deps: ExecBenchDeps) {
     this.db = deps.db;
     this.callModel = deps.callModel;
+    this.judgeScore = deps.judgeScore;
     this.sandbox = deps.sandbox ?? sandboxDefault;
     this.versionHash = deps.versionHash ?? defaultVersionHash;
     this.gpuIdle = deps.gpuIdle ?? defaultGpuIdle;
@@ -300,7 +317,9 @@ export class ExecBenchmark {
     return null;
   }
 
-  /** Cache check → (skip | model-call → extract → sandbox) → persist. */
+  /** Cache check → (skip | model-call → extract → sandbox) → persist.
+   *  Fresh runs also produce a (judge_score, pass@1) calibration pair when
+   *  a judge hook is wired (p3e-005, spec §4). */
   private async runOrReuse(
     provider: string,
     modelKey: string,
@@ -332,6 +351,10 @@ export class ExecBenchmark {
       };
     }
 
+    // 1b) Judge hook (p3e-005): score the same fresh response the sandbox
+    // will execute. Failure → no pair, never an exec failure.
+    const judged = await this.safeJudgeScore(probe.prompt, responseText);
+
     // 2) Extract code block (last fenced block in the target language)
     const code = extractCodeBlock(responseText, probe.language);
     if (code === null) {
@@ -342,7 +365,7 @@ export class ExecBenchmark {
         failReason: "no_code_block",
         durationMs: 0,
         backend: null,
-      }, latencyMs);
+      }, latencyMs, judged);
     }
 
     // 3) Sandbox run (full harness — visible + hidden cases)
@@ -353,10 +376,27 @@ export class ExecBenchmark {
       ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
     });
 
-    return this.persist(probe, modelKey, provider, versionHash, run, latencyMs);
+    return this.persist(probe, modelKey, provider, versionHash, run, latencyMs, judged);
   }
 
-  /** Persist a sandbox (or extraction) outcome and return the probe outcome. */
+  /** Judge hook wrapper — swallows every failure (null = no pair). */
+  private async safeJudgeScore(
+    prompt: string,
+    responseText: string,
+  ): Promise<JudgeScoreResult | null> {
+    if (!this.judgeScore) return null;
+    try {
+      return await this.judgeScore(prompt, responseText);
+    } catch (err) {
+      logger.warn(`exec-bench: judge hook failed (no calibration pair): ${err}`);
+      return null;
+    }
+  }
+
+  /** Persist a sandbox (or extraction) outcome and return the probe outcome.
+   *  p3e-005: when the judge also scored this response, the (judge_score,
+   *  pass@1) pair lands in judge_calibration — unless the exec side is
+   *  unusable (sandbox_unavailable), which carries no calibration signal. */
   private persist(
     probe: CodingProbe,
     modelKey: string,
@@ -367,6 +407,7 @@ export class ExecBenchmark {
       failReason: FailReason | null; durationMs: number; backend: string | null;
     },
     latencyMs: number,
+    judged?: JudgeScoreResult | null,
   ): ExecProbeOutcome {
     this.db.saveExecBenchmarkResult({
       modelKey,
@@ -382,6 +423,25 @@ export class ExecBenchmark {
       backend: run.backend,
       timestamp: new Date(this.now()).toISOString(),
     });
+    if (judged && run.failReason !== "sandbox_unavailable") {
+      try {
+        this.db.insertJudgeCalibration({
+          probeId: probe.id,
+          modelKey,
+          generation: probe.generation,
+          judgeScore: judged.rawScore,
+          passRate: run.passRate,
+          casesPassed: run.casesPassed,
+          casesTotal: run.casesTotal,
+          judgeProvider: judged.judgeProvider ?? null,
+          judgeModel: judged.judgeModel ?? null,
+          execBackend: run.backend,
+          timestamp: new Date(this.now()).toISOString(),
+        });
+      } catch (err) {
+        logger.warn(`exec-bench: calibration pair not logged for ${modelKey} × ${probe.id}: ${err}`);
+      }
+    }
     return {
       probeId: probe.id,
       cached: false,
@@ -391,6 +451,7 @@ export class ExecBenchmark {
       failReason: run.failReason,
       durationMs: run.durationMs,
       latencyMs,
+      ...(judged ? { judgeScore: judged.rawScore } : {}),
     };
   }
 

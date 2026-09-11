@@ -69,6 +69,10 @@ export interface JudgeResult {
   tier: 1 | 2 | 3;
   /** True when the response was elided (tier 3) — feeds Arm A attribution. */
   truncated: boolean;
+  /** Which judge actually scored (p3e-005 provenance — falls through the
+   *  fallback chain, so callers must know which candidate answered). */
+  judgeProvider: string;
+  judgeModel: string;
 }
 
 /** Chunk a string into n roughly-equal pieces. */
@@ -174,6 +178,8 @@ export class JudgeEvaluator {
       note: parsed.note,
       tier: 1,
       truncated: false,
+      judgeProvider: parsed.judgeProvider,
+      judgeModel: parsed.judgeModel,
     };
   }
 
@@ -229,6 +235,8 @@ export class JudgeEvaluator {
       note: parsed.note,
       tier: 2,
       truncated: elidedResp,
+      judgeProvider: parsed.judgeProvider,
+      judgeModel: parsed.judgeModel,
     };
   }
 
@@ -255,6 +263,8 @@ export class JudgeEvaluator {
       note: parsed.note,
       tier: 3,
       truncated: true,
+      judgeProvider: parsed.judgeProvider,
+      judgeModel: parsed.judgeModel,
     };
   }
 
@@ -262,7 +272,7 @@ export class JudgeEvaluator {
   private async askJudge(
     messages: Array<{ role: string; content: string }>,
     maxTokens = 100,
-  ): Promise<{ score: number; note: string } | null> {
+  ): Promise<{ score: number; note: string; judgeProvider: string; judgeModel: string } | null> {
     const candidates = this.getJudgeCandidates();
     let lastError: Error | undefined;
 
@@ -296,7 +306,7 @@ export class JudgeEvaluator {
           `Judge scored response: ${parsed.score}/10 via ${provider}/${model} — ${parsed.note}`,
         );
 
-        return parsed;
+        return { ...parsed, judgeProvider: provider, judgeModel: model };
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         logger.debug(`Judge candidate ${provider}/${model} failed: ${lastError.message}`);
