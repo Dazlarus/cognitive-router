@@ -36,7 +36,8 @@ import { isGenerationModel, modelSupportsTools } from "./model_policy.js";
 import { BudgetTracker } from "./budget_tracker.js";
 import { ModelCurator } from "./curator.js";
 import { ModelDiscovery } from "./discovery.js";
-import { PROMPT_GENERATION, rebuildLadder, applySyncedVerdictsToLadder } from "./benchmark_ladder.js";
+import { PROMPT_GENERATION, applySyncedVerdictsToLadder } from "./benchmark_ladder.js";
+import { LadderProjectionService } from "./ladder_refresh.js";
 import { withUpstreamTimeoutOverride } from "./upstream_timeout_scope.js";
 import { JudgeEvaluator } from "./judge.js";
 import { decideOutboundEffort, effortPolicyMode } from "./effort_policy.js";
@@ -356,6 +357,7 @@ export class ProxyServerStreaming {
   private judge: JudgeEvaluator;
   private curator: ModelCurator;
   private discovery: ModelDiscovery;
+  private ladderRefresh: LadderProjectionService;
   private initialized = false;
 
   constructor(config: CognitiveRouterConfig) {
@@ -381,18 +383,14 @@ export class ProxyServerStreaming {
     this.judge = new JudgeEvaluator();
     this.curator = new ModelCurator(this.db, this.modelRegistry, config);
     this.discovery = new ModelDiscovery(this.modelRegistry, this.db);
+    this.ladderRefresh = new LadderProjectionService(this.db);
     // Bench subsystem EXTRACTED (2026-09-07): the cogrouter-bench sidecar now
-    // owns passes/judging; verdicts arrive via POST /admin/bench/sync and
-    // routing consumes them after restart (restart-to-apply, CONTRACT.md §6).
-    // At startup: rebuild the coding ladder from synced verdict rows so the
-    // projection is consistent with the verdict table (idempotent).
-    try {
-      const rebuilt = rebuildLadder(this.db, "coding", PROMPT_GENERATION);
-      if (rebuilt.length > 0) this.db.replaceLadder("coding", PROMPT_GENERATION, rebuilt);
-      logger.info(`Ladder projection rebuilt from synced verdicts: ${rebuilt.length} identities`);
-    } catch (err) {
-      logger.warn(`Ladder rebuild skipped: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    // owns passes/judging; verdicts arrive via POST /admin/bench/sync, which
+    // HOT-APPLIES them in-process (no restart). The startup refresh lives in
+    // start() and routes through the same LadderProjectionService code path
+    // as the hourly timer and the admin hook (rebuildLadder + replaceLadder)
+    // — one path, three entry points. Idempotent; cold-start coding backstop
+    // included in the service.
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res).catch((err) => {
         logger.error(`Unhandled error: ${err}`);
@@ -412,6 +410,21 @@ export class ProxyServerStreaming {
     // Load model registry
     await this.modelRegistry.loadCachedState();
     await this.costTracker.refreshProviderStatus();
+
+    // Startup ladder refresh: rebuild the projection from synced verdict rows
+    // so it is consistent with the verdict table (idempotent). Failure must
+    // not block serving — the sync hot-apply path keeps it current after.
+    try {
+      const report = await this.ladderRefresh.refresh("startup");
+      if (!report.skipped && report.intents.length > 0) {
+        logger.info(
+          `Ladder projection rebuilt from synced verdicts: ` +
+          `${report.intents.map((r) => `${r.intent}=${r.identities}`).join(", ")}`,
+        );
+      }
+    } catch (err) {
+      logger.warn(`Ladder refresh skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     const host = this.config.bindHost ?? "127.0.0.1";
     const loopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
@@ -447,6 +460,10 @@ export class ProxyServerStreaming {
     // Start periodic model discovery (hourly, auto mode only)
     this.discovery.startPeriodic();
 
+    // Start periodic ladder projection refresh (hourly backstop; sync
+    // hot-apply remains the fast path)
+    this.ladderRefresh.startPeriodic();
+
     // Check Ollama health before starting classifier embeddings
     const ollamaHealthy = await this.checkOllamaHealth();
     if (!ollamaHealthy) {
@@ -467,6 +484,7 @@ export class ProxyServerStreaming {
   async stop(): Promise<void> {
     this.curator.stopPeriodic();
     this.discovery.stopPeriodic();
+    this.ladderRefresh.stopPeriodic();
     this.server.close();
     this.db.close();
   }
@@ -756,6 +774,41 @@ export class ProxyServerStreaming {
           logger.error(`Ladder read failed: ${err instanceof Error ? err.message : String(err)}`);
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: { code: "internal", message: "ladder read failed" } }));
+        }
+        return;
+      }
+
+      // Admin bench ladder refresh (p3e-006): on-demand projection rebuild
+      // through the same LadderProjectionService path as the hourly timer
+      // and startup (rebuildLadder + replaceLadder — the three entry points
+      // share one code path and can never diverge). Read/rewrite of the
+      // projection only — no model calls, no judge calls (CONTRACT.md §6
+      // write-path freeze holds). Gated by ROUTER_ADMIN_TOKEN like the
+      // ladder GET above.
+      if (url === "/admin/bench/ladder/refresh" && req.method === "POST") {
+        const token = process.env.ROUTER_ADMIN_TOKEN;
+        if (!token) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "admin_disabled", message: "ROUTER_ADMIN_TOKEN not configured" } }));
+          return;
+        }
+        const auth = req.headers["authorization"];
+        const provided =
+          (typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : undefined) ??
+          (req.headers["x-admin-token"] as string | undefined);
+        if (!provided || !timingSafeEqualStr(provided, token)) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "forbidden", message: "invalid credentials" } }));
+          return;
+        }
+        try {
+          const report = await this.ladderRefresh.refresh("admin");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(report));
+        } catch (err) {
+          logger.error(`Ladder refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "internal", message: "ladder refresh failed" } }));
         }
         return;
       }
