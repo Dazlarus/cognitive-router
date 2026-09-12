@@ -22,6 +22,7 @@ import {
   ucbBonus,
   type GateArm,
 } from "./learning_guards.js";
+import { CodingBlendService, type CodingBlendWeights } from "./coding_blend.js";
 
 export interface ModelCapability {
   provider: string;
@@ -306,6 +307,9 @@ const SEED_MODELS: ModelCapability[] = [
 
 export class ModelRegistry {
   private models = new Map<string, ModelCapability>();
+
+  /** p3e-007: coding-intent blend service (null until enabled). */
+  private codingBlend: CodingBlendService | null = null;
   /** Learned sample counts per provider/model/intent (UCB n). */
   private sampleCounts = new Map<string, number>();
   /** Manually pinned cells the learner refuses to overwrite. */
@@ -331,7 +335,9 @@ export class ModelRegistry {
   constructor(
     private db: DBService,
     private config: CognitiveRouterConfig,
-  ) {}
+  ) {
+    this.codingBlend = null;
+  }
 
   async loadCachedState(): Promise<void> {
     // Seed with known models (+ hand-maintained config cards; seed > discovery)
@@ -573,7 +579,42 @@ export class ModelRegistry {
     );
   }
 
+  /** Enable the coding-intent blend service. Must be called after DB is
+   *  fully seeded (post-loadCachedState) so ladder+exec data is available.
+   *  Pass optional weights; defaults are used when omitted. */
+  enableCodingBlend(weights?: Partial<CodingBlendWeights>): void {
+    this.codingBlend = new CodingBlendService(this.db, this, weights);
+    const r = this.codingBlend.report();
+    logger.info(
+      `Coding blend enabled: ${r.fullBlendCount} full blends, ` +
+      `${r.partialBlendCount} partial blends across ${r.identities.length} ladder identities.`
+    );
+  }
+
+  /** True when the coding blend is active. */
+  isCodingBlendEnabled(): boolean {
+    return this.codingBlend !== null;
+  }
+
+  /** Access the coding blend service (null when not enabled). */
+  getCodingBlend(): CodingBlendService | null {
+    return this.codingBlend;
+  }
+
   getCapabilityScore(provider: string, model: string, intent: string): number {
+    // Phase 3 (p3e-007): for coding intent, delegate to the blend when
+    // enabled. The blend combines ladder strength (shrunk), exec floor,
+    // and live EWMA. Models without bench data fall through unchanged.
+    if (intent === "coding" && this.codingBlend) {
+      const blend = this.codingBlend.blendProviderModel(provider, model);
+      if (blend) {
+        logger.debug(
+          `CodingBlend: ${provider}/${model} = ${blend.blended.toFixed(3)} ` +
+          `(bt=${blend.btNorm.toFixed(2)} exec=${blend.execFloor.toFixed(2)} ewma=${blend.ewmaScore.toFixed(2)})`
+        );
+        return blend.blended;
+      }
+    }
     const cap = this.getCapability(provider, model);
     if (!cap) return 0.5;
     const dim = ModelRegistry.INTENT_MAP[intent];

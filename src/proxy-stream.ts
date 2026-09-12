@@ -386,6 +386,7 @@ export class ProxyServerStreaming {
     this.curator = new ModelCurator(this.db, this.modelRegistry, config);
     this.discovery = new ModelDiscovery(this.modelRegistry, this.db);
     this.ladderRefresh = new LadderProjectionService(this.db);
+    // p3e-007: coding blend is enabled in start() after state loads.
     // p3e-005: periodic judge↔exec agreement report (reads judge_calibration;
     // pairs are logged by ExecBenchmark's judge hook — no model calls here).
     this.judgeCalibration = new JudgeCalibrationService(this.db);
@@ -429,6 +430,16 @@ export class ProxyServerStreaming {
       }
     } catch (err) {
       logger.warn(`Ladder refresh skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Phase 3 (p3e-007): enable coding-intent blend once the ladder
+    // projection is current. Models without exec data use partial blend
+    // (ladder + EWMA); models without ladder entry fall through to the
+    // existing seed/override path unchanged.
+    try {
+      this.modelRegistry.enableCodingBlend();
+    } catch (err) {
+      logger.warn(`Coding blend init (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
 
     const host = this.config.bindHost ?? "127.0.0.1";
