@@ -186,11 +186,15 @@ export class CodingBlendService {
     const entry = ladder.find((e) => e.modelKey === modelKey);
     if (!entry) return null;
 
-    const allStrengths = ladder.map((e) => e.strength);
+    // Shrink EVERY identity first, then normalize shrunk-vs-shrunk so the
+    // comparison set matches the quantity being ranked (same apples).
+    const allShrunk = ladder.map(
+      (e) => shrinkStrength(e.strength, countComparisons(this.db, e.modelKey)),
+    );
     const btStrength = entry.strength;
     const nComp = countComparisons(this.db, modelKey);
     const btShrunk = shrinkStrength(btStrength, nComp);
-    const btNorm = logMinmaxNorm(btShrunk, allStrengths);
+    const btNorm = logMinmaxNorm(btShrunk, allShrunk);
 
     // Exec floor from exec_benchmark_results via summarizePersisted
     const provider = providerOfModelKey(modelKey);
